@@ -87,7 +87,11 @@ impl LdkFeeEstimator for OnchainFeeEstimator {
 pub(crate) fn get_num_block_defaults_for_target(target: ConfirmationTarget) -> usize {
 	match target {
 		ConfirmationTarget::OnchainPayment => 6,
-		ConfirmationTarget::ChannelFunding => 12,
+		// Funding txs target ~3 blocks (mempool's "fast" tier) so they confirm
+		// promptly. The prior 12-block target resolved to a fee low enough that
+		// funding txs could sit unconfirmed for hours during normal congestion,
+		// stalling channels in `sync` (never reaching `channel_ready`).
+		ConfirmationTarget::ChannelFunding => 3,
 		ConfirmationTarget::Lightning(ldk_target) => match ldk_target {
 			LdkConfirmationTarget::MaximumFeeEstimate => 1,
 			LdkConfirmationTarget::UrgentOnChainSweep => 6,
