@@ -296,6 +296,68 @@ impl BitcoindClient {
 		}
 	}
 
+	/// Confirmation depth for an ARBITRARY `txid` via verbose `getrawtransaction`
+	/// (Peerswap native primitive B5).
+	///
+	/// To locate a tx by its id alone (the swap case — a counterparty opening tx
+	/// that is not in our wallet), the backend must be able to find it, i.e. a
+	/// `-txindex` node (or the tx still resident in the mempool). Returns:
+	/// - `Ok(Some(n))` with `n >= 1` for a tx confirmed `n` blocks deep,
+	/// - `Ok(Some(0))` for a tx seen in the mempool but unconfirmed,
+	/// - `Ok(None)` when the node does not know the tx (RPC error code -5),
+	/// - `Err(..)` for any transport/other failure, so the caller fails closed.
+	#[cfg(feature = "swaps")]
+	pub(crate) async fn swap_tx_confirmations(
+		&self, txid: &Txid,
+	) -> std::io::Result<Option<u32>> {
+		let rpc_client = match self {
+			BitcoindClient::Rpc { rpc_client, .. } => Arc::clone(rpc_client),
+			BitcoindClient::Rest { rpc_client, .. } => Arc::clone(rpc_client),
+		};
+		// `getrawtransaction` expects the txid in RPC/display (big-endian) order —
+		// exactly `Txid`'s `Display`. `consensus::encode::serialize_hex` emits the
+		// INTERNAL (little-endian) bytes, i.e. the REVERSED hex, which bitcoind rejects
+		// with -5 "No such transaction". That -5 is mapped to `Ok(None)` below, so the
+		// swap watcher would mistake EVERY confirmed opening tx for NotFound and never
+		// arm the confirmation/CSV ladder — wedging every swap on the bitcoind backend.
+		let txid_hex = txid.to_string();
+		let txid_json = serde_json::json!(txid_hex);
+		let verbose_json = serde_json::json!(true);
+		match rpc_client
+			.call_method::<SwapTxConfirmationResponse>(
+				"getrawtransaction",
+				&[txid_json, verbose_json],
+			)
+			.await
+		{
+			Ok(resp) => Ok(Some(resp.0)),
+			Err(e) => match e.into_inner() {
+				Some(inner) => {
+					let rpc_error_res: Result<Box<RpcError>, _> = inner.downcast();
+
+					match rpc_error_res {
+						Ok(rpc_error) => {
+							// -5 == "No such mempool or blockchain transaction".
+							if rpc_error.code == -5 {
+								Ok(None)
+							} else {
+								Err(std::io::Error::new(std::io::ErrorKind::Other, rpc_error))
+							}
+						},
+						Err(_) => Err(std::io::Error::new(
+							std::io::ErrorKind::Other,
+							"Failed to process verbose getrawtransaction response",
+						)),
+					}
+				},
+				None => Err(std::io::Error::new(
+					std::io::ErrorKind::Other,
+					"Failed to process verbose getrawtransaction response",
+				)),
+			},
+		}
+	}
+
 	/// Retrieves the raw mempool.
 	pub(crate) async fn get_raw_mempool(&self) -> std::io::Result<Vec<Txid>> {
 		match self {
@@ -675,6 +737,21 @@ impl TryInto<GetRawTransactionResponse> for JsonResponse {
 			})?;
 
 		Ok(GetRawTransactionResponse(tx))
+	}
+}
+
+/// Confirmation depth parsed from a verbose `getrawtransaction` result
+/// (Peerswap native primitive B5). The `confirmations` field is absent for an
+/// unconfirmed (mempool) transaction, which we map to `0`.
+#[cfg(feature = "swaps")]
+pub(crate) struct SwapTxConfirmationResponse(pub u32);
+
+#[cfg(feature = "swaps")]
+impl TryInto<SwapTxConfirmationResponse> for JsonResponse {
+	type Error = std::io::Error;
+	fn try_into(self) -> std::io::Result<SwapTxConfirmationResponse> {
+		let confirmations = self.0["confirmations"].as_u64().unwrap_or(0);
+		Ok(SwapTxConfirmationResponse(confirmations as u32))
 	}
 }
 
