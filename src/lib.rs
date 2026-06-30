@@ -116,6 +116,40 @@ pub use event::Event;
 
 pub use io::utils::generate_entropy_mnemonic;
 
+/// Public swap fee-priority selector (Peerswap native primitives, B-series).
+///
+/// Re-exported from the otherwise-private `fee_estimator` module so swap code
+/// can request on-chain fee rates without the crate-internal
+/// `ConfirmationTarget` leaking into the public API.
+#[cfg(feature = "swaps")]
+pub use fee_estimator::SwapFeeTarget;
+
+/// Public source-bearing swap feerate quote types (Peerswap native primitive
+/// B6 / plan FIX-B). Re-exported from the otherwise-private `fee_estimator`
+/// module so swap callers can detect estimate provenance (live vs fallback).
+#[cfg(feature = "swaps")]
+pub use fee_estimator::{FeerateQuote, SwapFeerateSource};
+
+/// Public reorg-aware chain-status types for the swap-txid watch primitive
+/// (Peerswap native primitives, B5). Re-exported from the otherwise-private
+/// `chain` module.
+#[cfg(feature = "swaps")]
+pub use chain::{ChainStatus, TxStatus};
+
+/// Public types appearing in the swap-primitive signatures on [`Node`]
+/// (Peerswap native primitives, B-series). Re-exported so the consumer crate
+/// can name them without reaching into the (otherwise-private) LDK/bitcoin
+/// module paths.
+#[cfg(feature = "swaps")]
+pub use bitcoin::psbt::Psbt;
+/// Swap keypair type returned by [`Node::derive_swap_keypair`] (B7).
+#[cfg(feature = "swaps")]
+pub use bitcoin::secp256k1::Keypair as SwapKeypair;
+/// Confirmed wallet UTXO type returned by [`Node::swap_list_confirmed_utxos`]
+/// (B2).
+#[cfg(feature = "swaps")]
+pub use lightning::events::bump_transaction::Utxo;
+
 #[cfg(feature = "uniffi")]
 use ffi::*;
 
@@ -206,6 +240,9 @@ pub struct Node {
 	payment_store: Arc<PaymentStore>,
 	is_listening: Arc<AtomicBool>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
+	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
+	#[cfg(feature = "swaps")]
+	swap_tx_watch: Arc<chain::SwapTxWatch>,
 }
 
 impl Node {
@@ -937,6 +974,121 @@ impl Node {
 			Arc::clone(&self.config),
 			Arc::clone(&self.logger),
 		)
+	}
+
+	/// Registers an arbitrary transaction (e.g. a counterparty's swap opening tx
+	/// that the local wallet does not own) for reorg-aware confirmation tracking
+	/// via [`Node::get_tx_confirmations`] (Peerswap native primitive B5).
+	///
+	/// `scriptpubkey` is the output script being watched; it is required by the
+	/// Electrum chain source (which locates a tx through its scriptHash history)
+	/// and ignored by the Esplora/Bitcoind backends. Registration is idempotent.
+	#[cfg(feature = "swaps")]
+	pub fn watch_txid(&self, txid: bitcoin::Txid, scriptpubkey: bitcoin::ScriptBuf) {
+		self.swap_tx_watch.register(txid, scriptpubkey);
+	}
+
+	/// Drops the reorg-aware watch for `txid` registered via [`Node::watch_txid`]
+	/// (Peerswap native primitive B5, LOW-1). The consumer calls this once a swap
+	/// reaches a terminal, settled state so the in-memory watch map does not grow
+	/// unbounded for the process lifetime. A no-op for a txid never watched.
+	#[cfg(feature = "swaps")]
+	pub fn unwatch_txid(&self, txid: bitcoin::Txid) {
+		self.swap_tx_watch.unregister(&txid);
+	}
+
+	/// Queries the reorg-aware confirmation status of an arbitrary `txid`
+	/// against the configured chain source (Peerswap native primitive B5).
+	///
+	/// Unlike wallet-owned confirmation lookups, this works on a counterparty's
+	/// opening tx. Confirmations are re-derived from the tx's *current*
+	/// best-chain block on every call, so a previously-confirmed tx that has
+	/// re-orged out is reported as [`ChainStatus::Reorged`] (and a never-confirmed
+	/// tx gone from the mempool as [`ChainStatus::Dropped`]) with zero
+	/// confirmations, allowing the caller to re-anchor deadlines (F4).
+	///
+	/// FAIL-CLOSED (E6): if the chain source is unconfigured/unreachable, or an
+	/// Electrum lookup is attempted for a `txid` never registered via
+	/// [`Node::watch_txid`], the returned status is [`ChainStatus::NoChainSource`]
+	/// — never a confirmed result. Callers MUST NOT advance any state that
+	/// depends on a confirmation they could not verify.
+	#[cfg(feature = "swaps")]
+	pub async fn get_tx_confirmations(&self, txid: bitcoin::Txid) -> Result<TxStatus, Error> {
+		let script_pubkey = self.swap_tx_watch.script_pubkey(&txid);
+		let previously_confirmed = self.swap_tx_watch.previously_confirmed(&txid);
+		let observation = self.chain_source.swap_query_tx(txid, script_pubkey.as_ref()).await;
+		let status = chain::derive_tx_status(observation, previously_confirmed);
+		self.swap_tx_watch.record(&txid, &status);
+		Ok(status)
+	}
+
+	/// Builds a fully-signed swap funding (HTLC opening) transaction paying
+	/// `amount` to `output_script` (e.g. a P2WSH submarine-swap HTLC output) at
+	/// the feerate implied by `fee_target`, with the supplied `locktime`
+	/// (Peerswap native primitive B1).
+	///
+	/// The returned [`bitcoin::Transaction`] is signed and persisted but **not**
+	/// broadcast — call [`Node::broadcast_swap_tx`] to publish it. The public
+	/// [`SwapFeeTarget`] is used in place of the crate-internal confirmation
+	/// target so no internal type leaks across the crate boundary.
+	#[cfg(feature = "swaps")]
+	pub fn create_swap_funding_tx(
+		&self, output_script: bitcoin::ScriptBuf, amount: bitcoin::Amount,
+		fee_target: SwapFeeTarget, locktime: bitcoin::blockdata::locktime::absolute::LockTime,
+	) -> Result<bitcoin::Transaction, Error> {
+		self.wallet.create_swap_funding_tx(output_script, amount, fee_target.into(), locktime)
+	}
+
+	/// Lists the wallet's confirmed, unspent outputs as [`Utxo`]s for use as
+	/// swap funding inputs (Peerswap native primitive B2).
+	#[cfg(feature = "swaps")]
+	pub fn swap_list_confirmed_utxos(&self) -> Result<Vec<Utxo>, Error> {
+		self.wallet.swap_list_confirmed_utxos()
+	}
+
+	/// Signs a swap [`Psbt`] with the on-chain wallet, returning the extracted
+	/// [`bitcoin::Transaction`] (Peerswap native primitive B3).
+	///
+	/// LDK-provided inputs are not finalized by BDK; the caller is responsible
+	/// for finalizing any swap-script (HTLC) inputs it owns.
+	#[cfg(feature = "swaps")]
+	pub fn swap_sign_psbt(&self, psbt: Psbt) -> Result<bitcoin::Transaction, Error> {
+		self.wallet.swap_sign_psbt(psbt)
+	}
+
+	/// Enqueues a fully-signed swap transaction for broadcast on the configured
+	/// chain backend (Peerswap native primitive B4).
+	///
+	/// Fire-and-forget: the transaction is placed on the bounded broadcast queue
+	/// drained by the chain source and this returns immediately; it does not
+	/// confirm acceptance by the backend.
+	#[cfg(feature = "swaps")]
+	pub fn broadcast_swap_tx(&self, tx: &bitcoin::Transaction) {
+		self.tx_broadcaster.broadcast_tx(tx);
+	}
+
+	/// Estimates the on-chain feerate for a swap transaction at the requested
+	/// [`SwapFeeTarget`] priority, returning a source-bearing [`FeerateQuote`]
+	/// (Peerswap native primitive B6 / plan FIX-B).
+	///
+	/// The quote's [`SwapFeerateSource`] lets a fail-closed caller distinguish a
+	/// live backend estimate from a static fallback/relay-floor value and refuse
+	/// to fund on an untrusted estimate.
+	#[cfg(feature = "swaps")]
+	pub fn estimate_onchain_feerate(&self, target: SwapFeeTarget) -> FeerateQuote {
+		self.chain_source.fee_estimator().estimate_swap_feerate_quote(target)
+	}
+
+	/// Derives a deterministic swap [`SwapKeypair`] at `index` from a dedicated,
+	/// swaps-only BIP-32 derivation path (Peerswap native primitive B7).
+	///
+	/// The keypair is NEVER derived from the node identity secret key: it comes
+	/// from a hardened path reserved exclusively for swaps, isolated from the
+	/// identity/channel keys. The returned keypair carries both the secret and
+	/// public key for building and signing swap HTLC scripts.
+	#[cfg(feature = "swaps")]
+	pub fn derive_swap_keypair(&self, index: u32) -> Result<SwapKeypair, Error> {
+		self.keys_manager.derive_swap_keypair(index)
 	}
 
 	/// Returns a payment handler allowing to send and receive on-chain payments.

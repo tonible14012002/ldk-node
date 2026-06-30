@@ -221,6 +221,66 @@ impl ElectrumRuntimeClient {
 		}
 	}
 
+	/// Reorg-aware confirmation query for an ARBITRARY `txid` via its watched
+	/// scriptPubKey's history (Peerswap native primitive B5).
+	///
+	/// Electrum locates a transaction through its scriptHash history (not by
+	/// txid), so the watched output script is required. Any client/transport/
+	/// task failure yields [`RawTxObservation::Unreachable`] so the caller fails
+	/// closed (never a falsely-confirmed result, E6).
+	#[cfg(feature = "swaps")]
+	pub(crate) async fn swap_query_tx(
+		&self, txid: Txid, script_pubkey: bitcoin::ScriptBuf,
+	) -> crate::chain::RawTxObservation {
+		use crate::chain::RawTxObservation;
+
+		let electrum_client = Arc::clone(&self.electrum_client);
+
+		let spawn_fut = self.runtime.spawn_blocking(move || {
+			let history = electrum_client.script_get_history(script_pubkey.as_script())?;
+			let tip = electrum_client.block_headers_subscribe()?;
+			Ok::<_, electrum_client::Error>((history, tip.height))
+		});
+
+		let (history, tip_height) = match spawn_fut.await {
+			Ok(Ok(result)) => result,
+			Ok(Err(e)) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum query failed for {}: {}",
+					txid,
+					e
+				);
+				return RawTxObservation::Unreachable;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Electrum task join failed for {}: {}",
+					txid,
+					e
+				);
+				return RawTxObservation::Unreachable;
+			},
+		};
+
+		match history.into_iter().find(|entry| entry.tx_hash == txid) {
+			Some(entry) => {
+				// Electrum reports height 0 (unconfirmed) or -1 (unconfirmed with
+				// unconfirmed parents); both mean "in the mempool".
+				if entry.height <= 0 {
+					RawTxObservation::InMempool
+				} else {
+					let height = entry.height as u32;
+					let confirmations =
+						(tip_height as u32).saturating_sub(height).saturating_add(1);
+					RawTxObservation::Confirmed { height: Some(height), confirmations }
+				}
+			},
+			None => RawTxObservation::NotFound,
+		}
+	}
+
 	pub(crate) async fn get_fee_rate_cache_update(
 		&self,
 	) -> Result<HashMap<ConfirmationTarget, FeeRate>, Error> {

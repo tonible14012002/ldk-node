@@ -124,6 +124,14 @@ where
         *our_metadata = Some(metadata);
     }
 
+    /// Get OUR OWN advertised metadata blob (the one broadcast to peers), if set.
+    /// Distinct from [`get_all_metadata`], which returns PEERS' received blobs and
+    /// NEVER our own — so this is the only way for the owning node to read back what
+    /// it is currently advertising (needed for a correct read-merge-write of our blob).
+    pub fn get_our_metadata(&self) -> Option<Vec<u8>> {
+        self.our_metadata.lock().unwrap().clone()
+    }
+
     /// Get metadata for a specific node
     pub fn get_node_metadata(&self, node_id: &PublicKey) -> Option<NodeMetadata> {
         let metadata_store = self.node_metadata.lock().unwrap();
@@ -256,8 +264,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logger::test_logger;
     use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use lightning::util::test_utils::TestLogger;
     use lightning::util::ser::{Readable, Writeable};
     use std::io::Cursor;
 
@@ -282,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_custom_gossip_handler() {
-        let logger = test_logger();
+        let logger = Arc::new(TestLogger::new());
         let handler = CustomGossipMessageHandler::new(logger);
         
         // Test setting our metadata

@@ -1721,6 +1721,8 @@ fn build_with_store_internal(
 		payment_store,
 		is_listening,
 		node_metrics,
+		#[cfg(feature = "swaps")]
+		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
 	})
 }
 

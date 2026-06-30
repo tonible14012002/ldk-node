@@ -50,6 +50,11 @@ use bitcoin::{
 	WitnessProgram, WitnessVersion,
 };
 
+#[cfg(feature = "swaps")]
+use bitcoin::bip32::{ChildNumber, Xpriv};
+#[cfg(feature = "swaps")]
+use bitcoin::secp256k1::Keypair;
+
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -282,6 +287,42 @@ where
 		})?;
 
 		Ok(tx)
+	}
+
+	/// Builds a fully-signed funding transaction paying `amount` to an arbitrary `output_script`
+	/// (e.g. a P2WSH submarine-swap HTLC output) at the fee rate implied by `confirmation_target`,
+	/// with the supplied `locktime`. The returned [`Transaction`] is signed and persisted but **not**
+	/// broadcast.
+	///
+	/// This is a thin swaps-gated wrapper over [`Wallet::create_funding_transaction`]; it does not
+	/// alter the existing behaviour of that method in any way.
+	#[cfg(feature = "swaps")]
+	pub(crate) fn create_swap_funding_tx(
+		&self, output_script: ScriptBuf, amount: Amount, confirmation_target: ConfirmationTarget,
+		locktime: LockTime,
+	) -> Result<Transaction, Error> {
+		self.create_funding_transaction(output_script, amount, confirmation_target, locktime)
+	}
+
+	/// Lists the wallet's confirmed, unspent outputs as [`Utxo`]s.
+	///
+	/// This is a thin swaps-gated inherent wrapper over the [`WalletSource::list_confirmed_utxos`]
+	/// trait method. Unlike the trait method (whose error type is `()`), it surfaces a real
+	/// [`Error`] so swap call sites get a meaningful failure value.
+	#[cfg(feature = "swaps")]
+	pub(crate) fn swap_list_confirmed_utxos(&self) -> Result<Vec<Utxo>, Error> {
+		WalletSource::list_confirmed_utxos(self).map_err(|()| Error::WalletOperationFailed)
+	}
+
+	/// Signs a PSBT with the BDK wallet, returning the extracted [`Transaction`].
+	///
+	/// This is a thin swaps-gated inherent wrapper over the [`WalletSource::sign_psbt`] trait
+	/// method. Unlike the trait method (whose error type is `()`), it surfaces a real [`Error`] so
+	/// swap call sites get a meaningful failure value. As with the trait method, LDK-provided inputs
+	/// are not finalized by BDK and the `finalized` bool is intentionally ignored.
+	#[cfg(feature = "swaps")]
+	pub(crate) fn swap_sign_psbt(&self, psbt: Psbt) -> Result<Transaction, Error> {
+		WalletSource::sign_psbt(self, psbt).map_err(|()| Error::WalletOperationFailed)
 	}
 
 	pub(crate) fn get_new_address(&self) -> Result<bitcoin::Address, Error> {
@@ -786,6 +827,14 @@ where
 	inner: KeysManager,
 	wallet: Arc<Wallet<B, E, L>>,
 	logger: L,
+	/// Dedicated swap-key derivation master (Peerswap native primitive B7).
+	///
+	/// Derived from the wallet seed at a hardened BIP-32 index reserved
+	/// exclusively for swaps. It is fully isolated from the node identity
+	/// secret key (which LDK derives at the low reserved children of the same
+	/// master), so a swap keypair can NEVER coincide with the node identity.
+	#[cfg(feature = "swaps")]
+	swap_master_xprv: Xpriv,
 }
 
 impl<B: Deref, E: Deref, L: Deref> WalletKeysManager<B, E, L>
@@ -803,7 +852,15 @@ where
 		wallet: Arc<Wallet<B, E, L>>, logger: L,
 	) -> Self {
 		let inner = KeysManager::new(seed, starting_time_secs, starting_time_nanos);
-		Self { inner, wallet, logger }
+		#[cfg(feature = "swaps")]
+		let swap_master_xprv = Self::derive_swap_master_xprv(seed);
+		Self {
+			inner,
+			wallet,
+			logger,
+			#[cfg(feature = "swaps")]
+			swap_master_xprv,
+		}
 	}
 
 	pub fn sign_message(&self, msg: &[u8]) -> String {
@@ -817,6 +874,66 @@ where
 	pub fn verify_signature(&self, msg: &[u8], sig: &str, pkey: &PublicKey) -> bool {
 		message_signing::verify(msg, sig, pkey)
 	}
+
+	/// Hardened BIP-32 child index of the dedicated swap-key domain (B7).
+	///
+	/// Value is the ASCII bytes of `"swap"` (`0x73776170`), which is `< 2^31`
+	/// so it is a valid hardened index. It sits far outside the low children
+	/// (`0..=6`) that LDK's `KeysManager` reserves for the node identity,
+	/// channel, destination, shutdown, and inbound-payment keys — guaranteeing
+	/// the swap key tree never overlaps the node identity secret key.
+	#[cfg(feature = "swaps")]
+	const SWAP_KEY_HARDENED_CHILD_INDEX: u32 = 0x7377_6170;
+
+	/// Derives the dedicated swap-domain master xpriv from the wallet `seed`.
+	///
+	/// BIP-32 child-key derivation is network-independent for the secret
+	/// material, so the fixed network used to construct the master only affects
+	/// the (unused) serialization version bytes — never the derived keys.
+	#[cfg(feature = "swaps")]
+	fn derive_swap_master_xprv(seed: &[u8; 32]) -> Xpriv {
+		let secp = Secp256k1::new();
+		let master = Xpriv::new_master(Network::Bitcoin, seed)
+			.expect("a 32-byte seed is always a valid BIP-32 master key");
+		master
+			.derive_priv(
+				&secp,
+				&[ChildNumber::Hardened { index: Self::SWAP_KEY_HARDENED_CHILD_INDEX }],
+			)
+			.expect("hardened derivation from a valid master key is infallible")
+	}
+
+	/// Derives a deterministic swap [`Keypair`] at `index` from the dedicated,
+	/// swaps-only BIP-32 path (B7).
+	///
+	/// The key is derived from [`Self::swap_master_xprv`], i.e. a hardened path
+	/// reserved exclusively for swaps; it is NEVER derived from the node
+	/// identity secret key. The returned [`Keypair`] carries both the secret
+	/// and the public key so callers can build and sign swap HTLC scripts.
+	#[cfg(feature = "swaps")]
+	pub(crate) fn derive_swap_keypair(&self, index: u32) -> Result<Keypair, Error> {
+		swap_keypair_from_master(&self.swap_master_xprv, index).map_err(|e| {
+			log_error!(self.logger, "Failed to derive swap keypair at index {}: {}", index, e);
+			Error::InvalidSecretKey
+		})
+	}
+}
+
+/// Derives the swap [`Keypair`] at hardened `index` from an already-derived
+/// swap-domain master xpriv (Peerswap native primitive B7).
+///
+/// Split out from [`WalletKeysManager::derive_swap_keypair`] as a generic-free,
+/// `self`-free helper so the deterministic derivation can be exercised by unit
+/// test vectors without constructing a full wallet/keys-manager. The instance
+/// method adds error logging on top of this pure derivation. Secret material is
+/// never logged here.
+#[cfg(feature = "swaps")]
+fn swap_keypair_from_master(
+	master: &Xpriv, index: u32,
+) -> Result<Keypair, bitcoin::bip32::Error> {
+	let secp = Secp256k1::new();
+	let child = master.derive_priv(&secp, &[ChildNumber::Hardened { index }])?;
+	Ok(Keypair::from_secret_key(&secp, &child.private_key))
 }
 
 impl<B: Deref, E: Deref, L: Deref> NodeSigner for WalletKeysManager<B, E, L>
@@ -952,5 +1069,83 @@ where
 			log_error!(self.logger, "Failed to retrieve new address from wallet: {}", e);
 		})?;
 		Ok(address.script_pubkey())
+	}
+}
+
+#[cfg(all(test, feature = "swaps"))]
+mod swap_b7_tests {
+	//! Test vectors for the B7 dedicated swap-key derivation.
+	//!
+	//! These exercise the exact production derivation path used by
+	//! [`WalletKeysManager::derive_swap_keypair`] — namely
+	//! [`WalletKeysManager::derive_swap_master_xprv`] (the swaps-only hardened
+	//! BIP-32 domain) followed by [`swap_keypair_from_master`] — without having
+	//! to construct a full BDK-backed wallet/keys-manager.
+
+	use super::swap_keypair_from_master;
+	use crate::types::KeysManager;
+	use bitcoin::secp256k1::{PublicKey, Secp256k1};
+	use lightning::sign::KeysManager as LdkKeysManager;
+
+	/// Fixed 32-byte seed used by every vector below.
+	const TEST_SEED: [u8; 32] = [
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+		0xff, 0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2,
+		0xe1, 0xf0,
+	];
+
+	/// Derives the swap public key for `index` from `TEST_SEED` over the full
+	/// production path and returns it as a lowercase compressed-hex string.
+	fn swap_pubkey_hex(index: u32) -> String {
+		let master = KeysManager::derive_swap_master_xprv(&TEST_SEED);
+		let keypair = swap_keypair_from_master(&master, index).expect("derivation must succeed");
+		keypair.public_key().to_string()
+	}
+
+	#[test]
+	fn swap_keypair_matches_fixed_vector() {
+		// Fixed seed + index => fixed compressed public key. Regenerating this
+		// value would signal an (unintended) change to the swap derivation path.
+		assert_eq!(
+			swap_pubkey_hex(0),
+			"03d6c52bcef058703ff78e4d765f7b114ff5ad13f222596049b6a7bb66406bc6b6"
+		);
+		assert_eq!(
+			swap_pubkey_hex(1),
+			"0203784b06423d07485e4378ebce2eca4c7db3caa15426d52715c2414f4b0cebd9"
+		);
+	}
+
+	#[test]
+	fn swap_keypair_is_deterministic() {
+		assert_eq!(swap_pubkey_hex(0), swap_pubkey_hex(0));
+		// Distinct indices yield distinct keys.
+		assert_ne!(swap_pubkey_hex(0), swap_pubkey_hex(1));
+	}
+
+	#[test]
+	fn swap_key_differs_from_node_identity() {
+		// The node identity secret key is what LDK's KeysManager derives from the
+		// same seed. The swap key MUST come from a different (dedicated) path.
+		let ldk = LdkKeysManager::new(&TEST_SEED, 0, 0);
+		let node_secret = ldk.get_node_secret_key();
+		let secp = Secp256k1::new();
+		let node_pubkey = PublicKey::from_secret_key(&secp, &node_secret);
+
+		let master = KeysManager::derive_swap_master_xprv(&TEST_SEED);
+		for index in 0..8u32 {
+			let swap_keypair =
+				swap_keypair_from_master(&master, index).expect("derivation must succeed");
+			assert_ne!(
+				swap_keypair.secret_key(),
+				node_secret,
+				"swap secret at index {index} must never equal the node identity secret"
+			);
+			assert_ne!(
+				swap_keypair.public_key(),
+				node_pubkey,
+				"swap pubkey at index {index} must never equal the node identity pubkey"
+			);
+		}
 	}
 }

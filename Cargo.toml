@@ -26,6 +26,9 @@ panic = 'abort'     # Abort on panic
 
 [features]
 default = []
+# Peerswap native primitives (B-series). Empty for now; gates all swap
+# additions so the default build is byte-for-byte unaffected.
+swaps = []
 
 [dependencies]
 lightning = { version = "0.1.0", features = ["std"] }
