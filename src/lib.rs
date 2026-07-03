@@ -964,6 +964,95 @@ impl Node {
 		))
 	}
 
+	/// Sends a circular self-payment along a caller-supplied route (cooperative
+	/// cycle-balance primitive).
+	///
+	/// The caller builds the exact [`Route`] (first hop = drain channel A, last hop =
+	/// fill channel B → self), generates a `preimage`/`payment_hash` pair (held
+	/// locally), and passes them here. The payment record is stored with
+	/// [`PaymentKind::Rebalance`] so the `event.rs` `PaymentClaimable` handler allows
+	/// the self-loop to settle instead of refusing it as a circular payment.
+	///
+	/// Settlement is observed by polling [`Node::payment`] for the returned
+	/// [`PaymentId`]; no user-facing event is emitted for the loop.
+	///
+	/// The raw [`ChannelManager`] is NOT exposed; this method is the sole entry
+	/// point for route-controlled self-pays.
+	///
+	/// [`Route`]: lightning::routing::router::Route
+	/// [`PaymentKind::Rebalance`]: crate::payment::PaymentKind::Rebalance
+	/// [`ChannelManager`]: crate::types::ChannelManager
+	#[cfg(feature = "cycles")]
+	pub fn send_along_route(
+		&self, route: lightning::routing::router::Route, amount_msat: u64,
+		payment_hash: lightning_types::payment::PaymentHash,
+		preimage: lightning_types::payment::PaymentPreimage,
+	) -> Result<PaymentId, Error> {
+		use lightning::ln::channelmanager::{RecipientOnionFields, RetryableSendFailure};
+
+		let rt_lock = self.runtime.read().unwrap();
+		if rt_lock.is_none() {
+			return Err(Error::NotRunning);
+		}
+
+		let payment_id = PaymentId(payment_hash.0);
+
+		if let Some(existing) = self.payment_store.get(&payment_id) {
+			if existing.status == payment::PaymentStatus::Pending
+				|| existing.status == payment::PaymentStatus::Succeeded
+			{
+				log_error!(self.logger, "Rebalance payment error: duplicate payment_id.");
+				return Err(Error::DuplicatePayment);
+			}
+		}
+
+		let kind = payment::PaymentKind::Rebalance { hash: payment_hash, preimage };
+		let payment_record = PaymentDetails::new(
+			payment_id,
+			kind,
+			Some(amount_msat),
+			None,
+			payment::PaymentDirection::Outbound,
+			payment::PaymentStatus::Pending,
+		);
+		self.payment_store.insert(payment_record).map_err(|e| {
+			log_error!(self.logger, "Failed to insert rebalance payment record: {}", e);
+			e
+		})?;
+
+		match self.channel_manager.send_payment_with_route(
+			route,
+			payment_hash,
+			RecipientOnionFields::spontaneous_empty(),
+			payment_id,
+		) {
+			Ok(()) => {
+				log_info!(
+					self.logger,
+					"Initiated self-rebalance of {}msat (payment_id: {}).",
+					amount_msat,
+					payment_id,
+				);
+				Ok(payment_id)
+			},
+			Err(RetryableSendFailure::DuplicatePayment) => Err(Error::DuplicatePayment),
+			Err(e) => {
+				let update = payment::store::PaymentDetailsUpdate {
+					status: Some(payment::PaymentStatus::Failed),
+					..payment::store::PaymentDetailsUpdate::new(payment_id)
+				};
+				let _ = self.payment_store.update(&update);
+				log_error!(
+					self.logger,
+					"Self-rebalance send failed ({:?}) for payment_id {}.",
+					e,
+					payment_id,
+				);
+				Err(Error::PaymentSendingFailed)
+			},
+		}
+	}
+
 	/// Returns a payment handler allowing to send and receive on-chain payments.
 	#[cfg(not(feature = "uniffi"))]
 	pub fn onchain_payment(&self) -> OnchainPayment {

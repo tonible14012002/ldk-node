@@ -573,7 +573,11 @@ where
 			} => {
 				let payment_id = PaymentId(payment_hash.0);
 				if let Some(info) = self.payment_store.get(&payment_id) {
-					if info.direction == PaymentDirection::Outbound {
+					// Guard 1: refuse circular (self-loop) payments, EXCEPT for
+					// self-rebalance loops tagged as PaymentKind::Rebalance. Cross-node
+					// payments are never caught here (the remote recipient has no local
+					// Outbound record under the inbound hash).
+					if info.direction == PaymentDirection::Outbound && !info.is_rebalance() {
 						log_info!(
 							self.logger,
 							"Refused inbound payment with ID {}: circular payments are unsupported.",
@@ -594,8 +598,13 @@ where
 						};
 					}
 
+					// Guard 2: refuse duplicate Succeeded payments and plain Spontaneous
+					// inbound payments. Self-rebalance loops (PaymentKind::Rebalance) must
+					// fall through here so we can claim the HTLC using our locally-held
+					// preimage and settle the loop.
 					if info.status == PaymentStatus::Succeeded
-						|| matches!(info.kind, PaymentKind::Spontaneous { .. })
+						|| (matches!(info.kind, PaymentKind::Spontaneous { .. })
+							&& !info.is_rebalance())
 					{
 						log_info!(
 							self.logger,
@@ -677,6 +686,32 @@ where
 							}
 							_ => debug_assert!(false, "We only expect the counterparty to get away with withholding fees for JIT payments."),
 						}
+					}
+
+					// For self-rebalance loops the preimage is held locally in the
+					// Rebalance record. Claim immediately without inserting a new
+					// payment record (the outbound record already exists).
+					if let PaymentKind::Rebalance { preimage, .. } = info.kind {
+						log_info!(
+							self.logger,
+							"Claiming self-rebalance loop for payment hash {} of {}msat",
+							hex_utils::to_string(&payment_hash.0),
+							amount_msat,
+						);
+						self.channel_manager.claim_funds(preimage);
+
+						let update = PaymentDetailsUpdate {
+							status: Some(PaymentStatus::Succeeded),
+							amount_msat: Some(Some(amount_msat)),
+							..PaymentDetailsUpdate::new(payment_id)
+						};
+						match self.payment_store.update(&update) {
+							Ok(_) => return Ok(()),
+							Err(e) => {
+								log_error!(self.logger, "Failed to access payment store: {}", e);
+								return Err(ReplayEvent());
+							},
+						};
 					}
 
 					// If this is known by the store but ChannelManager doesn't know the preimage,

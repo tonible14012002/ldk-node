@@ -61,6 +61,15 @@ impl PaymentDetails {
 			.as_secs();
 		Self { id, kind, amount_msat, fee_paid_msat, direction, status, latest_update_timestamp }
 	}
+
+	/// Returns `true` if this is a circular self-rebalance payment sent along a
+	/// caller-supplied route.
+	///
+	/// Used by the `event.rs` `PaymentClaimable` handler to allow the self-loop to
+	/// settle instead of being refused as a circular payment.
+	pub(crate) fn is_rebalance(&self) -> bool {
+		matches!(self.kind, PaymentKind::Rebalance { .. })
+	}
 }
 
 impl Writeable for PaymentDetails {
@@ -445,6 +454,18 @@ pub enum PaymentKind {
 		/// The pre-image used by the payment.
 		preimage: Option<PaymentPreimage>,
 	},
+	/// A circular self-rebalance payment sent along a caller-supplied route.
+	///
+	/// The sender generates the preimage locally, sends the payment over a pinned
+	/// route (out-channel A → intermediaries → in-channel B → self), and claims it on
+	/// receipt. The `event.rs` `PaymentClaimable` guard falls through for this kind so
+	/// the loop is allowed to settle — all other self-loops are still refused.
+	Rebalance {
+		/// The payment hash, i.e., the hash of the `preimage`.
+		hash: PaymentHash,
+		/// The pre-image used by the payment (held locally by the initiating node).
+		preimage: PaymentPreimage,
+	},
 }
 
 impl_writeable_tlv_based_enum!(PaymentKind,
@@ -482,6 +503,10 @@ impl_writeable_tlv_based_enum!(PaymentKind,
 		(2, preimage, option),
 		(3, quantity, option),
 		(4, secret, option),
+	},
+	(12, Rebalance) => {
+		(0, hash, required),
+		(2, preimage, required),
 	}
 );
 
