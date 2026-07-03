@@ -1006,6 +1006,29 @@ impl Node {
 			}
 		}
 
+		// Register `payment_hash` with the ChannelManager's STATELESS inbound-payment
+		// verifier so the looped HTLC is receivable at the final hop. Without this the
+		// final onion payload carries neither a payment secret nor a keysend preimage
+		// and LDK fails it with "We require payment_secrets" BEFORE any
+		// `PaymentClaimable` fires — the loop could never settle. This creates NO
+		// payment-store record (unlike `Bolt11Payment::receive_for_hash`), so the
+		// scoped circular guard still sees only our single Outbound Rebalance record.
+		// `min_value_msat = amount_msat` means an underpaying HTLC never even surfaces
+		// a claimable event (no proof-of-payment leak); the secret only ever travels
+		// inside the onion we build, so no third party can construct a claimable HTLC
+		// for this hash.
+		let payment_secret = self
+			.channel_manager
+			.create_inbound_payment_for_hash(payment_hash, Some(amount_msat), 3600, None)
+			.map_err(|()| {
+				log_error!(
+					self.logger,
+					"Failed to register rebalance inbound payment for payment_id {}.",
+					payment_id,
+				);
+				Error::PaymentSendingFailed
+			})?;
+
 		let kind = payment::PaymentKind::Rebalance { hash: payment_hash, preimage };
 		let payment_record = PaymentDetails::new(
 			payment_id,
@@ -1023,7 +1046,7 @@ impl Node {
 		match self.channel_manager.send_payment_with_route(
 			route,
 			payment_hash,
-			RecipientOnionFields::spontaneous_empty(),
+			RecipientOnionFields::secret_only(payment_secret),
 			payment_id,
 		) {
 			Ok(()) => {

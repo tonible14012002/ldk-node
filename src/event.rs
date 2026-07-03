@@ -692,6 +692,21 @@ where
 					// Rebalance record. Claim immediately without inserting a new
 					// payment record (the outbound record already exists).
 					if let PaymentKind::Rebalance { preimage, .. } = info.kind {
+						// Belt-and-braces amount pin: the stateless inbound registration
+						// already enforces `min_value_msat = amount` before this event can
+						// fire, but never reveal the preimage for less than the recorded
+						// loop amount.
+						if amount_msat < info.amount_msat.unwrap_or(0) {
+							log_error!(
+								self.logger,
+								"Refusing underpaying self-rebalance HTLC for payment hash {}: got {}msat, expected {}msat",
+								hex_utils::to_string(&payment_hash.0),
+								amount_msat,
+								info.amount_msat.unwrap_or(0),
+							);
+							self.channel_manager.fail_htlc_backwards(&payment_hash);
+							return Ok(());
+						}
 						log_info!(
 							self.logger,
 							"Claiming self-rebalance loop for payment hash {} of {}msat",
