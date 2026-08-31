@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::logger::{log_error, log_info, LdkLogger};
+use crate::logger::{log_debug, log_error, log_info, LdkLogger};
 use crate::types::PeerManager;
 use crate::Error;
 
@@ -19,12 +19,26 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Number of consecutive failed dial attempts between ERROR-level reports for a
+/// single peer.
+///
+/// A node whose peer pool contains many unreachable addresses redials them on
+/// every sweep, and logging each attempt makes the failures the largest thing
+/// in the log while telling an operator nothing the first one did not. The
+/// first failure and every `CONNECT_FAILURE_LOG_INTERVAL`-th one after it are
+/// reported at ERROR; the attempts in between stay at DEBUG.
+const CONNECT_FAILURE_LOG_INTERVAL: u64 = 64;
+
 pub(crate) struct ConnectionManager<L: Deref + Clone + Sync + Send>
 where
 	L::Target: LdkLogger,
 {
 	pending_connections:
 		Mutex<HashMap<PublicKey, Vec<tokio::sync::oneshot::Sender<Result<(), Error>>>>>,
+	/// Consecutive failed dial attempts per peer, used to rate-limit the
+	/// failure reports. An entry is removed as soon as the peer connects, so
+	/// the map is bounded by the number of peers that are currently failing.
+	connect_failures: Mutex<HashMap<PublicKey, u64>>,
 	peer_manager: Arc<PeerManager>,
 	logger: L,
 }
@@ -35,7 +49,8 @@ where
 {
 	pub(crate) fn new(peer_manager: Arc<PeerManager>, logger: L) -> Self {
 		let pending_connections = Mutex::new(HashMap::new());
-		Self { pending_connections, peer_manager, logger }
+		let connect_failures = Mutex::new(HashMap::new());
+		Self { pending_connections, connect_failures, peer_manager, logger }
 	}
 
 	pub(crate) async fn connect_peer_if_necessary(
@@ -63,7 +78,7 @@ where
 			})?;
 		}
 
-		log_info!(self.logger, "Connecting to peer: {}@{}", node_id, addr);
+		log_debug!(self.logger, "Connecting to peer: {}@{}", node_id, addr);
 
 		let socket_addr = addr
 			.to_socket_addrs()
@@ -104,14 +119,55 @@ where
 				}
 			},
 			None => {
-				log_error!(self.logger, "Failed to connect to peer: {}@{}", node_id, addr);
+				self.log_connect_failure(&node_id, &addr);
 				Err(Error::ConnectionFailed)
 			},
 		};
 
+		if res.is_ok() {
+			self.clear_connect_failures(&node_id);
+		}
+
 		self.propagate_result_to_subscribers(&node_id, res);
 
 		res
+	}
+
+	/// Records a failed dial and reports it at a rate that does not scale with
+	/// how often the peer is retried. See [`CONNECT_FAILURE_LOG_INTERVAL`].
+	fn log_connect_failure(&self, node_id: &PublicKey, addr: &SocketAddress) {
+		let failures = {
+			let mut connect_failures_lock = self.connect_failures.lock().unwrap();
+			let entry = connect_failures_lock.entry(*node_id).or_insert(0);
+			*entry = entry.saturating_add(1);
+			*entry
+		};
+
+		if failures == 1 || failures % CONNECT_FAILURE_LOG_INTERVAL == 0 {
+			log_error!(
+				self.logger,
+				"Failed to connect to peer: {}@{} ({} consecutive failures)",
+				node_id,
+				addr,
+				failures
+			);
+		} else {
+			log_debug!(self.logger, "Failed to connect to peer: {}@{}", node_id, addr);
+		}
+	}
+
+	/// Clears the failure count for a peer that just connected, reporting the
+	/// recovery when there was a run of failures to clear.
+	fn clear_connect_failures(&self, node_id: &PublicKey) {
+		let failures = self.connect_failures.lock().unwrap().remove(node_id);
+		if let Some(failures) = failures.filter(|failures| *failures > 0) {
+			log_info!(
+				self.logger,
+				"Connected to peer {} after {} failed attempts",
+				node_id,
+				failures
+			);
+		}
 	}
 
 	fn register_or_subscribe_pending_connection(

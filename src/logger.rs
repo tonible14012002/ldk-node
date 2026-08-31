@@ -19,9 +19,10 @@ use log::Record as LogFacadeRecord;
 #[cfg(not(feature = "uniffi"))]
 use core::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// A unit of logging output with metadata to enable filtering `module_path`,
 /// `file`, and `line` to inform on log's source.
@@ -104,10 +105,122 @@ pub trait LogWriter: Send + Sync {
 	fn log(&self, record: LogRecord);
 }
 
+/// How long a buffered record may sit unwritten before the next record forces a
+/// flush. Bounds how much of the tail is lost if the process dies without
+/// paying a syscall per line.
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Capacity of the buffer held in front of the log file.
+const LOG_BUFFER_BYTES: usize = 16 * 1024;
+
+/// The log file behind [`Writer::FileWriter`], held open and buffered across
+/// records rather than reopened for each one.
+///
+/// The handle is opened in append mode, so it stays correct across a
+/// `copytruncate` rotation: writes continue at the new end of the same inode.
+/// Rotation that *renames* the file would leave this handle attached to the
+/// rotated copy, so the packaged logrotate rule must keep using `copytruncate`.
+pub(crate) struct FileSink {
+	sink: Option<BufWriter<fs::File>>,
+	dropped_records: u64,
+	last_flush: Instant,
+}
+
+impl FileSink {
+	fn new() -> Self {
+		Self { sink: None, dropped_records: 0, last_flush: Instant::now() }
+	}
+
+	/// Writes one already-formatted record.
+	///
+	/// Logging must never take the node down, so an I/O failure here is counted
+	/// and reported with the next record that gets through instead of being
+	/// propagated or panicked on.
+	fn write_record(&mut self, file_path: &str, level: LogLevel, record: &str) {
+		if !self.ensure_open(file_path) {
+			self.dropped_records = self.dropped_records.saturating_add(1);
+			return;
+		}
+
+		if let Some(notice) = self.take_dropped_notice() {
+			let _ = self.write_bytes(notice.as_bytes());
+		}
+
+		if self.write_bytes(record.as_bytes()).is_err() {
+			// Drop the handle so the next record reopens the file.
+			self.sink = None;
+			self.dropped_records = self.dropped_records.saturating_add(1);
+			return;
+		}
+
+		if level >= LogLevel::Warn || self.last_flush.elapsed() >= LOG_FLUSH_INTERVAL {
+			self.flush();
+		}
+	}
+
+	fn ensure_open(&mut self, file_path: &str) -> bool {
+		if self.sink.is_some() {
+			return true;
+		}
+
+		match fs::OpenOptions::new().create(true).append(true).open(file_path) {
+			Ok(file) => {
+				self.sink = Some(BufWriter::with_capacity(LOG_BUFFER_BYTES, file));
+				true
+			},
+			Err(_) => false,
+		}
+	}
+
+	fn write_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+		match self.sink.as_mut() {
+			Some(sink) => sink.write_all(bytes),
+			None => {
+				Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "log file is not open"))
+			},
+		}
+	}
+
+	/// Renders a record accounting for anything lost while the file was
+	/// unwritable, so a silent gap in the log is never silent.
+	fn take_dropped_notice(&mut self) -> Option<String> {
+		if self.dropped_records == 0 {
+			return None;
+		}
+
+		let dropped = self.dropped_records;
+		self.dropped_records = 0;
+		Some(format!(
+			"{} {:<5} [{}:{}] dropped {} log records: the log file could not be written\n",
+			Utc::now().format("%Y-%m-%d %H:%M:%S"),
+			LogLevel::Warn.to_string(),
+			module_path!(),
+			line!(),
+			dropped
+		))
+	}
+
+	fn flush(&mut self) {
+		if let Some(sink) = self.sink.as_mut() {
+			if sink.flush().is_err() {
+				self.sink = None;
+				return;
+			}
+		}
+		self.last_flush = Instant::now();
+	}
+}
+
+impl Drop for FileSink {
+	fn drop(&mut self) {
+		self.flush();
+	}
+}
+
 /// Defines a writer for [`Logger`].
 pub(crate) enum Writer {
 	/// Writes logs to the file system.
-	FileWriter { file_path: String, max_log_level: LogLevel },
+	FileWriter { file_path: String, max_log_level: LogLevel, sink: Mutex<FileSink> },
 	/// Forwards logs to the `log` facade.
 	LogFacadeWriter,
 	/// Forwards logs to a custom writer.
@@ -117,7 +230,7 @@ pub(crate) enum Writer {
 impl LogWriter for Writer {
 	fn log(&self, record: LogRecord) {
 		match self {
-			Writer::FileWriter { file_path, max_log_level } => {
+			Writer::FileWriter { file_path, max_log_level, sink } => {
 				if record.level < *max_log_level {
 					return;
 				}
@@ -131,13 +244,8 @@ impl LogWriter for Writer {
 					record.args
 				);
 
-				fs::OpenOptions::new()
-					.create(true)
-					.append(true)
-					.open(file_path)
-					.expect("Failed to open log file")
-					.write_all(log.as_bytes())
-					.expect("Failed to write to log file")
+				let mut sink_lock = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+				sink_lock.write_record(file_path, record.level, &log);
 			},
 			Writer::LogFacadeWriter => {
 				let mut builder = LogFacadeRecord::builder();
@@ -196,7 +304,13 @@ impl Logger {
 				.map_err(|e| eprintln!("ERROR: Failed to open log file: {}", e))?;
 		}
 
-		Ok(Self { writer: Writer::FileWriter { file_path, max_log_level } })
+		Ok(Self {
+			writer: Writer::FileWriter {
+				file_path,
+				max_log_level,
+				sink: Mutex::new(FileSink::new()),
+			},
+		})
 	}
 
 	/// Creates a new logger that forwards logs to the `log` facade.
@@ -213,7 +327,7 @@ impl Logger {
 impl LdkLogger for Logger {
 	fn log(&self, record: LdkRecord) {
 		match &self.writer {
-			Writer::FileWriter { file_path: _, max_log_level } => {
+			Writer::FileWriter { max_log_level, .. } => {
 				if record.level < *max_log_level {
 					return;
 				}
@@ -226,5 +340,87 @@ impl LdkLogger for Logger {
 				self.writer.log(record.into());
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	fn temp_log_path(tag: &str) -> String {
+		static COUNTER: AtomicUsize = AtomicUsize::new(0);
+		let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+		std::env::temp_dir()
+			.join(format!("ldk-node-logger-{}-{}-{}.log", tag, std::process::id(), unique))
+			.to_string_lossy()
+			.into_owned()
+	}
+
+	fn read(path: &str) -> String {
+		fs::read_to_string(path).unwrap_or_default()
+	}
+
+	#[test]
+	fn buffers_until_a_serious_record_forces_a_flush() {
+		let path = temp_log_path("buffering");
+		let mut sink = FileSink::new();
+
+		sink.write_record(&path, LogLevel::Debug, "debug line\n");
+		assert_eq!(read(&path), "", "a debug record should still be buffered");
+
+		sink.write_record(&path, LogLevel::Error, "error line\n");
+		assert_eq!(
+			read(&path),
+			"debug line\nerror line\n",
+			"an error record must flush what is buffered behind it"
+		);
+
+		let _ = fs::remove_file(&path);
+	}
+
+	#[test]
+	fn keeps_writing_after_the_file_is_truncated_in_place() {
+		let path = temp_log_path("copytruncate");
+		let mut sink = FileSink::new();
+
+		sink.write_record(&path, LogLevel::Error, "before rotation\n");
+		assert_eq!(read(&path), "before rotation\n");
+
+		// Exactly what `logrotate ... copytruncate` does: same inode, zero length.
+		fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
+		assert_eq!(read(&path), "");
+
+		sink.write_record(&path, LogLevel::Error, "after rotation\n");
+		assert_eq!(
+			read(&path),
+			"after rotation\n",
+			"the held handle must follow a copytruncate rotation"
+		);
+
+		let _ = fs::remove_file(&path);
+	}
+
+	#[test]
+	fn counts_unwritable_records_and_reports_them_once_writing_recovers() {
+		let unwritable = format!("{}/does-not-exist/ldk_node.log", temp_log_path("unwritable"));
+		let mut sink = FileSink::new();
+
+		sink.write_record(&unwritable, LogLevel::Error, "lost line\n");
+		assert_eq!(sink.dropped_records, 1, "a failed open must be counted, not panic");
+
+		let path = temp_log_path("recovery");
+		sink.write_record(&path, LogLevel::Error, "kept line\n");
+
+		let written = read(&path);
+		assert!(
+			written.contains("dropped 1 log records"),
+			"the gap must be reported once writing recovers, got: {}",
+			written
+		);
+		assert!(written.ends_with("kept line\n"));
+		assert_eq!(sink.dropped_records, 0);
+
+		let _ = fs::remove_file(&path);
 	}
 }
