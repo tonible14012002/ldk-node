@@ -28,20 +28,20 @@ use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
 
 #[cfg(feature = "swaps")]
-use bitcoin::{ScriptBuf, Txid};
-#[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
+#[cfg(feature = "swaps")]
+use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
 /// Fee estimates from an Esplora server's `/fee-estimates` endpoint.
-pub(crate) struct EsploraFeeAdapter {
+pub(crate) struct EsploraChainAdapter {
 	client: EsploraAsyncClient,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
 }
 
-impl EsploraFeeAdapter {
+impl EsploraChainAdapter {
 	pub(crate) fn new(
 		client: EsploraAsyncClient, config: Arc<Config>, logger: Arc<Logger>,
 	) -> Self {
@@ -50,7 +50,7 @@ impl EsploraFeeAdapter {
 }
 
 #[async_trait]
-impl FeeAdapter for EsploraFeeAdapter {
+impl FeeAdapter for EsploraChainAdapter {
 	fn name(&self) -> &'static str {
 		"esplora"
 	}
@@ -113,15 +113,13 @@ impl FeeAdapter for EsploraFeeAdapter {
 }
 
 #[async_trait]
-impl LookupAdapter for EsploraFeeAdapter {
+impl LookupAdapter for EsploraChainAdapter {
 	fn name(&self) -> &'static str {
 		"esplora"
 	}
 
 	#[cfg(feature = "swaps")]
-	async fn tx_status(
-		&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>,
-	) -> RawTxObservation {
+	async fn tx_status(&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
 		let status = match self.client.get_tx_status(&txid).await {
 			Ok(status) => status,
 			Err(esplora_client::Error::HttpResponse { status: 404, .. }) => {
@@ -191,7 +189,7 @@ impl LookupAdapter for EsploraFeeAdapter {
 }
 
 #[async_trait]
-impl BroadcastAdapter for EsploraFeeAdapter {
+impl BroadcastAdapter for EsploraChainAdapter {
 	fn name(&self) -> &'static str {
 		"esplora"
 	}

@@ -22,9 +22,9 @@ use crate::fee_estimator::ConfirmationTarget;
 use crate::Error;
 
 #[cfg(feature = "swaps")]
-use bitcoin::{ScriptBuf, Txid};
-#[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
+#[cfg(feature = "swaps")]
+use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
@@ -111,9 +111,7 @@ pub(crate) trait LookupAdapter: Send + Sync {
 	/// could be folded into "confirmed", because callers arm CSV and claim
 	/// deadlines off this answer.
 	#[cfg(feature = "swaps")]
-	async fn tx_status(
-		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
-	) -> RawTxObservation;
+	async fn tx_status(&self, txid: Txid, script_pubkey: Option<&ScriptBuf>) -> RawTxObservation;
 
 	/// The UTXO source used to verify BOLT-7 `channel_announcement`s.
 	///

@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::{ChainLayer, ChainSource, DEFAULT_ESPLORA_SERVER_URL};
+use crate::chain::{ChainLayer, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, BitcoindRestClientConfig, Config,
 	ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
@@ -13,6 +13,7 @@ use crate::config::{
 };
 
 use crate::connection::ConnectionManager;
+use crate::custom_gossip::CustomGossipMessageHandler;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
@@ -26,7 +27,6 @@ use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
 };
 use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
-use crate::custom_gossip::CustomGossipMessageHandler;
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::peer_store::PeerStore;
 use crate::tx_broadcaster::TransactionBroadcaster;
@@ -436,7 +436,7 @@ impl NodeBuilder {
 	///
 	/// When enabled, the node will be able to send and receive custom gossip messages
 	/// containing metadata extensions to the standard Lightning gossip protocol.
-	/// 
+	///
 	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
 	/// up to 4096 bytes in length.
 	pub fn enable_custom_gossip(&mut self) -> &mut Self {
@@ -878,7 +878,7 @@ impl ArcedNodeBuilder {
 	///
 	/// When enabled, the node will be able to send and receive custom gossip messages
 	/// containing metadata extensions to the standard Lightning gossip protocol.
-	/// 
+	///
 	/// Custom gossip messages use message type 32769 and can contain arbitrary metadata
 	/// up to 4096 bytes in length.
 	pub fn enable_custom_gossip(&self) {
@@ -1145,10 +1145,12 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 	));
 
-	let legacy_chain_source = match chain_data_source_config {
+	// The chain ability seam. Every consumer below talks to `ChainLayer`; none
+	// of them knows which backend fills its slots.
+	let chain_source = match chain_data_source_config {
 		Some(ChainDataSourceConfig::Esplora { server_url, sync_config }) => {
 			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
-			Arc::new(ChainSource::new_esplora(
+			ChainLayer::new_esplora(
 				server_url.clone(),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1158,11 +1160,11 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			))
+			)
 		},
 		Some(ChainDataSourceConfig::Electrum { server_url, sync_config }) => {
 			let sync_config = sync_config.unwrap_or(ElectrumSyncConfig::default());
-			Arc::new(ChainSource::new_electrum(
+			ChainLayer::new_electrum(
 				server_url.clone(),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1172,7 +1174,7 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			))
+			)
 		},
 		Some(ChainDataSourceConfig::Bitcoind {
 			rpc_host,
@@ -1181,7 +1183,7 @@ fn build_with_store_internal(
 			rpc_password,
 			rest_client_config,
 		}) => match rest_client_config {
-			Some(rest_client_config) => Arc::new(ChainSource::new_bitcoind_rest(
+			Some(rest_client_config) => ChainLayer::new_bitcoind_rest(
 				rpc_host.clone(),
 				*rpc_port,
 				rpc_user.clone(),
@@ -1194,8 +1196,8 @@ fn build_with_store_internal(
 				rest_client_config.clone(),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			)),
-			None => Arc::new(ChainSource::new_bitcoind_rpc(
+			),
+			None => ChainLayer::new_bitcoind_rpc(
 				rpc_host.clone(),
 				*rpc_port,
 				rpc_user.clone(),
@@ -1207,14 +1209,14 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			)),
+			),
 		},
 
 		None => {
 			// Default to Esplora client.
 			let server_url = DEFAULT_ESPLORA_SERVER_URL.to_string();
 			let sync_config = EsploraSyncConfig::default();
-			Arc::new(ChainSource::new_esplora(
+			ChainLayer::new_esplora(
 				server_url.clone(),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1224,13 +1226,11 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			))
+			)
 		},
 	};
 
-	// The chain ability seam. Every consumer below talks to `ChainLayer`, never
-	// to a concrete chain source.
-	let chain_source = Arc::new(ChainLayer::new(legacy_chain_source));
+	let chain_source = Arc::new(chain_source);
 
 	let runtime = Arc::new(RwLock::new(None));
 
@@ -1561,22 +1561,21 @@ fn build_with_store_internal(
 
 				let liquidity_source = Arc::new(liquidity_source_builder.build());
 				let custom_message_handler = Arc::new(NodeCustomMessageHandler::new_liquidity(
-					Arc::clone(&liquidity_source)
+					Arc::clone(&liquidity_source),
 				));
 				(Some(liquidity_source), custom_message_handler)
 			},
 			(false, true) => {
 				// Only custom gossip enabled
 				let gossip_handler = Arc::new(CustomGossipMessageHandler::new(Arc::clone(&logger)));
-				let custom_message_handler = Arc::new(NodeCustomMessageHandler::new_custom_gossip(
-					gossip_handler
-				));
+				let custom_message_handler =
+					Arc::new(NodeCustomMessageHandler::new_custom_gossip(gossip_handler));
 				(None, custom_message_handler)
 			},
 			(false, false) => {
 				// Neither enabled
 				(None, Arc::new(NodeCustomMessageHandler::new_ignoring()))
-			}
+			},
 		}
 	};
 

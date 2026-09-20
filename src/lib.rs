@@ -292,10 +292,11 @@ impl Node {
 		let slots = self.chain_source.slot_adapters();
 		log_info!(
 			self.logger,
-			"Chain ability slots: fee={} lookup={} broadcast={}",
+			"Chain ability slots: fee={} lookup={} broadcast={} (sync engine: {})",
 			slots.fee,
 			slots.lookup,
-			slots.broadcast
+			slots.broadcast,
+			slots.engine
 		);
 		if !slots.verifies_announcements {
 			// Say this out loud. Without a UTXO source the routing graph accepts

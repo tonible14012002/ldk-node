@@ -30,11 +30,11 @@ use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
 
 #[cfg(feature = "swaps")]
+use crate::chain::RawTxObservation;
+#[cfg(feature = "swaps")]
 use bitcoin::{ScriptBuf, Txid};
 #[cfg(feature = "swaps")]
 use lightning_block_sync::BlockSource;
-#[cfg(feature = "swaps")]
-use crate::chain::RawTxObservation;
 
 use async_trait::async_trait;
 
@@ -43,7 +43,7 @@ use async_trait::async_trait;
 /// Unlike the other backends this picks the estimation *mode* per
 /// [`ConfirmationTarget`], not per block count, which is why the adapter
 /// contract is target-shaped rather than block-count-shaped.
-pub(crate) struct BitcoindFeeAdapter {
+pub(crate) struct BitcoindChainAdapter {
 	api_client: Arc<BitcoindClient>,
 	/// Cached best-chain tip, shared with the block-polling engine that
 	/// maintains it. Used only as a fail-soft fallback for deriving a height.
@@ -52,7 +52,7 @@ pub(crate) struct BitcoindFeeAdapter {
 	logger: Arc<Logger>,
 }
 
-impl BitcoindFeeAdapter {
+impl BitcoindChainAdapter {
 	pub(crate) fn new(
 		api_client: Arc<BitcoindClient>,
 		latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>, config: Arc<Config>,
@@ -63,7 +63,7 @@ impl BitcoindFeeAdapter {
 }
 
 #[async_trait]
-impl FeeAdapter for BitcoindFeeAdapter {
+impl FeeAdapter for BitcoindChainAdapter {
 	fn name(&self) -> &'static str {
 		"bitcoind"
 	}
@@ -171,15 +171,13 @@ impl FeeAdapter for BitcoindFeeAdapter {
 }
 
 #[async_trait]
-impl LookupAdapter for BitcoindFeeAdapter {
+impl LookupAdapter for BitcoindChainAdapter {
 	fn name(&self) -> &'static str {
 		"bitcoind"
 	}
 
 	#[cfg(feature = "swaps")]
-	async fn tx_status(
-		&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>,
-	) -> RawTxObservation {
+	async fn tx_status(&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
 		match self.api_client.swap_tx_confirmations(&txid).await {
 			Ok(Some(0)) => RawTxObservation::InMempool,
 			Ok(Some(confirmations)) => {
@@ -207,8 +205,7 @@ impl LookupAdapter for BitcoindFeeAdapter {
 						self.latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
 					},
 				};
-				let height =
-					tip_height.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
+				let height = tip_height.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
 				RawTxObservation::Confirmed { height, confirmations }
 			},
 			Ok(None) => RawTxObservation::NotFound,
@@ -227,7 +224,7 @@ impl LookupAdapter for BitcoindFeeAdapter {
 }
 
 #[async_trait]
-impl BroadcastAdapter for BitcoindFeeAdapter {
+impl BroadcastAdapter for BitcoindChainAdapter {
 	fn name(&self) -> &'static str {
 		"bitcoind"
 	}

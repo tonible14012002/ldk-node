@@ -8,18 +8,13 @@
 //! The chain ability seam.
 //!
 //! [`ChainLayer`] is the single entry point the rest of the crate uses to reach
-//! the Bitcoin chain. It exists so the three chain *abilities* — fee estimation,
-//! lookup, and broadcast — can each be served by an independently chosen
-//! adapter, instead of all three being implied by one closed "which chain source
-//! is configured" enum.
+//! the Bitcoin chain. The three chain *abilities* — fee estimation, lookup and
+//! broadcast — each occupy a slot that one adapter fills, and the wallet sync
+//! engine is a separate explicit axis.
 //!
-//! Phase 1 introduces the type and routes every caller through it while the
-//! legacy [`ChainSource`] enum still does the work. Abilities then migrate out of
-//! the enum one at a time; the enum is deleted once it is empty. Until then this
-//! is deliberately pure indirection: **every method here must behave exactly as
-//! the call it replaces.**
+//! Nothing outside slot construction branches on which backend is configured.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lightning::chain::{Filter, WatchedOutput};
@@ -27,13 +22,23 @@ use lightning::chain::{Filter, WatchedOutput};
 use bitcoin::{Script, ScriptBuf, Txid};
 
 use lightning_block_sync::gossip::UtxoSource;
+use lightning_transaction_sync::EsploraSyncClient;
 
+use crate::chain::adapters::bitcoind::BitcoindChainAdapter;
+use crate::chain::adapters::electrum::ElectrumChainAdapter;
+use crate::chain::adapters::esplora::EsploraChainAdapter;
+use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache};
+use crate::chain::engine::bitcoind::BitcoindSyncEngine;
+use crate::chain::engine::electrum::ElectrumSyncEngine;
+use crate::chain::engine::esplora::EsploraSyncEngine;
+use crate::chain::engine::SyncEngine;
 use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
-use crate::chain::ChainSource;
+use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
+use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_info, LdkLogger, Logger};
-use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper};
+use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
 #[cfg(feature = "swaps")]
@@ -44,6 +49,7 @@ pub(crate) struct ChainSlotAdapters {
 	pub(crate) fee: &'static str,
 	pub(crate) lookup: &'static str,
 	pub(crate) broadcast: &'static str,
+	pub(crate) engine: &'static str,
 	/// Whether the lookup slot can verify BOLT-7 channel announcements.
 	/// `false` means the routing graph carries unverified capacities.
 	pub(crate) verifies_announcements: bool,
@@ -66,22 +72,209 @@ pub(crate) struct ChainLayer {
 	lookup: Arc<dyn LookupAdapter>,
 	/// SLOT 3 — transaction broadcast.
 	broadcast: Arc<dyn BroadcastAdapter>,
+	/// Wallet synchronisation. A separate axis, not one of the slots.
+	engine: Arc<dyn SyncEngine>,
 	/// State shared by every slot's tail. Held once, rather than duplicated
-	/// into each chain-source variant as it was pre-seam.
+	/// into each backend as it was pre-seam.
 	shared: SharedChainCtx,
-	/// The pre-seam chain source. Shrinks to nothing as abilities are extracted
-	/// into slots, and is removed entirely at the end of Phase 1.
-	///
-	/// Held behind the `Arc` the builder already constructs purely to keep the
-	/// Phase 1 wiring diff minimal; it goes away with the field.
-	legacy: Arc<ChainSource>,
 }
 
 impl ChainLayer {
-	pub(crate) fn new(legacy: Arc<ChainSource>) -> Self {
-		let (fee, lookup, broadcast) = legacy.seam_slots();
-		let shared = legacy.shared_ctx();
-		Self { fee, lookup, broadcast, shared, legacy }
+	fn new(
+		fee: Arc<dyn FeeAdapter>, lookup: Arc<dyn LookupAdapter>,
+		broadcast: Arc<dyn BroadcastAdapter>, engine: Arc<dyn SyncEngine>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		Self {
+			fee,
+			lookup,
+			broadcast,
+			engine,
+			shared: SharedChainCtx {
+				fee_estimator,
+				tx_broadcaster,
+				kv_store,
+				logger,
+				node_metrics,
+			},
+		}
+	}
+
+	pub(crate) fn new_esplora(
+		server_url: String, sync_config: EsploraSyncConfig, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		// FIXME / TODO: We introduced this to make `bdk_esplora` work separately without updating
+		// `lightning-transaction-sync`. We should revert this as part of of the upgrade to LDK 0.2.
+		let mut client_builder_0_11 = esplora_client_0_11::Builder::new(&server_url);
+		client_builder_0_11 = client_builder_0_11.timeout(DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS);
+		let esplora_client_0_11 = client_builder_0_11.build_async().unwrap();
+		let tx_sync =
+			Arc::new(EsploraSyncClient::from_client(esplora_client_0_11, Arc::clone(&logger)));
+
+		let mut client_builder = esplora_client::Builder::new(&server_url);
+		client_builder = client_builder.timeout(DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS);
+		let esplora_client = client_builder.build_async().unwrap();
+
+		let adapter = Arc::new(EsploraChainAdapter::new(
+			esplora_client.clone(),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+		));
+
+		let engine = Arc::new(EsploraSyncEngine {
+			sync_config,
+			esplora_client,
+			onchain_wallet,
+			onchain_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
+			tx_sync,
+			lightning_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
+			kv_store: Arc::clone(&kv_store),
+			logger: Arc::clone(&logger),
+			node_metrics: Arc::clone(&node_metrics),
+		});
+
+		Self::new(
+			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
+			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
+			adapter as Arc<dyn BroadcastAdapter>,
+			engine,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			logger,
+			node_metrics,
+		)
+	}
+
+	pub(crate) fn new_electrum(
+		server_url: String, sync_config: ElectrumSyncConfig, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let electrum_runtime_status = Arc::new(RwLock::new(ElectrumRuntimeStatus::new()));
+
+		let adapter = Arc::new(ElectrumChainAdapter::new(
+			Arc::clone(&electrum_runtime_status),
+			Arc::clone(&logger),
+		));
+
+		let engine = Arc::new(ElectrumSyncEngine {
+			server_url,
+			sync_config,
+			electrum_runtime_status,
+			onchain_wallet,
+			onchain_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
+			lightning_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
+			kv_store: Arc::clone(&kv_store),
+			config,
+			logger: Arc::clone(&logger),
+			node_metrics: Arc::clone(&node_metrics),
+		});
+
+		Self::new(
+			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
+			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
+			adapter as Arc<dyn BroadcastAdapter>,
+			engine,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			logger,
+			node_metrics,
+		)
+	}
+
+	pub(crate) fn new_bitcoind_rpc(
+		rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
+		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
+		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let api_client =
+			Arc::new(BitcoindClient::new_rpc(rpc_host, rpc_port, rpc_user, rpc_password));
+		Self::from_bitcoind_client(
+			api_client,
+			onchain_wallet,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			config,
+			logger,
+			node_metrics,
+		)
+	}
+
+	pub(crate) fn new_bitcoind_rest(
+		rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
+		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
+		rest_client_config: BitcoindRestClientConfig, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let api_client = Arc::new(BitcoindClient::new_rest(
+			rest_client_config.rest_host,
+			rest_client_config.rest_port,
+			rpc_host,
+			rpc_port,
+			rpc_user,
+			rpc_password,
+		));
+		Self::from_bitcoind_client(
+			api_client,
+			onchain_wallet,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			config,
+			logger,
+			node_metrics,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn from_bitcoind_client(
+		api_client: Arc<BitcoindClient>, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let latest_chain_tip = Arc::new(RwLock::new(None));
+
+		let adapter = Arc::new(BitcoindChainAdapter::new(
+			Arc::clone(&api_client),
+			Arc::clone(&latest_chain_tip),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+		));
+
+		let engine = Arc::new(BitcoindSyncEngine {
+			api_client,
+			header_cache: tokio::sync::Mutex::new(BoundedHeaderCache::new()),
+			latest_chain_tip,
+			onchain_wallet,
+			wallet_polling_status: Mutex::new(WalletSyncStatus::Completed),
+			kv_store: Arc::clone(&kv_store),
+			config,
+			logger: Arc::clone(&logger),
+			node_metrics: Arc::clone(&node_metrics),
+		});
+
+		Self::new(
+			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
+			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
+			adapter as Arc<dyn BroadcastAdapter>,
+			engine,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			logger,
+			node_metrics,
+		)
 	}
 
 	/// Which adapter currently occupies each slot. For logs and diagnostics;
@@ -91,17 +284,18 @@ impl ChainLayer {
 			fee: self.fee.name(),
 			lookup: self.lookup.name(),
 			broadcast: self.broadcast.name(),
+			engine: self.engine.name(),
 			verifies_announcements: self.lookup.utxo_source().is_some(),
 		}
 	}
 
-	/// Start any runtime-dependent parts of the layer (currently Electrum only).
+	/// Start any runtime-dependent part of the layer (currently Electrum only).
 	pub(crate) fn start(&self, runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
-		self.legacy.start(runtime)
+		self.engine.start(runtime)
 	}
 
 	pub(crate) fn stop(&self) {
-		self.legacy.stop()
+		self.engine.stop()
 	}
 
 	/// The UTXO source used to verify BOLT-7 `channel_announcement`s, if the
@@ -116,9 +310,9 @@ impl ChainLayer {
 		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) {
-		let legacy = Arc::clone(&self.legacy);
-		legacy
-			.continuously_sync_wallets(
+		let engine = Arc::clone(&self.engine);
+		engine
+			.run_background(
 				self,
 				stop_sync_receiver,
 				channel_manager,
@@ -187,32 +381,15 @@ impl ChainLayer {
 
 	/// One full synchronous sync pass, as triggered by [`crate::Node::sync_wallets`].
 	///
-	/// The engine choice lives here rather than at the call site: a caller asks
-	/// for "sync everything once" and must not need to know which sync
-	/// architecture is in play. The per-engine call ORDER is load-bearing and is
-	/// reproduced exactly from the pre-seam implementation — in particular the
-	/// transaction-based engine syncs the Lightning wallet *before* the on-chain
-	/// wallet.
+	/// Fees first, then the engine — in both engine shapes, exactly as
+	/// pre-seam. Which engine is running is the engine's own business; this
+	/// does not branch on it.
 	pub(crate) async fn sync_wallets_once(
 		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
-		match &*self.legacy {
-			ChainSource::Esplora { .. } | ChainSource::Electrum { .. } => {
-				self.update_fee_rate_estimates().await?;
-				self.legacy
-					.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper)
-					.await?;
-				self.legacy.sync_onchain_wallet().await?;
-			},
-			ChainSource::Bitcoind { .. } => {
-				self.update_fee_rate_estimates().await?;
-				self.legacy
-					.poll_and_update_listeners(channel_manager, chain_monitor, output_sweeper)
-					.await?;
-			},
-		}
-		Ok(())
+		self.update_fee_rate_estimates().await?;
+		self.engine.sync_once(channel_manager, chain_monitor, output_sweeper).await
 	}
 
 	/// Reorg-aware status of a watched transaction (Peerswap native primitive B5).
@@ -226,16 +403,16 @@ impl ChainLayer {
 	/// The shared on-chain fee estimator (Peerswap native primitive B6).
 	#[cfg(feature = "swaps")]
 	pub(crate) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
-		self.legacy.fee_estimator()
+		&self.shared.fee_estimator
 	}
 }
 
 impl Filter for ChainLayer {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
-		self.legacy.register_tx(txid, script_pubkey)
+		self.engine.register_tx(txid, script_pubkey)
 	}
 
 	fn register_output(&self, output: WatchedOutput) {
-		self.legacy.register_output(output)
+		self.engine.register_output(output)
 	}
 }

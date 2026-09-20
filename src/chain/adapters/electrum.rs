@@ -20,11 +20,11 @@ use crate::logger::Logger;
 use crate::Error;
 
 #[cfg(feature = "swaps")]
-use bitcoin::{ScriptBuf, Txid};
-#[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 #[cfg(feature = "swaps")]
 use crate::logger::{log_error, LdkLogger};
+#[cfg(feature = "swaps")]
+use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
@@ -33,12 +33,12 @@ use async_trait::async_trait;
 /// The Electrum client batches all confirmation targets into one call and owns
 /// its own timeout and completeness policy, so this adapter is a thin shim over
 /// it rather than a per-target loop.
-pub(crate) struct ElectrumFeeAdapter {
+pub(crate) struct ElectrumChainAdapter {
 	runtime_status: Arc<RwLock<ElectrumRuntimeStatus>>,
 	logger: Arc<Logger>,
 }
 
-impl ElectrumFeeAdapter {
+impl ElectrumChainAdapter {
 	pub(crate) fn new(
 		runtime_status: Arc<RwLock<ElectrumRuntimeStatus>>, logger: Arc<Logger>,
 	) -> Self {
@@ -52,22 +52,20 @@ impl ElectrumFeeAdapter {
 }
 
 #[async_trait]
-impl FeeAdapter for ElectrumFeeAdapter {
+impl FeeAdapter for ElectrumChainAdapter {
 	fn name(&self) -> &'static str {
 		"electrum"
 	}
 
 	async fn fee_rate_update(&self) -> Result<FeeUpdate, Error> {
-		let electrum_client: Arc<ElectrumRuntimeClient> =
-			if let Some(client) = self.runtime_status.read().unwrap().client().as_ref() {
-				Arc::clone(client)
-			} else {
-				debug_assert!(
-					false,
-					"We should have started the chain source before updating fees"
-				);
-				return Err(Error::FeerateEstimationUpdateFailed);
-			};
+		let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
+			self.runtime_status.read().unwrap().client().as_ref()
+		{
+			Arc::clone(client)
+		} else {
+			debug_assert!(false, "We should have started the chain source before updating fees");
+			return Err(Error::FeerateEstimationUpdateFailed);
+		};
 
 		let cache = electrum_client.get_fee_rate_cache_update().await?;
 
@@ -76,15 +74,13 @@ impl FeeAdapter for ElectrumFeeAdapter {
 }
 
 #[async_trait]
-impl LookupAdapter for ElectrumFeeAdapter {
+impl LookupAdapter for ElectrumChainAdapter {
 	fn name(&self) -> &'static str {
 		"electrum"
 	}
 
 	#[cfg(feature = "swaps")]
-	async fn tx_status(
-		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
-	) -> RawTxObservation {
+	async fn tx_status(&self, txid: Txid, script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
 		let script_pubkey = match script_pubkey {
 			Some(script_pubkey) => script_pubkey.clone(),
 			None => {
@@ -114,7 +110,7 @@ impl LookupAdapter for ElectrumFeeAdapter {
 }
 
 #[async_trait]
-impl BroadcastAdapter for ElectrumFeeAdapter {
+impl BroadcastAdapter for ElectrumChainAdapter {
 	fn name(&self) -> &'static str {
 		"electrum"
 	}
