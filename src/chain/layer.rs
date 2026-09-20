@@ -28,7 +28,7 @@ use bitcoin::{Script, ScriptBuf, Txid};
 
 use lightning_block_sync::gossip::UtxoSource;
 
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate};
+use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
 use crate::chain::ChainSource;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::utils::write_node_metrics;
@@ -42,7 +42,11 @@ use crate::chain::RawTxObservation;
 /// Which adapter is serving each slot.
 pub(crate) struct ChainSlotAdapters {
 	pub(crate) fee: &'static str,
+	pub(crate) lookup: &'static str,
 	pub(crate) broadcast: &'static str,
+	/// Whether the lookup slot can verify BOLT-7 channel announcements.
+	/// `false` means the routing graph carries unverified capacities.
+	pub(crate) verifies_announcements: bool,
 }
 
 /// Everything a slot's shared tail needs once its adapter has answered.
@@ -58,6 +62,8 @@ pub(crate) struct SharedChainCtx {
 pub(crate) struct ChainLayer {
 	/// SLOT 1 — fee estimation.
 	fee: Arc<dyn FeeAdapter>,
+	/// SLOT 2 — chain lookup.
+	lookup: Arc<dyn LookupAdapter>,
 	/// SLOT 3 — transaction broadcast.
 	broadcast: Arc<dyn BroadcastAdapter>,
 	/// State shared by every slot's tail. Held once, rather than duplicated
@@ -73,15 +79,20 @@ pub(crate) struct ChainLayer {
 
 impl ChainLayer {
 	pub(crate) fn new(legacy: Arc<ChainSource>) -> Self {
-		let (fee, broadcast) = legacy.seam_slots();
+		let (fee, lookup, broadcast) = legacy.seam_slots();
 		let shared = legacy.shared_ctx();
-		Self { fee, broadcast, shared, legacy }
+		Self { fee, lookup, broadcast, shared, legacy }
 	}
 
 	/// Which adapter currently occupies each slot. For logs and diagnostics;
 	/// nothing may branch on it.
 	pub(crate) fn slot_adapters(&self) -> ChainSlotAdapters {
-		ChainSlotAdapters { fee: self.fee.name(), broadcast: self.broadcast.name() }
+		ChainSlotAdapters {
+			fee: self.fee.name(),
+			lookup: self.lookup.name(),
+			broadcast: self.broadcast.name(),
+			verifies_announcements: self.lookup.utxo_source().is_some(),
+		}
 	}
 
 	/// Start any runtime-dependent parts of the layer (currently Electrum only).
@@ -97,7 +108,7 @@ impl ChainLayer {
 	/// configured lookup can serve one. `None` means announcements are accepted
 	/// unverified.
 	pub(crate) fn as_utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
-		self.legacy.as_utxo_source()
+		self.lookup.utxo_source()
 	}
 
 	pub(crate) async fn continuously_sync_wallets(
@@ -209,7 +220,7 @@ impl ChainLayer {
 	pub(crate) async fn swap_query_tx(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> RawTxObservation {
-		self.legacy.swap_query_tx(txid, script_pubkey).await
+		self.lookup.tx_status(txid, script_pubkey).await
 	}
 
 	/// The shared on-chain fee estimator (Peerswap native primitive B6).

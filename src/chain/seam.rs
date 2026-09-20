@@ -12,11 +12,19 @@
 //! no code outside slot construction branches on which one it is.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bitcoin::{FeeRate, Transaction};
 
+use lightning_block_sync::gossip::UtxoSource;
+
 use crate::fee_estimator::ConfirmationTarget;
 use crate::Error;
+
+#[cfg(feature = "swaps")]
+use bitcoin::{ScriptBuf, Txid};
+#[cfg(feature = "swaps")]
+use crate::chain::RawTxObservation;
 
 use async_trait::async_trait;
 
@@ -79,4 +87,38 @@ pub(crate) trait BroadcastAdapter: Send + Sync {
 	/// just means bitcoind already knows the transaction and is logged far more
 	/// quietly than a genuine failure — so log level belongs to the adapter.
 	async fn broadcast_tx(&self, tx: &Transaction);
+}
+
+/// Answers questions about the chain that the wallet's own sync does not cover.
+///
+/// This is deliberately a **narrow query** ability, not a sync engine. The two
+/// sync architectures (transaction-based and block-polling) share no interface
+/// and are selected as an explicit separate axis; what belongs here are the
+/// point lookups their consumers need — the status of an arbitrary transaction,
+/// and whether channel announcements can be verified against the UTXO set.
+#[async_trait]
+pub(crate) trait LookupAdapter: Send + Sync {
+	/// Stable identifier, for logs and for answering "which adapter served this".
+	fn name(&self) -> &'static str;
+
+	/// Reorg-aware status of an ARBITRARY transaction — one the local wallet
+	/// need not own, such as a counterparty's swap opening tx.
+	///
+	/// FAIL-CLOSED (E6): an adapter that cannot answer — unstarted client,
+	/// transport error, missing scriptPubKey, or an inconsistent
+	/// tip/confirming-height pair — MUST return
+	/// [`RawTxObservation::Unreachable`]. It must never report a result that
+	/// could be folded into "confirmed", because callers arm CSV and claim
+	/// deadlines off this answer.
+	#[cfg(feature = "swaps")]
+	async fn tx_status(
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
+	) -> RawTxObservation;
+
+	/// The UTXO source used to verify BOLT-7 `channel_announcement`s.
+	///
+	/// `None` declares that this adapter **cannot** verify announcements, in
+	/// which case they are accepted unverified and the routing graph carries
+	/// capacities nobody checked.
+	fn utxo_source(&self) -> Option<Arc<dyn UtxoSource>>;
 }

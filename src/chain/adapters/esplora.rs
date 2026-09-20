@@ -17,13 +17,20 @@ use esplora_client::AsyncClient as EsploraAsyncClient;
 
 use lightning::util::ser::Writeable;
 
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate};
+use lightning_block_sync::gossip::UtxoSource;
+
+use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 };
 use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
+
+#[cfg(feature = "swaps")]
+use bitcoin::{ScriptBuf, Txid};
+#[cfg(feature = "swaps")]
+use crate::chain::RawTxObservation;
 
 use async_trait::async_trait;
 
@@ -102,6 +109,84 @@ impl FeeAdapter for EsploraFeeAdapter {
 		}
 
 		Ok(FeeUpdate::Apply { cache: new_fee_rate_cache, log_unchanged: true })
+	}
+}
+
+#[async_trait]
+impl LookupAdapter for EsploraFeeAdapter {
+	fn name(&self) -> &'static str {
+		"esplora"
+	}
+
+	#[cfg(feature = "swaps")]
+	async fn tx_status(
+		&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>,
+	) -> RawTxObservation {
+		let status = match self.client.get_tx_status(&txid).await {
+			Ok(status) => status,
+			Err(esplora_client::Error::HttpResponse { status: 404, .. }) => {
+				// Definitive "not in the chain or mempool" answer.
+				return RawTxObservation::NotFound;
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora status query failed for {}: {}",
+					txid,
+					e
+				);
+				return RawTxObservation::Unreachable;
+			},
+		};
+		if !status.confirmed {
+			return RawTxObservation::InMempool;
+		}
+		let height = match status.block_height {
+			Some(height) => height,
+			None => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora reported a confirmed tx {} without a block height",
+					txid
+				);
+				return RawTxObservation::Unreachable;
+			},
+		};
+		// B5 LOW-2: the confirming-block height and the tip come from two
+		// separate Esplora calls; a block/reorg in the gap can make them
+		// inconsistent. Detect the one observable inconsistency — a tip BELOW
+		// the tx's confirming block (impossible on a single consistent chain)
+		// — and FAIL CLOSED (treat as unverifiable) rather than reporting a
+		// bogus `1`-confirmation from the saturating arithmetic. The benign
+		// gap (tip one block ahead of the status snapshot) only over-counts
+		// confirmations by ≤1, which errs on the safe/late side for deadlines.
+		match self.client.get_height().await {
+			Ok(tip_height) if tip_height >= height => {
+				let confirmations = tip_height.saturating_sub(height).saturating_add(1);
+				RawTxObservation::Confirmed { height: Some(height), confirmations }
+			},
+			Ok(tip_height) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Esplora tip {} below confirming-block height {} for {} (reorg/race); failing closed",
+					tip_height,
+					height,
+					txid
+				);
+				RawTxObservation::Unreachable
+			},
+			Err(e) => {
+				log_error!(self.logger, "swap_query_tx: Esplora tip query failed: {}", e);
+				RawTxObservation::Unreachable
+			},
+		}
+	}
+
+	/// Esplora exposes no UTXO-set lookup, so channel announcements cannot be
+	/// verified against one. Pre-seam this was the `_ => None` arm of
+	/// `as_utxo_source`; it is now an explicit declaration by the adapter.
+	fn utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
+		None
 	}
 }
 

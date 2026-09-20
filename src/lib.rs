@@ -292,10 +292,21 @@ impl Node {
 		let slots = self.chain_source.slot_adapters();
 		log_info!(
 			self.logger,
-			"Chain ability slots: fee={} broadcast={}",
+			"Chain ability slots: fee={} lookup={} broadcast={}",
 			slots.fee,
+			slots.lookup,
 			slots.broadcast
 		);
+		if !slots.verifies_announcements {
+			// Say this out loud. Without a UTXO source the routing graph accepts
+			// every peer's channel_announcement without checking that the funding
+			// output exists, and nothing else reports it.
+			log_info!(
+				self.logger,
+				"Chain lookup adapter '{}' cannot verify BOLT-7 channel announcements; the routing graph will carry unverified channel capacities.",
+				slots.lookup
+			);
+		}
 
 		// Block to ensure we update our fee rate cache once on startup
 		let chain_source = Arc::clone(&self.chain_source);

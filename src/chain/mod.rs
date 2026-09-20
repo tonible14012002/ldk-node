@@ -19,7 +19,7 @@ use crate::chain::adapters::esplora::EsploraFeeAdapter;
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache, ChainListener};
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::chain::layer::SharedChainCtx;
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter};
+use crate::chain::seam::{BroadcastAdapter, FeeAdapter, LookupAdapter};
 use crate::config::{
 	BackgroundSyncConfig, BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig,
 	BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS,
@@ -36,12 +36,9 @@ use lightning::chain::{Confirm, Filter, Listen, WatchedOutput};
 
 use lightning_transaction_sync::EsploraSyncClient;
 
-use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::init::{synchronize_listeners, validate_best_block_header};
 use lightning_block_sync::poll::{ChainPoller, ChainTip, ValidatedBlockHeader};
 use lightning_block_sync::{BlockSourceErrorKind, SpvClient};
-#[cfg(feature = "swaps")]
-use lightning_block_sync::BlockSource;
 
 use bdk_esplora::EsploraAsyncExt;
 use bdk_wallet::Update as BdkUpdate;
@@ -225,7 +222,9 @@ pub(crate) enum ChainSource {
 	Bitcoind {
 		api_client: Arc<BitcoindClient>,
 		header_cache: tokio::sync::Mutex<BoundedHeaderCache>,
-		latest_chain_tip: RwLock<Option<ValidatedBlockHeader>>,
+		// `Arc` so the seam's lookup adapter can read the cached tip without
+		// reaching back through the enum.
+		latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>,
 		onchain_wallet: Arc<Wallet>,
 		wallet_polling_status: Mutex<WalletSyncStatus>,
 		fee_estimator: Arc<OnchainFeeEstimator>,
@@ -325,7 +324,7 @@ impl ChainSource {
 		));
 
 		let header_cache = tokio::sync::Mutex::new(BoundedHeaderCache::new());
-		let latest_chain_tip = RwLock::new(None);
+		let latest_chain_tip = Arc::new(RwLock::new(None));
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 		Self::Bitcoind {
 			api_client,
@@ -359,7 +358,7 @@ impl ChainSource {
 		));
 
 		let header_cache = tokio::sync::Mutex::new(BoundedHeaderCache::new());
-		let latest_chain_tip = RwLock::new(None);
+		let latest_chain_tip = Arc::new(RwLock::new(None));
 		let wallet_polling_status = Mutex::new(WalletSyncStatus::Completed);
 
 		Self::Bitcoind {
@@ -405,19 +404,14 @@ impl ChainSource {
 		}
 	}
 
-	pub(crate) fn as_utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
-		match self {
-			Self::Bitcoind { api_client, .. } => Some(api_client.utxo_source()),
-			_ => None,
-		}
-	}
-
-	/// Build the fee adapter for this backend.
+	/// Build the ability adapters for this backend.
 	///
 	/// Phase 1 scaffolding: the enum still owns the wire clients, so it also
 	/// builds the adapters. This moves to the builder once the enum is gone and
 	/// slots are chosen independently.
-	pub(crate) fn seam_slots(&self) -> (Arc<dyn FeeAdapter>, Arc<dyn BroadcastAdapter>) {
+	pub(crate) fn seam_slots(
+		&self,
+	) -> (Arc<dyn FeeAdapter>, Arc<dyn LookupAdapter>, Arc<dyn BroadcastAdapter>) {
 		match self {
 			Self::Esplora { esplora_client, config, logger, .. } => {
 				let adapter = Arc::new(EsploraFeeAdapter::new(
@@ -425,20 +419,35 @@ impl ChainSource {
 					Arc::clone(config),
 					Arc::clone(logger),
 				));
-				(Arc::clone(&adapter) as Arc<dyn FeeAdapter>, adapter as Arc<dyn BroadcastAdapter>)
+				(
+					Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
+					Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
+					adapter as Arc<dyn BroadcastAdapter>,
+				)
 			},
-			Self::Electrum { electrum_runtime_status, .. } => {
-				let adapter =
-					Arc::new(ElectrumFeeAdapter::new(Arc::clone(electrum_runtime_status)));
-				(Arc::clone(&adapter) as Arc<dyn FeeAdapter>, adapter as Arc<dyn BroadcastAdapter>)
+			Self::Electrum { electrum_runtime_status, logger, .. } => {
+				let adapter = Arc::new(ElectrumFeeAdapter::new(
+					Arc::clone(electrum_runtime_status),
+					Arc::clone(logger),
+				));
+				(
+					Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
+					Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
+					adapter as Arc<dyn BroadcastAdapter>,
+				)
 			},
-			Self::Bitcoind { api_client, config, logger, .. } => {
+			Self::Bitcoind { api_client, latest_chain_tip, config, logger, .. } => {
 				let adapter = Arc::new(BitcoindFeeAdapter::new(
 					Arc::clone(api_client),
+					Arc::clone(latest_chain_tip),
 					Arc::clone(config),
 					Arc::clone(logger),
 				));
-				(Arc::clone(&adapter) as Arc<dyn FeeAdapter>, adapter as Arc<dyn BroadcastAdapter>)
+				(
+					Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
+					Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
+					adapter as Arc<dyn BroadcastAdapter>,
+				)
 			},
 		}
 	}
@@ -1283,153 +1292,6 @@ impl ChainSource {
 		}
 	}
 
-	/// Reorg-aware confirmation/eviction query for an ARBITRARY `txid` (Peerswap
-	/// native primitive B5).
-	///
-	/// Unlike the wallet-owned confirmation lookups, this works on a
-	/// counterparty's swap opening tx that the local wallet does not own. It
-	/// returns a backend-agnostic [`RawTxObservation`]; the caller
-	/// ([`crate::Node::get_tx_confirmations`]) folds in the previously-observed
-	/// confirmation anchor to distinguish a first `Mempool`/`Dropped` sighting
-	/// from a `Reorged` un-confirmation.
-	///
-	/// FAIL-CLOSED (E6): any chain source that cannot answer — an unstarted
-	/// backend client, a transport error, or a missing scriptPubKey for the
-	/// Electrum scriptHash lookup — yields [`RawTxObservation::Unreachable`], so
-	/// the public API never reports a falsely-confirmed result.
-	#[cfg(feature = "swaps")]
-	pub(crate) async fn swap_query_tx(
-		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
-	) -> RawTxObservation {
-		match self {
-			Self::Esplora { esplora_client, logger, .. } => {
-				let status = match esplora_client.get_tx_status(&txid).await {
-					Ok(status) => status,
-					Err(esplora_client::Error::HttpResponse { status: 404, .. }) => {
-						// Definitive "not in the chain or mempool" answer.
-						return RawTxObservation::NotFound;
-					},
-					Err(e) => {
-						log_error!(
-							logger,
-							"swap_query_tx: Esplora status query failed for {}: {}",
-							txid,
-							e
-						);
-						return RawTxObservation::Unreachable;
-					},
-				};
-				if !status.confirmed {
-					return RawTxObservation::InMempool;
-				}
-				let height = match status.block_height {
-					Some(height) => height,
-					None => {
-						log_error!(
-							logger,
-							"swap_query_tx: Esplora reported a confirmed tx {} without a block height",
-							txid
-						);
-						return RawTxObservation::Unreachable;
-					},
-				};
-				// B5 LOW-2: the confirming-block height and the tip come from two
-				// separate Esplora calls; a block/reorg in the gap can make them
-				// inconsistent. Detect the one observable inconsistency — a tip BELOW
-				// the tx's confirming block (impossible on a single consistent chain)
-				// — and FAIL CLOSED (treat as unverifiable) rather than reporting a
-				// bogus `1`-confirmation from the saturating arithmetic. The benign
-				// gap (tip one block ahead of the status snapshot) only over-counts
-				// confirmations by ≤1, which errs on the safe/late side for deadlines.
-				match esplora_client.get_height().await {
-					Ok(tip_height) if tip_height >= height => {
-						let confirmations =
-							tip_height.saturating_sub(height).saturating_add(1);
-						RawTxObservation::Confirmed { height: Some(height), confirmations }
-					},
-					Ok(tip_height) => {
-						log_error!(
-							logger,
-							"swap_query_tx: Esplora tip {} below confirming-block height {} for {} (reorg/race); failing closed",
-							tip_height,
-							height,
-							txid
-						);
-						RawTxObservation::Unreachable
-					},
-					Err(e) => {
-						log_error!(logger, "swap_query_tx: Esplora tip query failed: {}", e);
-						RawTxObservation::Unreachable
-					},
-				}
-			},
-			Self::Electrum { electrum_runtime_status, logger, .. } => {
-				let script_pubkey = match script_pubkey {
-					Some(script_pubkey) => script_pubkey.clone(),
-					None => {
-						log_error!(
-							logger,
-							"swap_query_tx: Electrum backend requires a watched scriptPubKey for {} (register via watch_txid)",
-							txid
-						);
-						return RawTxObservation::Unreachable;
-					},
-				};
-				let client = match electrum_runtime_status.read().unwrap().client() {
-					Some(client) => client,
-					None => {
-						log_error!(logger, "swap_query_tx: Electrum chain source not started");
-						return RawTxObservation::Unreachable;
-					},
-				};
-				client.swap_query_tx(txid, script_pubkey).await
-			},
-			Self::Bitcoind { api_client, latest_chain_tip, logger, .. } => {
-				match api_client.swap_tx_confirmations(&txid).await {
-					Ok(Some(0)) => RawTxObservation::InMempool,
-					Ok(Some(confirmations)) => {
-						// `getrawtransaction` returns the depth but not the height; derive
-						// it as `tip - (confs - 1)`. B5 LOW-2: read a FRESH best-chain tip
-						// (`get_best_block`) rather than the cached `latest_chain_tip`,
-						// which can lag the real tip and yield a height that is too low —
-						// and thus a CSV/claim deadline armed slightly EARLY. A fresh (or
-						// even a one-block-stale-newer) tip can only err on the LATE/safe
-						// side. Fail-soft on the HEIGHT ONLY: the depth is already
-						// authoritative, so on a tip-read error we fall back to the cached
-						// tip rather than failing the whole query closed.
-						let tip_height = match api_client.get_best_block().await {
-							Ok((_, Some(h))) => Some(h),
-							Ok((_, None)) => {
-								latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
-							},
-							Err(e) => {
-								log_error!(
-									logger,
-									"swap_query_tx: Bitcoind fresh-tip read failed for {} ({:?}); falling back to cached tip for height",
-									txid,
-									e
-								);
-								latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
-							},
-						};
-						let height = tip_height
-							.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
-						RawTxObservation::Confirmed { height, confirmations }
-					},
-					Ok(None) => RawTxObservation::NotFound,
-					Err(e) => {
-						log_error!(
-							logger,
-							"swap_query_tx: Bitcoind query failed for {}: {}",
-							txid,
-							e
-						);
-						RawTxObservation::Unreachable
-					},
-				}
-			},
-		}
-	}
 }
 
 impl Filter for ChainSource {
