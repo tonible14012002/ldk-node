@@ -5,33 +5,33 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-mod bitcoind;
-mod electrum;
+pub(crate) mod adapters;
+pub(crate) mod bitcoind;
+pub(crate) mod electrum;
 mod layer;
+pub(crate) mod seam;
 
 pub(crate) use layer::ChainLayer;
 
-use crate::chain::bitcoind::{
-	BitcoindClient, BoundedHeaderCache, ChainListener, FeeRateEstimationMode,
-};
+use crate::chain::adapters::bitcoind::BitcoindFeeAdapter;
+use crate::chain::adapters::electrum::ElectrumFeeAdapter;
+use crate::chain::adapters::esplora::EsploraFeeAdapter;
+use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache, ChainListener};
 use crate::chain::electrum::ElectrumRuntimeClient;
+use crate::chain::layer::SharedChainCtx;
+use crate::chain::seam::FeeAdapter;
 use crate::config::{
 	BackgroundSyncConfig, BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig,
 	BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS,
-	FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, LDK_WALLET_SYNC_TIMEOUT_SECS,
-	RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL, TX_BROADCAST_TIMEOUT_SECS,
-	WALLET_SYNC_INTERVAL_MINIMUM_SECS,
+	LDK_WALLET_SYNC_TIMEOUT_SECS, RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL,
+	TX_BROADCAST_TIMEOUT_SECS, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
 };
-use crate::fee_estimator::{
-	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
-	ConfirmationTarget, OnchainFeeEstimator,
-};
+use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
-use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
 use lightning::chain::{Confirm, Filter, Listen, WatchedOutput};
 use lightning::util::ser::Writeable;
 
@@ -49,7 +49,7 @@ use bdk_wallet::Update as BdkUpdate;
 
 use esplora_client::AsyncClient as EsploraAsyncClient;
 
-use bitcoin::{FeeRate, Network, Script, ScriptBuf, Txid};
+use bitcoin::{Script, ScriptBuf, Txid};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -210,7 +210,9 @@ pub(crate) enum ChainSource {
 	Electrum {
 		server_url: String,
 		sync_config: ElectrumSyncConfig,
-		electrum_runtime_status: RwLock<ElectrumRuntimeStatus>,
+		// `Arc` so the seam's adapters can share the live runtime status with
+		// the chain source instead of reaching back through the enum.
+		electrum_runtime_status: Arc<RwLock<ElectrumRuntimeStatus>>,
 		onchain_wallet: Arc<Wallet>,
 		onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
 		lightning_wallet_sync_status: Mutex<WalletSyncStatus>,
@@ -291,7 +293,7 @@ impl ChainSource {
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
-		let electrum_runtime_status = RwLock::new(ElectrumRuntimeStatus::new());
+		let electrum_runtime_status = Arc::new(RwLock::new(ElectrumRuntimeStatus::new()));
 		let onchain_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		let lightning_wallet_sync_status = Mutex::new(WalletSyncStatus::Completed);
 		Self::Electrum {
@@ -411,8 +413,49 @@ impl ChainSource {
 		}
 	}
 
+	/// Build the fee adapter for this backend.
+	///
+	/// Phase 1 scaffolding: the enum still owns the wire clients, so it also
+	/// builds the adapters. This moves to the builder once the enum is gone and
+	/// slots are chosen independently.
+	pub(crate) fn fee_adapter(&self) -> Arc<dyn FeeAdapter> {
+		match self {
+			Self::Esplora { esplora_client, config, logger, .. } => Arc::new(
+				EsploraFeeAdapter::new(esplora_client.clone(), Arc::clone(config), Arc::clone(logger)),
+			),
+			Self::Electrum { electrum_runtime_status, .. } => {
+				Arc::new(ElectrumFeeAdapter::new(Arc::clone(electrum_runtime_status)))
+			},
+			Self::Bitcoind { api_client, config, logger, .. } => Arc::new(BitcoindFeeAdapter::new(
+				Arc::clone(api_client),
+				Arc::clone(config),
+				Arc::clone(logger),
+			)),
+		}
+	}
+
+	/// The context every slot's shared tail needs: install the result, record
+	/// that it happened, persist the metrics.
+	pub(crate) fn shared_ctx(&self) -> SharedChainCtx {
+		match self {
+			Self::Esplora { fee_estimator, kv_store, logger, node_metrics, .. }
+			| Self::Electrum { fee_estimator, kv_store, logger, node_metrics, .. }
+			| Self::Bitcoind { fee_estimator, kv_store, logger, node_metrics, .. } => {
+				SharedChainCtx {
+					fee_estimator: Arc::clone(fee_estimator),
+					kv_store: Arc::clone(kv_store),
+					logger: Arc::clone(logger),
+					node_metrics: Arc::clone(node_metrics),
+				}
+			},
+		}
+	}
+
+	/// `layer` is the seam this source is mounted behind. The background loop
+	/// refreshes fees through the layer's fee SLOT rather than through this
+	/// source, so a swapped adapter takes effect for background updates too.
 	pub(crate) async fn continuously_sync_wallets(
-		&self, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
+		&self, layer: Arc<ChainLayer>, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
 		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) {
@@ -420,6 +463,7 @@ impl ChainSource {
 			Self::Esplora { sync_config, logger, .. } => {
 				if let Some(background_sync_config) = sync_config.background_sync_config.as_ref() {
 					self.start_tx_based_sync_loop(
+						layer,
 						stop_sync_receiver,
 						channel_manager,
 						chain_monitor,
@@ -440,6 +484,7 @@ impl ChainSource {
 			Self::Electrum { sync_config, logger, .. } => {
 				if let Some(background_sync_config) = sync_config.background_sync_config.as_ref() {
 					self.start_tx_based_sync_loop(
+						layer,
 						stop_sync_receiver,
 						channel_manager,
 						chain_monitor,
@@ -618,7 +663,7 @@ impl ChainSource {
 							let _ = self.poll_and_update_listeners(Arc::clone(&channel_manager), Arc::clone(&chain_monitor), Arc::clone(&output_sweeper)).await;
 						}
 						_ = fee_rate_update_interval.tick() => {
-							let _ = self.update_fee_rate_estimates().await;
+							let _ = layer.update_fee_rate_estimates().await;
 						}
 					}
 				}
@@ -627,7 +672,7 @@ impl ChainSource {
 	}
 
 	async fn start_tx_based_sync_loop(
-		&self, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
+		&self, layer: Arc<ChainLayer>, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
 		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>, background_sync_config: &BackgroundSyncConfig,
 		logger: Arc<Logger>,
@@ -672,7 +717,7 @@ impl ChainSource {
 					let _ = self.sync_onchain_wallet().await;
 				}
 				_ = fee_rate_update_interval.tick() => {
-					let _ = self.update_fee_rate_estimates().await;
+					let _ = layer.update_fee_rate_estimates().await;
 				}
 				_ = lightning_wallet_sync_interval.tick() => {
 					let _ = self.sync_lightning_wallet(
@@ -1222,269 +1267,6 @@ impl ChainSource {
 				let res = Ok(());
 				wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
 				res
-			},
-		}
-	}
-
-	pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
-		match self {
-			Self::Esplora {
-				esplora_client,
-				fee_estimator,
-				config,
-				kv_store,
-				logger,
-				node_metrics,
-				..
-			} => {
-				let now = Instant::now();
-				let estimates = tokio::time::timeout(
-					Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS),
-					esplora_client.get_fee_estimates(),
-				)
-				.await
-				.map_err(|e| {
-					log_error!(logger, "Updating fee rate estimates timed out: {}", e);
-					Error::FeerateEstimationUpdateTimeout
-				})?
-				.map_err(|e| {
-					log_error!(logger, "Failed to retrieve fee rate estimates: {}", e);
-					Error::FeerateEstimationUpdateFailed
-				})?;
-
-				if estimates.is_empty() && config.network == Network::Bitcoin {
-					// Ensure we fail if we didn't receive any estimates.
-					log_error!(
-						logger,
-						"Failed to retrieve fee rate estimates: empty fee estimates are dissallowed on Mainnet.",
-					);
-					return Err(Error::FeerateEstimationUpdateFailed);
-				}
-
-				let confirmation_targets = get_all_conf_targets();
-
-				let mut new_fee_rate_cache = HashMap::with_capacity(10);
-				for target in confirmation_targets {
-					let num_blocks = get_num_block_defaults_for_target(target);
-
-					// Convert the retrieved fee rate and fall back to 1 sat/vb if we fail or it
-					// yields less than that. This is mostly necessary to continue on
-					// `signet`/`regtest` where we might not get estimates (or bogus values).
-					let converted_estimate_sat_vb =
-						esplora_client::convert_fee_rate(num_blocks, estimates.clone())
-							.map_or(1.0, |converted| converted.max(1.0));
-
-					let fee_rate =
-						FeeRate::from_sat_per_kwu((converted_estimate_sat_vb * 250.0) as u64);
-
-					// LDK 0.0.118 introduced changes to the `ConfirmationTarget` semantics that
-					// require some post-estimation adjustments to the fee rates, which we do here.
-					let adjusted_fee_rate = apply_post_estimation_adjustments(target, fee_rate);
-
-					new_fee_rate_cache.insert(target, adjusted_fee_rate);
-
-					log_trace!(
-						logger,
-						"Fee rate estimation updated for {:?}: {} sats/kwu",
-						target,
-						adjusted_fee_rate.to_sat_per_kwu(),
-					);
-				}
-
-				fee_estimator.set_fee_rate_cache(new_fee_rate_cache);
-
-				log_info!(
-					logger,
-					"Fee rate cache update finished in {}ms.",
-					now.elapsed().as_millis()
-				);
-				let unix_time_secs_opt =
-					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-				{
-					let mut locked_node_metrics = node_metrics.write().unwrap();
-					locked_node_metrics.latest_fee_rate_cache_update_timestamp = unix_time_secs_opt;
-					write_node_metrics(
-						&*locked_node_metrics,
-						Arc::clone(&kv_store),
-						Arc::clone(&logger),
-					)?;
-				}
-
-				Ok(())
-			},
-			Self::Electrum {
-				electrum_runtime_status,
-				fee_estimator,
-				kv_store,
-				logger,
-				node_metrics,
-				..
-			} => {
-				let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
-					electrum_runtime_status.read().unwrap().client().as_ref()
-				{
-					Arc::clone(client)
-				} else {
-					debug_assert!(
-						false,
-						"We should have started the chain source before updating fees"
-					);
-					return Err(Error::FeerateEstimationUpdateFailed);
-				};
-
-				let now = Instant::now();
-
-				let new_fee_rate_cache = electrum_client.get_fee_rate_cache_update().await?;
-				fee_estimator.set_fee_rate_cache(new_fee_rate_cache);
-
-				log_info!(
-					logger,
-					"Fee rate cache update finished in {}ms.",
-					now.elapsed().as_millis()
-				);
-
-				let unix_time_secs_opt =
-					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-				{
-					let mut locked_node_metrics = node_metrics.write().unwrap();
-					locked_node_metrics.latest_fee_rate_cache_update_timestamp = unix_time_secs_opt;
-					write_node_metrics(
-						&*locked_node_metrics,
-						Arc::clone(&kv_store),
-						Arc::clone(&logger),
-					)?;
-				}
-
-				Ok(())
-			},
-			Self::Bitcoind {
-				api_client,
-				fee_estimator,
-				config,
-				kv_store,
-				logger,
-				node_metrics,
-				..
-			} => {
-				macro_rules! get_fee_rate_update {
-					($estimation_fut: expr) => {{
-						let update_res = tokio::time::timeout(
-							Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS),
-							$estimation_fut,
-						)
-						.await
-						.map_err(|e| {
-							log_error!(logger, "Updating fee rate estimates timed out: {}", e);
-							Error::FeerateEstimationUpdateTimeout
-						})?;
-						update_res
-					}};
-				}
-				let confirmation_targets = get_all_conf_targets();
-
-				let mut new_fee_rate_cache = HashMap::with_capacity(10);
-				let now = Instant::now();
-				for target in confirmation_targets {
-					let fee_rate_update_res = match target {
-						ConfirmationTarget::Lightning(
-							LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee,
-						) => {
-							let estimation_fut = api_client.get_mempool_minimum_fee_rate();
-							get_fee_rate_update!(estimation_fut)
-						},
-						ConfirmationTarget::Lightning(
-							LdkConfirmationTarget::MaximumFeeEstimate,
-						) => {
-							let num_blocks = get_num_block_defaults_for_target(target);
-							let estimation_mode = FeeRateEstimationMode::Conservative;
-							let estimation_fut =
-								api_client.get_fee_estimate_for_target(num_blocks, estimation_mode);
-							get_fee_rate_update!(estimation_fut)
-						},
-						ConfirmationTarget::Lightning(
-							LdkConfirmationTarget::UrgentOnChainSweep,
-						) => {
-							let num_blocks = get_num_block_defaults_for_target(target);
-							let estimation_mode = FeeRateEstimationMode::Conservative;
-							let estimation_fut =
-								api_client.get_fee_estimate_for_target(num_blocks, estimation_mode);
-							get_fee_rate_update!(estimation_fut)
-						},
-						_ => {
-							// Otherwise, we default to economical block-target estimate.
-							let num_blocks = get_num_block_defaults_for_target(target);
-							let estimation_mode = FeeRateEstimationMode::Economical;
-							let estimation_fut =
-								api_client.get_fee_estimate_for_target(num_blocks, estimation_mode);
-							get_fee_rate_update!(estimation_fut)
-						},
-					};
-
-					let fee_rate = match (fee_rate_update_res, config.network) {
-						(Ok(rate), _) => rate,
-						(Err(e), Network::Bitcoin) => {
-							// Strictly fail on mainnet.
-							log_error!(logger, "Failed to retrieve fee rate estimates: {}", e);
-							return Err(Error::FeerateEstimationUpdateFailed);
-						},
-						(Err(e), n) if n == Network::Regtest || n == Network::Signet => {
-							// On regtest/signet we just fall back to the usual 1 sat/vb == 250
-							// sat/kwu default.
-							log_error!(
-								logger,
-								"Failed to retrieve fee rate estimates: {}. Falling back to default of 1 sat/vb.",
-								e,
-							);
-							FeeRate::from_sat_per_kwu(250)
-						},
-						(Err(e), _) => {
-							// On testnet `estimatesmartfee` can be unreliable so we just skip in
-							// case of a failure, which will have us falling back to defaults.
-							log_error!(
-								logger,
-								"Failed to retrieve fee rate estimates: {}. Falling back to defaults.",
-								e,
-							);
-							return Ok(());
-						},
-					};
-
-					// LDK 0.0.118 introduced changes to the `ConfirmationTarget` semantics that
-					// require some post-estimation adjustments to the fee rates, which we do here.
-					let adjusted_fee_rate = apply_post_estimation_adjustments(target, fee_rate);
-
-					new_fee_rate_cache.insert(target, adjusted_fee_rate);
-
-					log_trace!(
-						logger,
-						"Fee rate estimation updated for {:?}: {} sats/kwu",
-						target,
-						adjusted_fee_rate.to_sat_per_kwu(),
-					);
-				}
-
-				if fee_estimator.set_fee_rate_cache(new_fee_rate_cache) {
-					// We only log if the values changed, as it might be very spammy otherwise.
-					log_info!(
-						logger,
-						"Fee rate cache update finished in {}ms.",
-						now.elapsed().as_millis()
-					);
-				}
-
-				let unix_time_secs_opt =
-					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-				{
-					let mut locked_node_metrics = node_metrics.write().unwrap();
-					locked_node_metrics.latest_fee_rate_cache_update_timestamp = unix_time_secs_opt;
-					write_node_metrics(
-						&*locked_node_metrics,
-						Arc::clone(&kv_store),
-						Arc::clone(&logger),
-					)?;
-				}
-
-				Ok(())
 			},
 		}
 	}

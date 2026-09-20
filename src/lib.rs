@@ -286,6 +286,12 @@ impl Node {
 			e
 		})?;
 
+		// Record which adapter occupies each chain ability slot, so a support
+		// question about a fee or broadcast answer can be traced to the thing
+		// that produced it without guessing from config.
+		let slots = self.chain_source.slot_adapters();
+		log_info!(self.logger, "Chain ability slots: fee={}", slots.fee);
+
 		// Block to ensure we update our fee rate cache once on startup
 		let chain_source = Arc::clone(&self.chain_source);
 		let runtime_ref = &runtime;

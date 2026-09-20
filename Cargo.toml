@@ -86,6 +86,9 @@ bip21 = { version = "0.5", features = ["std"], default-features = false }
 
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 rand = "0.8.5"
+# Needed for object-safe async methods on the chain ability adapters
+# (`Arc<dyn FeeAdapter>` and friends in `chain::seam`).
+async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1.37", default-features = false, features = [ "rt-multi-thread", "time", "sync", "macros" ] }
 esplora-client = { version = "0.12", default-features = false, features = ["tokio", "async-https-rustls"] }

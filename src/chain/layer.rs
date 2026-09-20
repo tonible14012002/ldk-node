@@ -19,7 +19,8 @@
 //! is deliberately pure indirection: **every method here must behave exactly as
 //! the call it replaces.**
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lightning::chain::{Filter, WatchedOutput};
 
@@ -27,17 +28,37 @@ use bitcoin::{Script, ScriptBuf, Txid};
 
 use lightning_block_sync::gossip::UtxoSource;
 
+use crate::chain::seam::{FeeAdapter, FeeUpdate};
 use crate::chain::ChainSource;
-use crate::types::{ChainMonitor, ChannelManager, Sweeper};
-use crate::Error;
+use crate::fee_estimator::OnchainFeeEstimator;
+use crate::io::utils::write_node_metrics;
+use crate::logger::{log_info, LdkLogger, Logger};
+use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper};
+use crate::{Error, NodeMetrics};
 
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
-#[cfg(feature = "swaps")]
-use crate::fee_estimator::OnchainFeeEstimator;
+
+/// Which adapter is serving each slot.
+pub(crate) struct ChainSlotAdapters {
+	pub(crate) fee: &'static str,
+}
+
+/// Everything a slot's shared tail needs once its adapter has answered.
+pub(crate) struct SharedChainCtx {
+	pub(crate) fee_estimator: Arc<OnchainFeeEstimator>,
+	pub(crate) kv_store: Arc<DynStore>,
+	pub(crate) logger: Arc<Logger>,
+	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
+}
 
 /// The chain layer: the crate's single seam onto Bitcoin.
 pub(crate) struct ChainLayer {
+	/// SLOT 1 — fee estimation.
+	fee: Arc<dyn FeeAdapter>,
+	/// State shared by every slot's tail. Held once, rather than duplicated
+	/// into each chain-source variant as it was pre-seam.
+	shared: SharedChainCtx,
 	/// The pre-seam chain source. Shrinks to nothing as abilities are extracted
 	/// into slots, and is removed entirely at the end of Phase 1.
 	///
@@ -48,7 +69,15 @@ pub(crate) struct ChainLayer {
 
 impl ChainLayer {
 	pub(crate) fn new(legacy: Arc<ChainSource>) -> Self {
-		Self { legacy }
+		let fee = legacy.fee_adapter();
+		let shared = legacy.shared_ctx();
+		Self { fee, shared, legacy }
+	}
+
+	/// Which adapter currently occupies each slot. For logs and diagnostics;
+	/// nothing may branch on it.
+	pub(crate) fn slot_adapters(&self) -> ChainSlotAdapters {
+		ChainSlotAdapters { fee: self.fee.name() }
 	}
 
 	/// Start any runtime-dependent parts of the layer (currently Electrum only).
@@ -68,12 +97,14 @@ impl ChainLayer {
 	}
 
 	pub(crate) async fn continuously_sync_wallets(
-		&self, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
+		self: Arc<Self>, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
 		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	) {
-		self.legacy
+		let legacy = Arc::clone(&self.legacy);
+		legacy
 			.continuously_sync_wallets(
+				self,
 				stop_sync_receiver,
 				channel_manager,
 				chain_monitor,
@@ -82,8 +113,43 @@ impl ChainLayer {
 			.await
 	}
 
+	/// Refresh the fee-rate cache from SLOT 1.
+	///
+	/// The adapter produces the cache; the seam installs it and records that it
+	/// happened. Both steps are skipped entirely when the adapter returns
+	/// [`FeeUpdate::Skip`], which preserves the pre-seam bitcoind behaviour of
+	/// leaving a stale-but-valid cache in place on a soft failure rather than
+	/// advancing the metrics timestamp as though an update had landed.
 	pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
-		self.legacy.update_fee_rate_estimates().await
+		let now = Instant::now();
+
+		let (cache, log_unchanged) = match self.fee.fee_rate_update().await? {
+			FeeUpdate::Skip => return Ok(()),
+			FeeUpdate::Apply { cache, log_unchanged } => (cache, log_unchanged),
+		};
+
+		let changed = self.shared.fee_estimator.set_fee_rate_cache(cache);
+		if changed || log_unchanged {
+			log_info!(
+				self.shared.logger,
+				"Fee rate cache update finished in {}ms.",
+				now.elapsed().as_millis()
+			);
+		}
+
+		let unix_time_secs_opt =
+			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
+		{
+			let mut locked_node_metrics = self.shared.node_metrics.write().unwrap();
+			locked_node_metrics.latest_fee_rate_cache_update_timestamp = unix_time_secs_opt;
+			write_node_metrics(
+				&*locked_node_metrics,
+				Arc::clone(&self.shared.kv_store),
+				Arc::clone(&self.shared.logger),
+			)?;
+		}
+
+		Ok(())
 	}
 
 	pub(crate) async fn process_broadcast_queue(&self) {
@@ -104,14 +170,14 @@ impl ChainLayer {
 	) -> Result<(), Error> {
 		match &*self.legacy {
 			ChainSource::Esplora { .. } | ChainSource::Electrum { .. } => {
-				self.legacy.update_fee_rate_estimates().await?;
+				self.update_fee_rate_estimates().await?;
 				self.legacy
 					.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper)
 					.await?;
 				self.legacy.sync_onchain_wallet().await?;
 			},
 			ChainSource::Bitcoind { .. } => {
-				self.legacy.update_fee_rate_estimates().await?;
+				self.update_fee_rate_estimates().await?;
 				self.legacy
 					.poll_and_update_listeners(channel_manager, chain_monitor, output_sweeper)
 					.await?;
