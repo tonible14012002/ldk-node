@@ -28,12 +28,12 @@ use bitcoin::{Script, ScriptBuf, Txid};
 
 use lightning_block_sync::gossip::UtxoSource;
 
-use crate::chain::seam::{FeeAdapter, FeeUpdate};
+use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate};
 use crate::chain::ChainSource;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_info, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper};
+use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper};
 use crate::{Error, NodeMetrics};
 
 #[cfg(feature = "swaps")]
@@ -42,11 +42,13 @@ use crate::chain::RawTxObservation;
 /// Which adapter is serving each slot.
 pub(crate) struct ChainSlotAdapters {
 	pub(crate) fee: &'static str,
+	pub(crate) broadcast: &'static str,
 }
 
 /// Everything a slot's shared tail needs once its adapter has answered.
 pub(crate) struct SharedChainCtx {
 	pub(crate) fee_estimator: Arc<OnchainFeeEstimator>,
+	pub(crate) tx_broadcaster: Arc<Broadcaster>,
 	pub(crate) kv_store: Arc<DynStore>,
 	pub(crate) logger: Arc<Logger>,
 	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
@@ -56,6 +58,8 @@ pub(crate) struct SharedChainCtx {
 pub(crate) struct ChainLayer {
 	/// SLOT 1 — fee estimation.
 	fee: Arc<dyn FeeAdapter>,
+	/// SLOT 3 — transaction broadcast.
+	broadcast: Arc<dyn BroadcastAdapter>,
 	/// State shared by every slot's tail. Held once, rather than duplicated
 	/// into each chain-source variant as it was pre-seam.
 	shared: SharedChainCtx,
@@ -69,15 +73,15 @@ pub(crate) struct ChainLayer {
 
 impl ChainLayer {
 	pub(crate) fn new(legacy: Arc<ChainSource>) -> Self {
-		let fee = legacy.fee_adapter();
+		let (fee, broadcast) = legacy.seam_slots();
 		let shared = legacy.shared_ctx();
-		Self { fee, shared, legacy }
+		Self { fee, broadcast, shared, legacy }
 	}
 
 	/// Which adapter currently occupies each slot. For logs and diagnostics;
 	/// nothing may branch on it.
 	pub(crate) fn slot_adapters(&self) -> ChainSlotAdapters {
-		ChainSlotAdapters { fee: self.fee.name() }
+		ChainSlotAdapters { fee: self.fee.name(), broadcast: self.broadcast.name() }
 	}
 
 	/// Start any runtime-dependent parts of the layer (currently Electrum only).
@@ -152,8 +156,22 @@ impl ChainLayer {
 		Ok(())
 	}
 
+	/// Drain the broadcast queue through SLOT 3.
+	///
+	/// Called once a second. Failures are logged by the adapter and dropped —
+	/// the queue carries no retry semantics, so an error here must never
+	/// propagate.
 	pub(crate) async fn process_broadcast_queue(&self) {
-		self.legacy.process_broadcast_queue().await
+		if !self.broadcast.ready().await {
+			return;
+		}
+
+		let mut receiver = self.shared.tx_broadcaster.get_broadcast_queue().await;
+		while let Some(next_package) = receiver.recv().await {
+			for tx in &next_package {
+				self.broadcast.broadcast_tx(tx).await;
+			}
+		}
 	}
 
 	/// One full synchronous sync pass, as triggered by [`crate::Node::sync_wallets`].

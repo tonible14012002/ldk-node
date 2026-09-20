@@ -19,21 +19,20 @@ use crate::chain::adapters::esplora::EsploraFeeAdapter;
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache, ChainListener};
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::chain::layer::SharedChainCtx;
-use crate::chain::seam::FeeAdapter;
+use crate::chain::seam::{BroadcastAdapter, FeeAdapter};
 use crate::config::{
 	BackgroundSyncConfig, BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig,
 	BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS,
 	LDK_WALLET_SYNC_TIMEOUT_SECS, RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL,
-	TX_BROADCAST_TIMEOUT_SECS, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
+	WALLET_SYNC_INTERVAL_MINIMUM_SECS,
 };
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_bytes, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::logger::{log_error, log_info, log_trace, LdkLogger, Logger};
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
 use lightning::chain::{Confirm, Filter, Listen, WatchedOutput};
-use lightning::util::ser::Writeable;
 
 use lightning_transaction_sync::EsploraSyncClient;
 
@@ -418,19 +417,29 @@ impl ChainSource {
 	/// Phase 1 scaffolding: the enum still owns the wire clients, so it also
 	/// builds the adapters. This moves to the builder once the enum is gone and
 	/// slots are chosen independently.
-	pub(crate) fn fee_adapter(&self) -> Arc<dyn FeeAdapter> {
+	pub(crate) fn seam_slots(&self) -> (Arc<dyn FeeAdapter>, Arc<dyn BroadcastAdapter>) {
 		match self {
-			Self::Esplora { esplora_client, config, logger, .. } => Arc::new(
-				EsploraFeeAdapter::new(esplora_client.clone(), Arc::clone(config), Arc::clone(logger)),
-			),
-			Self::Electrum { electrum_runtime_status, .. } => {
-				Arc::new(ElectrumFeeAdapter::new(Arc::clone(electrum_runtime_status)))
+			Self::Esplora { esplora_client, config, logger, .. } => {
+				let adapter = Arc::new(EsploraFeeAdapter::new(
+					esplora_client.clone(),
+					Arc::clone(config),
+					Arc::clone(logger),
+				));
+				(Arc::clone(&adapter) as Arc<dyn FeeAdapter>, adapter as Arc<dyn BroadcastAdapter>)
 			},
-			Self::Bitcoind { api_client, config, logger, .. } => Arc::new(BitcoindFeeAdapter::new(
-				Arc::clone(api_client),
-				Arc::clone(config),
-				Arc::clone(logger),
-			)),
+			Self::Electrum { electrum_runtime_status, .. } => {
+				let adapter =
+					Arc::new(ElectrumFeeAdapter::new(Arc::clone(electrum_runtime_status)));
+				(Arc::clone(&adapter) as Arc<dyn FeeAdapter>, adapter as Arc<dyn BroadcastAdapter>)
+			},
+			Self::Bitcoind { api_client, config, logger, .. } => {
+				let adapter = Arc::new(BitcoindFeeAdapter::new(
+					Arc::clone(api_client),
+					Arc::clone(config),
+					Arc::clone(logger),
+				));
+				(Arc::clone(&adapter) as Arc<dyn FeeAdapter>, adapter as Arc<dyn BroadcastAdapter>)
+			},
 		}
 	}
 
@@ -438,11 +447,14 @@ impl ChainSource {
 	/// that it happened, persist the metrics.
 	pub(crate) fn shared_ctx(&self) -> SharedChainCtx {
 		match self {
-			Self::Esplora { fee_estimator, kv_store, logger, node_metrics, .. }
-			| Self::Electrum { fee_estimator, kv_store, logger, node_metrics, .. }
-			| Self::Bitcoind { fee_estimator, kv_store, logger, node_metrics, .. } => {
+			Self::Esplora { fee_estimator, tx_broadcaster, kv_store, logger, node_metrics, .. }
+			| Self::Electrum {
+				fee_estimator, tx_broadcaster, kv_store, logger, node_metrics, ..
+			}
+			| Self::Bitcoind { fee_estimator, tx_broadcaster, kv_store, logger, node_metrics, .. } => {
 				SharedChainCtx {
 					fee_estimator: Arc::clone(fee_estimator),
+					tx_broadcaster: Arc::clone(tx_broadcaster),
 					kv_store: Arc::clone(kv_store),
 					logger: Arc::clone(logger),
 					node_metrics: Arc::clone(node_metrics),
@@ -1267,161 +1279,6 @@ impl ChainSource {
 				let res = Ok(());
 				wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
 				res
-			},
-		}
-	}
-
-	pub(crate) async fn process_broadcast_queue(&self) {
-		match self {
-			Self::Esplora { esplora_client, tx_broadcaster, logger, .. } => {
-				let mut receiver = tx_broadcaster.get_broadcast_queue().await;
-				while let Some(next_package) = receiver.recv().await {
-					for tx in &next_package {
-						let txid = tx.compute_txid();
-						let timeout_fut = tokio::time::timeout(
-							Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
-							esplora_client.broadcast(tx),
-						);
-						match timeout_fut.await {
-							Ok(res) => match res {
-								Ok(()) => {
-									log_trace!(
-										logger,
-										"Successfully broadcast transaction {}",
-										txid
-									);
-								},
-								Err(e) => match e {
-									esplora_client::Error::HttpResponse { status, message } => {
-										if status == 400 {
-											// Log 400 at lesser level, as this often just means bitcoind already knows the
-											// transaction.
-											// FIXME: We can further differentiate here based on the error
-											// message which will be available with rust-esplora-client 0.7 and
-											// later.
-											log_trace!(
-												logger,
-												"Failed to broadcast due to HTTP connection error: {}",
-												message
-											);
-										} else {
-											log_error!(
-												logger,
-												"Failed to broadcast due to HTTP connection error: {} - {}",
-												status, message
-											);
-										}
-										log_trace!(
-											logger,
-											"Failed broadcast transaction bytes: {}",
-											log_bytes!(tx.encode())
-										);
-									},
-									_ => {
-										log_error!(
-											logger,
-											"Failed to broadcast transaction {}: {}",
-											txid,
-											e
-										);
-										log_trace!(
-											logger,
-											"Failed broadcast transaction bytes: {}",
-											log_bytes!(tx.encode())
-										);
-									},
-								},
-							},
-							Err(e) => {
-								log_error!(
-									logger,
-									"Failed to broadcast transaction due to timeout {}: {}",
-									txid,
-									e
-								);
-								log_trace!(
-									logger,
-									"Failed broadcast transaction bytes: {}",
-									log_bytes!(tx.encode())
-								);
-							},
-						}
-					}
-				}
-			},
-			Self::Electrum { electrum_runtime_status, tx_broadcaster, .. } => {
-				let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
-					electrum_runtime_status.read().unwrap().client().as_ref()
-				{
-					Arc::clone(client)
-				} else {
-					debug_assert!(
-						false,
-						"We should have started the chain source before broadcasting"
-					);
-					return;
-				};
-
-				let mut receiver = tx_broadcaster.get_broadcast_queue().await;
-				while let Some(next_package) = receiver.recv().await {
-					for tx in next_package {
-						electrum_client.broadcast(tx).await;
-					}
-				}
-			},
-			Self::Bitcoind { api_client, tx_broadcaster, logger, .. } => {
-				// While it's a bit unclear when we'd be able to lean on Bitcoin Core >v28
-				// features, we should eventually switch to use `submitpackage` via the
-				// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
-				// transactions.
-				let mut receiver = tx_broadcaster.get_broadcast_queue().await;
-				while let Some(next_package) = receiver.recv().await {
-					for tx in &next_package {
-						let txid = tx.compute_txid();
-						let timeout_fut = tokio::time::timeout(
-							Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
-							api_client.broadcast_transaction(tx),
-						);
-						match timeout_fut.await {
-							Ok(res) => match res {
-								Ok(id) => {
-									debug_assert_eq!(id, txid);
-									log_trace!(
-										logger,
-										"Successfully broadcast transaction {}",
-										txid
-									);
-								},
-								Err(e) => {
-									log_error!(
-										logger,
-										"Failed to broadcast transaction {}: {}",
-										txid,
-										e
-									);
-									log_trace!(
-										logger,
-										"Failed broadcast transaction bytes: {}",
-										log_bytes!(tx.encode())
-									);
-								},
-							},
-							Err(e) => {
-								log_error!(
-									logger,
-									"Failed to broadcast transaction due to timeout {}: {}",
-									txid,
-									e
-								);
-								log_trace!(
-									logger,
-									"Failed broadcast transaction bytes: {}",
-									log_bytes!(tx.encode())
-								);
-							},
-						}
-					}
-				}
 			},
 		}
 	}

@@ -11,18 +11,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bitcoin::{FeeRate, Network};
+use bitcoin::{FeeRate, Network, Transaction};
 
 use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
+use lightning::util::ser::Writeable;
 
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
-use crate::chain::seam::{FeeAdapter, FeeUpdate};
-use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS};
+use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate};
+use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
 	ConfirmationTarget,
 };
-use crate::logger::{log_error, log_trace, LdkLogger, Logger};
+use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
 
 use async_trait::async_trait;
@@ -151,5 +152,53 @@ impl FeeAdapter for BitcoindFeeAdapter {
 		// bitcoind refreshes often enough that logging every completion is spammy,
 		// so the completion line is emitted only when the cache actually changed.
 		Ok(FeeUpdate::Apply { cache: new_fee_rate_cache, log_unchanged: false })
+	}
+}
+
+#[async_trait]
+impl BroadcastAdapter for BitcoindFeeAdapter {
+	fn name(&self) -> &'static str {
+		"bitcoind"
+	}
+
+	// While it's a bit unclear when we'd be able to lean on Bitcoin Core >v28
+	// features, we should eventually switch to use `submitpackage` via the
+	// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
+	// transactions.
+	async fn broadcast_tx(&self, tx: &Transaction) {
+		let txid = tx.compute_txid();
+		let timeout_fut = tokio::time::timeout(
+			Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
+			self.api_client.broadcast_transaction(tx),
+		);
+		match timeout_fut.await {
+			Ok(res) => match res {
+				Ok(id) => {
+					debug_assert_eq!(id, txid);
+					log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
+				},
+				Err(e) => {
+					log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
+					log_trace!(
+						self.logger,
+						"Failed broadcast transaction bytes: {}",
+						log_bytes!(tx.encode())
+					);
+				},
+			},
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to broadcast transaction due to timeout {}: {}",
+					txid,
+					e
+				);
+				log_trace!(
+					self.logger,
+					"Failed broadcast transaction bytes: {}",
+					log_bytes!(tx.encode())
+				);
+			},
+		}
 	}
 }

@@ -290,7 +290,12 @@ impl Node {
 		// question about a fee or broadcast answer can be traced to the thing
 		// that produced it without guessing from config.
 		let slots = self.chain_source.slot_adapters();
-		log_info!(self.logger, "Chain ability slots: fee={}", slots.fee);
+		log_info!(
+			self.logger,
+			"Chain ability slots: fee={} broadcast={}",
+			slots.fee,
+			slots.broadcast
+		);
 
 		// Block to ensure we update our fee rate cache once on startup
 		let chain_source = Arc::clone(&self.chain_source);

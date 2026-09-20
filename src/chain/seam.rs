@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use bitcoin::FeeRate;
+use bitcoin::{FeeRate, Transaction};
 
 use crate::fee_estimator::ConfirmationTarget;
 use crate::Error;
@@ -52,4 +52,31 @@ pub(crate) trait FeeAdapter: Send + Sync {
 	fn name(&self) -> &'static str;
 
 	async fn fee_rate_update(&self) -> Result<FeeUpdate, Error>;
+}
+
+/// Sends transactions to the Bitcoin network.
+///
+/// Broadcast is deliberately **lossy**: a failure is logged and dropped, never
+/// returned to the caller. That is the pre-seam contract and the queue has no
+/// retry semantics to build on, so adapters must not propagate errors. An
+/// ordered fallback across several adapters is a later change, not this one.
+#[async_trait]
+pub(crate) trait BroadcastAdapter: Send + Sync {
+	/// Stable identifier, for logs and for answering "which adapter served this".
+	fn name(&self) -> &'static str;
+
+	/// Whether the backend can broadcast right now.
+	///
+	/// `false` abandons this drain pass entirely; the queue is drained again on
+	/// the next tick (once per second), so this is a skip, not a shutdown.
+	async fn ready(&self) -> bool {
+		true
+	}
+
+	/// Broadcast one transaction, logging its own outcome.
+	///
+	/// Each backend classifies its own errors — an Esplora HTTP 400 usually
+	/// just means bitcoind already knows the transaction and is logged far more
+	/// quietly than a genuine failure — so log level belongs to the adapter.
+	async fn broadcast_tx(&self, tx: &Transaction);
 }
