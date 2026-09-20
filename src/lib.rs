@@ -159,7 +159,7 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 
-use chain::ChainSource;
+use chain::ChainLayer;
 use config::{
 	default_user_config, may_announce_channel, ChannelConfig, Config, NODE_ANN_BCAST_INTERVAL,
 	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
@@ -218,7 +218,7 @@ pub struct Node {
 	event_handling_stopped_sender: tokio::sync::watch::Sender<()>,
 	config: Arc<Config>,
 	wallet: Arc<Wallet>,
-	chain_source: Arc<ChainSource>,
+	chain_source: Arc<ChainLayer>,
 	tx_broadcaster: Arc<Broadcaster>,
 	event_queue: Arc<EventQueue<Arc<Logger>>>,
 	channel_manager: Arc<ChannelManager>,
@@ -1572,29 +1572,7 @@ impl Node {
 		let sync_cmon = Arc::clone(&self.chain_monitor);
 		let sync_sweeper = Arc::clone(&self.output_sweeper);
 		runtime.block_on(async move {
-			match chain_source.as_ref() {
-				ChainSource::Esplora { .. } => {
-					chain_source.update_fee_rate_estimates().await?;
-					chain_source
-						.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
-						.await?;
-					chain_source.sync_onchain_wallet().await?;
-				},
-				ChainSource::Electrum { .. } => {
-					chain_source.update_fee_rate_estimates().await?;
-					chain_source
-						.sync_lightning_wallet(sync_cman, sync_cmon, sync_sweeper)
-						.await?;
-					chain_source.sync_onchain_wallet().await?;
-				},
-				ChainSource::Bitcoind { .. } => {
-					chain_source.update_fee_rate_estimates().await?;
-					chain_source
-						.poll_and_update_listeners(sync_cman, sync_cmon, sync_sweeper)
-						.await?;
-				},
-			}
-			Ok(())
+			chain_source.sync_wallets_once(sync_cman, sync_cmon, sync_sweeper).await
 		})
 	}
 

@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::ChainSource;
+use crate::chain::ChainLayer;
 use crate::config::ChannelConfig;
 use crate::data_store::DataStore;
 use crate::fee_estimator::OnchainFeeEstimator;
@@ -42,7 +42,7 @@ pub(crate) type DynStore = dyn KVStore + Sync + Send;
 
 pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	InMemorySigner,
-	Arc<ChainSource>,
+	Arc<ChainLayer>,
 	Arc<Broadcaster>,
 	Arc<OnchainFeeEstimator>,
 	Arc<Logger>,
@@ -60,7 +60,7 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 >;
 
 pub(crate) type LiquidityManager =
-	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainSource>>;
+	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainLayer>>;
 
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<ChainMonitor>,
@@ -131,7 +131,7 @@ pub(crate) type Sweeper = OutputSweeper<
 	Arc<Broadcaster>,
 	Arc<KeysManager>,
 	Arc<OnchainFeeEstimator>,
-	Arc<ChainSource>,
+	Arc<ChainLayer>,
 	Arc<DynStore>,
 	Arc<Logger>,
 	Arc<KeysManager>,

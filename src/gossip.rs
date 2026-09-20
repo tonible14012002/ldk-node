@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::ChainSource;
+use crate::chain::ChainLayer;
 use crate::config::RGS_SYNC_TIMEOUT_SECS;
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
 use crate::types::{GossipSync, Graph, P2PGossipSync, PeerManager, RapidGossipSync, UtxoLookup};
@@ -62,7 +62,7 @@ impl GossipSource {
 	}
 
 	pub(crate) fn set_gossip_verifier(
-		&self, chain_source: Arc<ChainSource>, peer_manager: Arc<PeerManager>,
+		&self, chain_source: Arc<ChainLayer>, peer_manager: Arc<PeerManager>,
 		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
 	) {
 		match self {

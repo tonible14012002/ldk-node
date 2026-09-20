@@ -7,7 +7,7 @@
 
 //! Objects related to liquidity management.
 
-use crate::chain::ChainSource;
+use crate::chain::ChainLayer;
 use crate::connection::ConnectionManager;
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
@@ -143,7 +143,7 @@ where
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
 	keys_manager: Arc<KeysManager>,
-	chain_source: Arc<ChainSource>,
+	chain_source: Arc<ChainLayer>,
 	config: Arc<Config>,
 	logger: L,
 }
@@ -154,7 +154,7 @@ where
 {
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
-		chain_source: Arc<ChainSource>, config: Arc<Config>, logger: L,
+		chain_source: Arc<ChainLayer>, config: Arc<Config>, logger: L,
 	) -> Self {
 		let lsps1_client = None;
 		let lsps2_client = None;

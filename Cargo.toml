@@ -1,3 +1,8 @@
+# Standalone crate: never a member of a surrounding workspace. Without this,
+# a local clone placed inside the consuming monorepo is captured by that
+# repo's workspace and fails to resolve.
+[workspace]
+
 [package]
 name = "ldk-node"
 version = "0.7.0+git"

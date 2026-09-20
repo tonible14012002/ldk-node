@@ -8,7 +8,7 @@
 use super::*;
 use crate::config::WALLET_KEYS_SEED_LEN;
 
-use crate::chain::ChainSource;
+use crate::chain::ChainLayer;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::{
 	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
@@ -235,7 +235,7 @@ where
 /// Read `OutputSweeper` state from the store.
 pub(crate) fn read_output_sweeper(
 	broadcaster: Arc<Broadcaster>, fee_estimator: Arc<OnchainFeeEstimator>,
-	chain_data_source: Arc<ChainSource>, keys_manager: Arc<KeysManager>, kv_store: Arc<DynStore>,
+	chain_data_source: Arc<ChainLayer>, keys_manager: Arc<KeysManager>, kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 ) -> Result<Sweeper, std::io::Error> {
 	let mut reader = Cursor::new(kv_store.read(

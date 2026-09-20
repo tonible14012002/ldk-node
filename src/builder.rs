@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::{ChainSource, DEFAULT_ESPLORA_SERVER_URL};
+use crate::chain::{ChainLayer, ChainSource, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, BitcoindRestClientConfig, Config,
 	ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
@@ -1145,7 +1145,7 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 	));
 
-	let chain_source = match chain_data_source_config {
+	let legacy_chain_source = match chain_data_source_config {
 		Some(ChainDataSourceConfig::Esplora { server_url, sync_config }) => {
 			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
 			Arc::new(ChainSource::new_esplora(
@@ -1227,6 +1227,10 @@ fn build_with_store_internal(
 			))
 		},
 	};
+
+	// The chain ability seam. Every consumer below talks to `ChainLayer`, never
+	// to a concrete chain source.
+	let chain_source = Arc::new(ChainLayer::new(legacy_chain_source));
 
 	let runtime = Arc::new(RwLock::new(None));
 

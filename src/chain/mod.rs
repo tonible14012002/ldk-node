@@ -7,6 +7,9 @@
 
 mod bitcoind;
 mod electrum;
+mod layer;
+
+pub(crate) use layer::ChainLayer;
 
 use crate::chain::bitcoind::{
 	BitcoindClient, BoundedHeaderCache, ChainListener, FeeRateEstimationMode,
