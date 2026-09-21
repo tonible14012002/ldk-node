@@ -60,6 +60,15 @@ pub enum Error {
 	TxSyncFailed,
 	/// A transaction sync operation timed out.
 	TxSyncTimeout,
+	/// This node's chain source cannot serve chain data to other nodes.
+	///
+	/// Serving requires a chain source that can answer arbitrary transaction,
+	/// output and script queries. Not every backend can, and a node that has
+	/// no chain source of its own certainly cannot — it would be relaying
+	/// answers it did not verify.
+	ChainServeUnsupported,
+	/// A request from another node for chain data could not be answered.
+	ChainServeFailed,
 	/// A gossip updating operation failed.
 	GossipUpdateFailed,
 	/// A gossip updating operation timed out.
@@ -153,6 +162,12 @@ impl fmt::Display for Error {
 			Self::OnchainTxSigningFailed => write!(f, "Failed to sign given transaction."),
 			Self::TxSyncFailed => write!(f, "Failed to sync transactions."),
 			Self::TxSyncTimeout => write!(f, "Syncing transactions timed out."),
+			Self::ChainServeUnsupported => {
+				write!(f, "This node's chain source cannot serve chain data to other nodes.")
+			},
+			Self::ChainServeFailed => {
+				write!(f, "Failed to answer another node's request for chain data.")
+			},
 			Self::GossipUpdateFailed => write!(f, "Failed to update gossip data."),
 			Self::GossipUpdateTimeout => write!(f, "Updating gossip data timed out."),
 			Self::LiquidityRequestFailed => write!(f, "Failed to request inbound liquidity."),

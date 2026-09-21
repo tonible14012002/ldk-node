@@ -31,6 +31,7 @@
 //! is three implementations, not two.
 
 pub(crate) mod bitcoind;
+pub(crate) mod dependent;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
 
@@ -41,6 +42,9 @@ use bitcoin::{Script, Txid};
 
 use lightning::chain::WatchedOutput;
 
+use crate::chain::provider::{
+	WireLightningSyncRequest, WireLightningSyncResponse, WireSyncRequest, WireUpdate,
+};
 use crate::chain::ChainLayer;
 use crate::config::{BackgroundSyncConfig, WALLET_SYNC_INTERVAL_MINIMUM_SECS};
 use crate::logger::{log_trace, LdkLogger, Logger};
@@ -169,4 +173,25 @@ pub(crate) trait SyncEngine: Send + Sync {
 
 	/// See [`SyncEngine::register_tx`].
 	fn register_output(&self, _output: WatchedOutput) {}
+
+	/// Answer another node's on-chain wallet sync request — the serving half
+	/// of the Dependent tier.
+	///
+	/// Defaults to refusing. Serving means running an arbitrary scan against
+	/// a real chain source, which only a node that has one can do; a Dependent
+	/// node must refuse rather than forward, or a chain of nodes could end up
+	/// believing an answer none of them checked.
+	async fn serve_wallet_sync(&self, _req: &WireSyncRequest) -> Result<WireUpdate, Error> {
+		Err(Error::ChainServeUnsupported)
+	}
+
+	/// Answer another node's Lightning sync request.
+	///
+	/// See [`SyncEngine::serve_wallet_sync`] for why this defaults to
+	/// refusing.
+	async fn serve_lightning_sync(
+		&self, _req: &WireLightningSyncRequest,
+	) -> Result<WireLightningSyncResponse, Error> {
+		Err(Error::ChainServeUnsupported)
+	}
 }

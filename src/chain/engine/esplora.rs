@@ -24,6 +24,14 @@ use bdk_esplora::EsploraAsyncExt;
 use esplora_client::AsyncClient as EsploraAsyncClient;
 
 use crate::chain::engine::{run_tx_based_sync_loop, SyncEngine, TxBasedBackend};
+use crate::chain::provider::{
+	WireBlockId, WireConfirmedTx, WireLightningSyncRequest, WireLightningSyncResponse,
+	WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
+};
+use crate::chain::wire_convert::{
+	block_hash_from_wire, header_to_wire, outpoint_from_wire, sync_response_to_wire, tx_to_wire,
+	txid_from_wire, wire_to_sync_request,
+};
 use crate::chain::{periodically_archive_fully_resolved_monitors, ChainLayer, WalletSyncStatus};
 use crate::config::{
 	EsploraSyncConfig, BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS,
@@ -46,6 +54,35 @@ pub(crate) struct EsploraSyncEngine {
 	pub(crate) kv_store: Arc<DynStore>,
 	pub(crate) logger: Arc<Logger>,
 	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
+}
+
+impl EsploraSyncEngine {
+	/// Assemble everything `Confirm::transactions_confirmed` needs for one
+	/// transaction: the transaction, its block header, and its real position
+	/// in that block.
+	///
+	/// Returns `None` when any part is missing — which happens legitimately
+	/// when a reorg lands between the status query and these follow-ups. A
+	/// partial entry is worse than none: LDK would be told a transaction sits
+	/// at a position it does not occupy.
+	async fn confirmed_tx_entry(
+		&self, txid: Txid, block_hash: bitcoin::BlockHash,
+	) -> Result<Option<WireConfirmedTx>, esplora_client::Error> {
+		let Some(tx) = self.esplora_client.get_tx(&txid).await? else {
+			return Ok(None);
+		};
+		let Some(proof) = self.esplora_client.get_merkle_proof(&txid).await? else {
+			return Ok(None);
+		};
+		let header = self.esplora_client.get_header_by_hash(&block_hash).await?;
+
+		Ok(Some(WireConfirmedTx {
+			tx_hex: tx_to_wire(&tx),
+			block: WireBlockId { height: proof.block_height, hash: block_hash.to_string() },
+			pos_in_block: proof.pos as u32,
+			header_hex: header_to_wire(&header),
+		}))
+	}
 }
 
 #[async_trait]
@@ -251,6 +288,130 @@ impl TxBasedBackend for EsploraSyncEngine {
 impl SyncEngine for EsploraSyncEngine {
 	fn name(&self) -> &'static str {
 		"esplora-tx-sync"
+	}
+
+	/// Run a Dependent node's scan against this node's own Esplora server.
+	///
+	/// The request is rebuilt into a real `SyncRequest` and handed to the same
+	/// client this node syncs itself with, so a served answer and a local one
+	/// come from exactly the same code path.
+	async fn serve_wallet_sync(&self, req: &WireSyncRequest) -> Result<WireUpdate, Error> {
+		let sync_request = wire_to_sync_request(req).map_err(|e| {
+			log_error!(self.logger, "Refusing a malformed wallet sync request: {}", e);
+			Error::ChainServeFailed
+		})?;
+
+		let response = tokio::time::timeout(
+			Duration::from_secs(BDK_WALLET_SYNC_TIMEOUT_SECS),
+			self.esplora_client.sync(sync_request, BDK_CLIENT_CONCURRENCY),
+		)
+		.await
+		.map_err(|e| {
+			log_error!(self.logger, "Serving a wallet sync request timed out: {}", e);
+			Error::ChainServeFailed
+		})?
+		.map_err(|e| {
+			log_error!(self.logger, "Serving a wallet sync request failed: {}", e);
+			Error::ChainServeFailed
+		})?;
+
+		Ok(sync_response_to_wire(response))
+	}
+
+	async fn serve_lightning_sync(
+		&self, req: &WireLightningSyncRequest,
+	) -> Result<WireLightningSyncResponse, Error> {
+		let serve_failed = |e: crate::chain::provider::ChainProviderError| {
+			log_error!(self.logger, "Refusing a malformed lightning sync request: {}", e);
+			Error::ChainServeFailed
+		};
+		let chain_failed = |e: esplora_client::Error| {
+			log_error!(self.logger, "Serving a lightning sync request failed: {}", e);
+			Error::ChainServeFailed
+		};
+
+		// The tip first: everything else is reported relative to it, and a
+		// tip fetched afterwards could be ahead of the answers given.
+		let tip_hash = self.esplora_client.get_tip_hash().await.map_err(chain_failed)?;
+		let tip_header =
+			self.esplora_client.get_header_by_hash(&tip_hash).await.map_err(chain_failed)?;
+		let tip_status =
+			self.esplora_client.get_block_status(&tip_hash).await.map_err(chain_failed)?;
+		let tip_height = tip_status.height.ok_or_else(|| {
+			log_error!(self.logger, "Esplora returned a tip block with no height");
+			Error::ChainServeFailed
+		})?;
+
+		let mut confirmed = Vec::new();
+		let mut unconfirmed = Vec::new();
+
+		for watched in &req.txids {
+			let txid = txid_from_wire(&watched.txid).map_err(serve_failed)?;
+			let known = watched
+				.known_block_hash
+				.as_deref()
+				.map(block_hash_from_wire)
+				.transpose()
+				.map_err(serve_failed)?;
+
+			let status = self.esplora_client.get_tx_status(&txid).await.map_err(chain_failed)?;
+
+			match (status.confirmed, status.block_hash) {
+				(true, Some(block_hash)) => {
+					// Only report what the caller does not already know. A
+					// transaction still in the same block needs no message.
+					if known == Some(block_hash) {
+						continue;
+					}
+					if let Some(entry) =
+						self.confirmed_tx_entry(txid, block_hash).await.map_err(chain_failed)?
+					{
+						confirmed.push(entry);
+					}
+				},
+				_ => {
+					// Not in the best chain. Only worth saying so if the
+					// caller believed otherwise.
+					if known.is_some() {
+						unconfirmed.push(watched.txid.clone());
+					}
+				},
+			}
+		}
+
+		for output in &req.outputs {
+			let outpoint = outpoint_from_wire(&output.outpoint).map_err(serve_failed)?;
+			let status = self
+				.esplora_client
+				.get_output_status(&outpoint.txid, outpoint.vout as u64)
+				.await
+				.map_err(chain_failed)?;
+
+			let Some(status) = status else { continue };
+			if !status.spent {
+				continue;
+			}
+			let (Some(spending_txid), Some(spend_status)) = (status.txid, status.status) else {
+				continue;
+			};
+			let (true, Some(block_hash)) = (spend_status.confirmed, spend_status.block_hash) else {
+				continue;
+			};
+
+			if let Some(entry) =
+				self.confirmed_tx_entry(spending_txid, block_hash).await.map_err(chain_failed)?
+			{
+				confirmed.push(entry);
+			}
+		}
+
+		Ok(WireLightningSyncResponse {
+			version: CHAIN_WIRE_VERSION,
+			tip: WireBlockId { height: tip_height, hash: tip_hash.to_string() },
+			tip_header_hex: header_to_wire(&tip_header),
+			confirmed,
+			unconfirmed,
+		})
 	}
 
 	async fn sync_once(

@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use crate::chain::provider::ChainDataProvider;
 use crate::chain::{ChainLayer, DEFAULT_ESPLORA_SERVER_URL};
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, BitcoindRestClientConfig, Config,
@@ -84,7 +85,7 @@ const VSS_HARDENED_CHILD_INDEX: u32 = 877;
 const VSS_LNURL_AUTH_HARDENED_CHILD_INDEX: u32 = 138;
 const LSPS_HARDENED_CHILD_INDEX: u32 = 577;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum ChainDataSourceConfig {
 	Esplora {
 		server_url: String,
@@ -101,6 +102,43 @@ enum ChainDataSourceConfig {
 		rpc_password: String,
 		rest_client_config: Option<BitcoindRestClientConfig>,
 	},
+	/// No chain source of this node's own: every chain ability is served by a
+	/// remote provider. The Dependent tier.
+	Dependent {
+		provider: Arc<dyn ChainDataProvider>,
+		sync_config: Option<EsploraSyncConfig>,
+	},
+}
+
+// Hand-written because the `Dependent` variant holds a trait object, which
+// cannot derive `Debug`. The provider identifies itself by name; nothing else
+// about it is this crate's business to print.
+impl std::fmt::Debug for ChainDataSourceConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Esplora { server_url, sync_config } => f
+				.debug_struct("Esplora")
+				.field("server_url", server_url)
+				.field("sync_config", sync_config)
+				.finish(),
+			Self::Electrum { server_url, sync_config } => f
+				.debug_struct("Electrum")
+				.field("server_url", server_url)
+				.field("sync_config", sync_config)
+				.finish(),
+			Self::Bitcoind { rpc_host, rpc_port, rest_client_config, .. } => f
+				.debug_struct("Bitcoind")
+				.field("rpc_host", rpc_host)
+				.field("rpc_port", rpc_port)
+				.field("rest_client_config", rest_client_config)
+				.finish_non_exhaustive(),
+			Self::Dependent { provider, sync_config } => f
+				.debug_struct("Dependent")
+				.field("provider", &provider.name())
+				.field("sync_config", sync_config)
+				.finish(),
+		}
+	}
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +351,38 @@ impl NodeBuilder {
 	) -> &mut Self {
 		self.chain_data_source_config =
 			Some(ChainDataSourceConfig::Electrum { server_url, sync_config });
+		self
+	}
+
+	/// Configures the [`Node`] instance to take all of its chain data from
+	/// another node, rather than from a chain source of its own.
+	///
+	/// This is the **Dependent** tier. The node fills every chain ability slot
+	/// — fee estimation, lookup, broadcast — and its wallet synchronisation
+	/// from the given [`ChainDataProvider`], and believes what it is told.
+	///
+	/// The transport is entirely the provider's business: this crate never
+	/// learns which node is being asked, how it is reached, or what the call
+	/// costs. That is deliberate, and it is what keeps the chain layer below
+	/// the application layer rather than beside it.
+	///
+	/// ## Consequences worth knowing before choosing this
+	///
+	/// * **BOLT-7 channel announcements cannot be verified.** The routing
+	///   graph will carry capacities nobody checked. The node says so at
+	///   startup.
+	/// * **Availability follows the provider.** When it cannot be reached the
+	///   node fails honestly — no balance updates, no broadcasts — rather than
+	///   reporting a stale or invented view of the chain.
+	///
+	/// If no `sync_config` is given, default values are used. See
+	/// [`EsploraSyncConfig`] for more information; the Dependent engine is
+	/// transaction-based and honours the same background-sync settings.
+	pub fn set_chain_source_dependent(
+		&mut self, provider: Arc<dyn ChainDataProvider>, sync_config: Option<EsploraSyncConfig>,
+	) -> &mut Self {
+		self.chain_data_source_config =
+			Some(ChainDataSourceConfig::Dependent { provider, sync_config });
 		self
 	}
 
@@ -1210,6 +1280,20 @@ fn build_with_store_internal(
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
 			),
+		},
+
+		Some(ChainDataSourceConfig::Dependent { provider, sync_config }) => {
+			let sync_config = sync_config.clone().unwrap_or(EsploraSyncConfig::default());
+			ChainLayer::new_dependent(
+				Arc::clone(provider),
+				sync_config,
+				Arc::clone(&wallet),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&kv_store),
+				Arc::clone(&logger),
+				Arc::clone(&node_metrics),
+			)
 		},
 
 		None => {

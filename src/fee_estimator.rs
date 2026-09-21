@@ -141,6 +141,42 @@ pub(crate) fn get_all_conf_targets() -> [ConfirmationTarget; 10] {
 	]
 }
 
+/// The stable wire name for a confirmation target.
+///
+/// These strings are a protocol surface: a Pro node emits them and a Dependent
+/// node matches on them, so they must never change once released. They are
+/// deliberately not derived from the enum's `Debug` output, which would couple
+/// the wire to a refactor of the type.
+pub(crate) fn conf_target_wire_name(target: ConfirmationTarget) -> &'static str {
+	match target {
+		ConfirmationTarget::OnchainPayment => "onchain_payment",
+		ConfirmationTarget::ChannelFunding => "channel_funding",
+		ConfirmationTarget::Lightning(ldk_target) => match ldk_target {
+			LdkConfirmationTarget::MaximumFeeEstimate => "ldk.maximum_fee_estimate",
+			LdkConfirmationTarget::UrgentOnChainSweep => "ldk.urgent_onchain_sweep",
+			LdkConfirmationTarget::MinAllowedAnchorChannelRemoteFee => {
+				"ldk.min_allowed_anchor_channel_remote_fee"
+			},
+			LdkConfirmationTarget::MinAllowedNonAnchorChannelRemoteFee => {
+				"ldk.min_allowed_non_anchor_channel_remote_fee"
+			},
+			LdkConfirmationTarget::AnchorChannelFee => "ldk.anchor_channel_fee",
+			LdkConfirmationTarget::NonAnchorChannelFee => "ldk.non_anchor_channel_fee",
+			LdkConfirmationTarget::ChannelCloseMinimum => "ldk.channel_close_minimum",
+			LdkConfirmationTarget::OutputSpendingFee => "ldk.output_spending_fee",
+		},
+	}
+}
+
+/// Resolve a wire name back to its target.
+///
+/// Unknown names return `None` rather than a default: a Dependent node that
+/// silently mapped an unrecognised target onto some other target's fee would
+/// pay the wrong rate without any signal that it had done so.
+pub(crate) fn conf_target_from_wire_name(name: &str) -> Option<ConfirmationTarget> {
+	get_all_conf_targets().into_iter().find(|t| conf_target_wire_name(*t) == name)
+}
+
 pub(crate) fn apply_post_estimation_adjustments(
 	target: ConfirmationTarget, estimated_rate: FeeRate,
 ) -> FeeRate {

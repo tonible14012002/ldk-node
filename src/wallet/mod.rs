@@ -57,6 +57,7 @@ use bitcoin::secp256k1::Keypair;
 
 use std::ops::Deref;
 use std::str::FromStr;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub(crate) enum OnchainSendAmount {
@@ -106,6 +107,23 @@ where
 
 	pub(crate) fn get_incremental_sync_request(&self) -> SyncRequest<(KeychainKind, u32)> {
 		self.inner.lock().unwrap().start_sync_with_revealed_spks().build()
+	}
+
+	/// Every revealed script pubkey, with the keychain and index it came from.
+	///
+	/// Used by the Dependent sync engine to work out `last_active_indices`
+	/// locally from a remote scan's results. Address derivation is the one
+	/// thing a Dependent node must not outsource: accepting a remote opinion
+	/// on which keys belong to this wallet would let a provider walk it onto
+	/// keys it does not control.
+	pub(crate) fn revealed_spk_index(&self) -> HashMap<ScriptBuf, (KeychainKind, u32)> {
+		self.inner
+			.lock()
+			.unwrap()
+			.spk_index()
+			.revealed_spks(..)
+			.map(|((keychain, index), spk)| (spk, (keychain, index)))
+			.collect()
 	}
 
 	pub(crate) fn get_cached_txs(&self) -> Vec<Arc<Transaction>> {

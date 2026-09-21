@@ -11,5 +11,6 @@
 //! nothing here knows about node kinds, tiers or presets.
 
 pub(crate) mod bitcoind;
+pub(crate) mod dependent;
 pub(crate) mod electrum;
 pub(crate) mod esplora;

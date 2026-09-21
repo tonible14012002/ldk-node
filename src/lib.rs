@@ -100,6 +100,14 @@ mod tx_broadcaster;
 mod types;
 mod wallet;
 
+/// The remote chain provider port, for nodes with no chain source of their own.
+///
+/// A Dependent node fills every chain slot from one implementation of
+/// [`chain_provider::ChainDataProvider`], supplied through
+/// [`Builder::set_chain_source_dependent`]. The transport is the implementor's
+/// business; this crate never learns what it is.
+pub use crate::chain::provider as chain_provider;
+
 pub use bip39;
 pub use bitcoin;
 pub use lightning;
@@ -1597,6 +1605,92 @@ impl Node {
 		runtime.block_on(async move {
 			chain_source.sync_wallets_once(sync_cman, sync_cmon, sync_sweeper).await
 		})
+	}
+
+	/// Serve this node's fee-rate cache to another node.
+	///
+	/// The Pro half of the Dependent tier: a node that has a chain source
+	/// answering for one that does not. Nothing here decides *who* may ask or
+	/// what it costs — that is the embedding application's business, and
+	/// keeping it out of this crate is what lets the same binary be either
+	/// tier by configuration alone.
+	pub fn chain_serve_fee_estimates(&self) -> Result<chain_provider::WireFeeEstimates, Error> {
+		Ok(self.chain_source.serve_fee_estimates())
+	}
+
+	/// Broadcast another node's transaction through this node's chain source.
+	///
+	/// Returns once the transaction has been accepted for broadcast — not
+	/// once it has reached a miner, which no node can promise.
+	pub fn chain_serve_broadcast(
+		&self, req: &chain_provider::WireBroadcastRequest,
+	) -> Result<(), Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let tx = crate::chain::wire_convert::tx_from_wire(&req.tx_hex).map_err(|e| {
+			log_error!(self.logger, "Refusing a malformed broadcast request: {}", e);
+			Error::ChainServeFailed
+		})?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		runtime.block_on(async move { chain_source.serve_broadcast(&tx).await })
+	}
+
+	/// Answer another node's question about an arbitrary transaction.
+	///
+	/// Errors when this node's own lookup could not answer. That distinction
+	/// is the whole point: the asking node arms timeouts off this, and must
+	/// see a failure rather than an answer that happens to look like "not
+	/// found".
+	#[cfg(feature = "swaps")]
+	pub fn chain_serve_tx_status(
+		&self, req: &chain_provider::WireTxStatusRequest,
+	) -> Result<chain_provider::WireTxStatusResponse, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let malformed = |e: chain_provider::ChainProviderError| {
+			log_error!(self.logger, "Refusing a malformed chain lookup request: {}", e);
+			Error::ChainServeFailed
+		};
+		let txid = crate::chain::wire_convert::txid_from_wire(&req.txid).map_err(malformed)?;
+		let script_pubkey = req
+			.script_hex
+			.as_deref()
+			.map(crate::chain::wire_convert::script_from_wire)
+			.transpose()
+			.map_err(malformed)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		runtime.block_on(async move {
+			chain_source.serve_tx_status(txid, script_pubkey.as_ref()).await
+		})
+	}
+
+	/// Run another node's on-chain wallet scan against this node's chain
+	/// source.
+	pub fn chain_serve_wallet_sync(
+		&self, req: &chain_provider::WireSyncRequest,
+	) -> Result<chain_provider::WireUpdate, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_wallet_sync(&req).await })
+	}
+
+	/// Answer another node's Lightning sync.
+	pub fn chain_serve_lightning_sync(
+		&self, req: &chain_provider::WireLightningSyncRequest,
+	) -> Result<chain_provider::WireLightningSyncResponse, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_lightning_sync(&req).await })
 	}
 
 	/// Close a previously opened channel.

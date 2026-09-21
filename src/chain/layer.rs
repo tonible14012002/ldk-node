@@ -19,28 +19,38 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lightning::chain::{Filter, WatchedOutput};
 
-use bitcoin::{Script, ScriptBuf, Txid};
+use bitcoin::{Script, ScriptBuf, Transaction, Txid};
 
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_transaction_sync::EsploraSyncClient;
 
 use crate::chain::adapters::bitcoind::BitcoindChainAdapter;
+use crate::chain::adapters::dependent::DependentChainAdapter;
 use crate::chain::adapters::electrum::ElectrumChainAdapter;
 use crate::chain::adapters::esplora::EsploraChainAdapter;
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache};
 use crate::chain::engine::bitcoind::BitcoindSyncEngine;
+use crate::chain::engine::dependent::DependentSyncEngine;
 use crate::chain::engine::electrum::ElectrumSyncEngine;
 use crate::chain::engine::esplora::EsploraSyncEngine;
 use crate::chain::engine::SyncEngine;
+use crate::chain::provider::{
+	ChainDataProvider, WireFeeEstimates, WireFeeTarget, WireLightningSyncRequest,
+	WireLightningSyncResponse, WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
+};
 use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
 use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
-use crate::fee_estimator::OnchainFeeEstimator;
+use crate::fee_estimator::{
+	conf_target_wire_name, get_all_conf_targets, FeeEstimator, OnchainFeeEstimator,
+};
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_info, LdkLogger, Logger};
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
+#[cfg(feature = "swaps")]
+use crate::chain::provider::WireTxStatusResponse;
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 
@@ -136,6 +146,44 @@ impl ChainLayer {
 			logger: Arc::clone(&logger),
 			node_metrics: Arc::clone(&node_metrics),
 		});
+
+		Self::new(
+			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
+			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
+			adapter as Arc<dyn BroadcastAdapter>,
+			engine,
+			fee_estimator,
+			tx_broadcaster,
+			kv_store,
+			logger,
+			node_metrics,
+		)
+	}
+
+	/// A node with no chain source of its own: every slot is filled from one
+	/// remote provider.
+	///
+	/// This is the Dependent tier. Nothing about the transport reaches this
+	/// crate — `provider` is supplied by the embedding application, which owns
+	/// the peer connection, and this constructor only decides which slots it
+	/// occupies.
+	pub(crate) fn new_dependent(
+		provider: Arc<dyn ChainDataProvider>, sync_config: EsploraSyncConfig,
+		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Self {
+		let adapter =
+			Arc::new(DependentChainAdapter::new(Arc::clone(&provider), Arc::clone(&logger)));
+
+		let engine = Arc::new(DependentSyncEngine::new(
+			provider,
+			sync_config,
+			onchain_wallet,
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+			Arc::clone(&node_metrics),
+		));
 
 		Self::new(
 			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
@@ -390,6 +438,99 @@ impl ChainLayer {
 	) -> Result<(), Error> {
 		self.update_fee_rate_estimates().await?;
 		self.engine.sync_once(channel_manager, chain_monitor, output_sweeper).await
+	}
+
+	// ── SERVING ─────────────────────────────────────────────────────────────
+	//
+	// The Pro half of the Dependent tier: answering another node's questions
+	// from this node's own chain source. Each of these reads through the same
+	// slot this node uses itself, so a served answer and a local one cannot
+	// diverge.
+
+	/// This node's current fee-rate cache, for a Dependent node to adopt.
+	///
+	/// Reported per target rather than per block count, because the per-target
+	/// policy — bitcoind's conservative-versus-economical choice, and this
+	/// node's own floors — is exactly what makes the answer worth asking for.
+	pub(crate) fn serve_fee_estimates(&self) -> WireFeeEstimates {
+		let targets = get_all_conf_targets()
+			.into_iter()
+			.map(|target| WireFeeTarget {
+				target: conf_target_wire_name(target).to_string(),
+				sat_per_kwu: self.shared.fee_estimator.estimate_fee_rate(target).to_sat_per_kwu(),
+			})
+			.collect();
+
+		WireFeeEstimates { version: CHAIN_WIRE_VERSION, targets }
+	}
+
+	/// Put another node's transaction on the network through this node's
+	/// BROADCAST slot.
+	///
+	/// Returns once the transaction has been handed to the slot. Broadcast is
+	/// lossy by contract, so this reports that the transaction was accepted
+	/// for broadcast, never that it reached a miner.
+	pub(crate) async fn serve_broadcast(&self, tx: &Transaction) -> Result<(), Error> {
+		if !self.broadcast.ready().await {
+			return Err(Error::ChainServeFailed);
+		}
+		self.broadcast.broadcast_tx(tx).await;
+		Ok(())
+	}
+
+	/// Answer another node's question about an arbitrary transaction.
+	///
+	/// An unreachable lookup slot is an **error**, never a response. The wire
+	/// type has no "unreachable" variant on purpose: if this node could not
+	/// look, the asking node must see a failed call and fail closed, not a
+	/// well-formed answer that reads as "not found".
+	#[cfg(feature = "swaps")]
+	pub(crate) async fn serve_tx_status(
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
+	) -> Result<WireTxStatusResponse, Error> {
+		let (confirmed, in_mempool, confirmation_height, tip_height) =
+			match self.lookup.tx_status(txid, script_pubkey).await {
+				RawTxObservation::Confirmed { height, confirmations } => {
+					// Reconstruct the tip the adapter derived depth against,
+					// so the caller can recompute rather than trust a count
+					// taken at a tip it cannot see.
+					let tip = height.map(|h| h + confirmations.saturating_sub(1));
+					(true, false, height, tip)
+				},
+				RawTxObservation::InMempool => (false, true, None, None),
+				RawTxObservation::NotFound => (false, false, None, None),
+				RawTxObservation::Unreachable => {
+					log_info!(
+						self.shared.logger,
+						"Refusing to answer a chain lookup for {}: this node's own lookup is unreachable",
+						txid
+					);
+					return Err(Error::ChainServeFailed);
+				},
+			};
+
+		Ok(WireTxStatusResponse {
+			version: CHAIN_WIRE_VERSION,
+			confirmed,
+			in_mempool,
+			confirmation_height,
+			tip_height,
+		})
+	}
+
+	/// Run another node's on-chain wallet scan against this node's chain
+	/// source.
+	pub(crate) async fn serve_wallet_sync(
+		&self, req: &WireSyncRequest,
+	) -> Result<WireUpdate, Error> {
+		self.engine.serve_wallet_sync(req).await
+	}
+
+	/// Answer another node's Lightning sync.
+	pub(crate) async fn serve_lightning_sync(
+		&self, req: &WireLightningSyncRequest,
+	) -> Result<WireLightningSyncResponse, Error> {
+		self.engine.serve_lightning_sync(req).await
 	}
 
 	/// Reorg-aware status of a watched transaction (Peerswap native primitive B5).
