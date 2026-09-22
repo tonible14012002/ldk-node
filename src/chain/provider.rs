@@ -240,9 +240,19 @@ pub struct WireSyncRequest {
 	/// it returns. Supplied by the caller so that "when did I first see this"
 	/// stays anchored to the *asking* node's clock.
 	pub start_time: u64,
-	/// The asking wallet's current tip, so the answer can be built as a
-	/// connected extension of it rather than a replacement.
-	pub chain_tip: Option<WireBlockId>,
+	/// The asking wallet's checkpoint chain, ascending, genesis first, so the
+	/// answer can be built as a connected extension of it rather than a
+	/// replacement.
+	///
+	/// The whole chain travels, not just its tip. The serving node runs an
+	/// ordinary BDK scan against this, and that scan walks the chain looking
+	/// for a block both nodes agree on, then inserts blocks *below* the tip —
+	/// one per confirmation it found, plus the provider's own recent blocks.
+	/// Inserting into a chain that does not reach genesis has no defined
+	/// answer, and BDK panics rather than guess. A lone tip is therefore not
+	/// enough; an empty vector means "no opinion yet", and the scan returns a
+	/// fresh chain instead of an extension.
+	pub chain_tip: Vec<WireBlockId>,
 	/// Scripts to scan, hex. Empty on a pure txid/outpoint refresh.
 	///
 	/// Carries scripts only — no keychain, no derivation index. The serving

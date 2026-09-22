@@ -152,7 +152,7 @@ pub(crate) fn checkpoint_from_wire(
 /// that has been read cannot be scanned again locally anyway.
 pub(crate) fn sync_request_to_wire(mut req: SyncRequest<(KeychainKind, u32)>) -> WireSyncRequest {
 	let start_time = req.start_time();
-	let chain_tip = req.chain_tip().map(|cp| block_id_to_wire(&cp.block_id()));
+	let chain_tip = req.chain_tip().as_ref().map(checkpoint_to_wire).unwrap_or_default();
 
 	let spks: Vec<String> =
 		req.iter_spks_with_expected_txids().map(|item| script_to_wire(&item.spk)).collect();
@@ -183,7 +183,7 @@ pub(crate) fn full_scan_request_batch_to_wire(
 	req: &mut FullScanRequest<KeychainKind>, batch_size: u32, stop_gap: u32,
 ) -> WireSyncRequest {
 	let start_time = req.start_time();
-	let chain_tip = req.chain_tip().map(|cp| block_id_to_wire(&cp.block_id()));
+	let chain_tip = req.chain_tip().as_ref().map(checkpoint_to_wire).unwrap_or_default();
 
 	let mut spks = Vec::new();
 	for keychain in req.keychains() {
@@ -284,8 +284,11 @@ pub(crate) fn wire_to_sync_request(
 
 	let mut builder = SyncRequest::<()>::builder_at(wire.start_time);
 
-	if let Some(tip) = &wire.chain_tip {
-		builder = builder.chain_tip(CheckPoint::new(block_id_from_wire(tip)?));
+	// The whole chain, not a lone block: the scan below inserts blocks beneath
+	// the tip, and a checkpoint that cannot be walked back to genesis panics
+	// rather than return an error.
+	if let Some(tip) = checkpoint_from_wire(&wire.chain_tip)? {
+		builder = builder.chain_tip(tip);
 	}
 
 	let spks = wire.spks.iter().map(|s| script_from_wire(s)).collect::<Result<Vec<_>, _>>()?;
@@ -381,5 +384,55 @@ mod tests {
 	#[test]
 	fn empty_checkpoints_mean_no_chain_update() {
 		assert!(checkpoint_from_wire(&[]).unwrap().is_none());
+	}
+
+	/// Build a wire chain whose heights ascend from genesis.
+	fn wire_chain(heights: &[u32]) -> Vec<WireBlockId> {
+		heights
+			.iter()
+			.map(|h| {
+				let mut bytes = [0u8; 32];
+				bytes[0..4].copy_from_slice(&h.to_le_bytes());
+				WireBlockId {
+					height: *h,
+					hash: BlockHash::from_byte_array(bytes).to_string(),
+				}
+			})
+			.collect()
+	}
+
+	/// The reason the whole chain travels instead of only its tip.
+	///
+	/// A scan on the serving node inserts blocks *beneath* the tip — one per
+	/// confirmation it found. `CheckPoint::insert` walks backwards expecting
+	/// to reach genesis, so a request carrying a lone block panics there
+	/// rather than returning an error. Carrying the chain is what makes the
+	/// insert land.
+	#[test]
+	fn a_request_chain_survives_an_insert_below_its_tip() {
+		let wire = WireSyncRequest {
+			version: CHAIN_WIRE_VERSION,
+			start_time: 0,
+			chain_tip: wire_chain(&[0, 100, 200]),
+			spks: Vec::new(),
+			txids: Vec::new(),
+			outpoints: Vec::new(),
+			full_scan: false,
+			stop_gap: 0,
+		};
+
+		let req = wire_to_sync_request(&wire).unwrap();
+		let tip = req.chain_tip().expect("the chain tip survived the wire");
+		assert_eq!(tip.height(), 200);
+
+		// Height 150 sits below the tip and is not yet in the chain — exactly
+		// the shape that used to panic.
+		let widened = tip.insert(BlockId {
+			height: 150,
+			hash: BlockHash::from_byte_array([9u8; 32]),
+		});
+		assert_eq!(widened.height(), 200);
+		assert!(widened.get(150).is_some());
+		assert!(widened.get(0).is_some(), "the chain still reaches genesis");
 	}
 }
