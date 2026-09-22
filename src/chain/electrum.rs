@@ -32,7 +32,16 @@ use electrum_client::Client as ElectrumClient;
 use electrum_client::ConfigBuilder as ElectrumConfigBuilder;
 use electrum_client::{Batch, ElectrumApi};
 
-use bitcoin::{FeeRate, Network, Script, Transaction, Txid};
+use bitcoin::{BlockHash, FeeRate, Network, OutPoint, Script, ScriptBuf, Transaction, Txid};
+
+use crate::chain::provider::{
+	WireBlockId, WireConfirmedTx, WireLightningSyncRequest, WireLightningSyncResponse,
+	WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
+};
+use crate::chain::wire_convert::{
+	block_hash_from_wire, header_to_wire, outpoint_from_wire, script_from_wire,
+	sync_response_to_wire, tx_to_wire, txid_from_wire, wire_to_sync_request,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -363,6 +372,267 @@ impl ElectrumRuntimeClient {
 
 		Ok(new_fee_rate_cache)
 	}
+
+	// ── serving a Dependent node ─────────────────────────────────────────────
+
+	/// Run a Dependent node's on-chain scan against this node's Electrum
+	/// server.
+	///
+	/// Uses the same `BdkElectrumClient` this node syncs itself with, so a
+	/// served answer and a local one come from one code path — and, more to
+	/// the point, from the same batching. Electrum folds many script lookups
+	/// into one round trip, which is what makes serving someone else's wallet
+	/// affordable where a request-per-script HTTP API is not.
+	pub(crate) async fn serve_wallet_sync(
+		&self, req: &WireSyncRequest,
+	) -> Result<WireUpdate, Error> {
+		let sync_request = wire_to_sync_request(req).map_err(|e| {
+			log_error!(self.logger, "Refusing a malformed wallet sync request: {}", e);
+			Error::ChainServeFailed
+		})?;
+
+		let bdk_electrum_client = Arc::clone(&self.bdk_electrum_client);
+		let spawn_fut = self.runtime.spawn_blocking(move || {
+			bdk_electrum_client.sync(sync_request, BDK_ELECTRUM_CLIENT_BATCH_SIZE, true)
+		});
+
+		let response =
+			tokio::time::timeout(Duration::from_secs(BDK_WALLET_SYNC_TIMEOUT_SECS), spawn_fut)
+				.await
+				.map_err(|e| {
+					log_error!(self.logger, "Serving a wallet sync request timed out: {}", e);
+					Error::ChainServeFailed
+				})?
+				.map_err(|e| {
+					log_error!(self.logger, "Serving a wallet sync request could not run: {}", e);
+					Error::ChainServeFailed
+				})?
+				.map_err(|e| {
+					log_error!(self.logger, "Serving a wallet sync request failed: {}", e);
+					Error::ChainServeFailed
+				})?;
+
+		Ok(sync_response_to_wire(response))
+	}
+
+	/// Answer a Dependent node's Lightning sync request.
+	///
+	/// Electrum indexes by script, not by txid, so a watched transaction is
+	/// resolved the way LDK's own Electrum sync resolves it: fetch the
+	/// transaction, take one of its own outputs, and look *that* script up.
+	/// The caller therefore needs to send no more than it already does.
+	pub(crate) async fn serve_lightning_sync(
+		&self, req: &WireLightningSyncRequest,
+	) -> Result<WireLightningSyncResponse, Error> {
+		let malformed = |e: crate::chain::provider::ChainProviderError| {
+			log_error!(self.logger, "Refusing a malformed lightning sync request: {}", e);
+			Error::ChainServeFailed
+		};
+
+		// Decode before the runtime hop, so a bad request costs the server
+		// nothing.
+		let mut watched_txs = Vec::with_capacity(req.txids.len());
+		for w in &req.txids {
+			let txid = txid_from_wire(&w.txid).map_err(malformed)?;
+			let known = w
+				.known_block_hash
+				.as_deref()
+				.map(block_hash_from_wire)
+				.transpose()
+				.map_err(malformed)?;
+			watched_txs.push((txid, known));
+		}
+
+		let mut watched_outputs = Vec::with_capacity(req.outputs.len());
+		for o in &req.outputs {
+			let outpoint = outpoint_from_wire(&o.outpoint).map_err(malformed)?;
+			let script = script_from_wire(&o.script_hex).map_err(malformed)?;
+			watched_outputs.push((outpoint, script));
+		}
+
+		let electrum_client = Arc::clone(&self.electrum_client);
+		let logger = Arc::clone(&self.logger);
+		let spawn_fut = self.runtime.spawn_blocking(move || {
+			serve_lightning_sync_blocking(&electrum_client, &logger, watched_txs, watched_outputs)
+		});
+
+		tokio::time::timeout(Duration::from_secs(LDK_WALLET_SYNC_TIMEOUT_SECS), spawn_fut)
+			.await
+			.map_err(|e| {
+				log_error!(self.logger, "Serving a lightning sync request timed out: {}", e);
+				Error::ChainServeFailed
+			})?
+			.map_err(|e| {
+				log_error!(self.logger, "Serving a lightning sync request could not run: {}", e);
+				Error::ChainServeFailed
+			})?
+	}
+}
+
+/// The blocking half of [`ElectrumRuntimeClient::serve_lightning_sync`].
+///
+/// Every Electrum call blocks, so the whole answer is assembled on one
+/// `spawn_blocking` thread rather than hopping per call.
+///
+/// On a server inconsistency this fails the whole request rather than
+/// returning a partial answer. A silently dropped confirmation would leave the
+/// asking node believing its funds are still unconfirmed with nothing to
+/// retry; failing makes the next tick ask again. This is the same trade LDK's
+/// own Electrum sync makes for itself.
+fn serve_lightning_sync_blocking(
+	electrum_client: &ElectrumClient, logger: &Logger, watched_txs: Vec<(Txid, Option<BlockHash>)>,
+	watched_outputs: Vec<(OutPoint, ScriptBuf)>,
+) -> Result<WireLightningSyncResponse, Error> {
+	let chain_failed = |what: &str, e: electrum_client::Error| {
+		log_error!(logger, "Serving a lightning sync request failed ({}): {}", what, e);
+		Error::ChainServeFailed
+	};
+
+	// The tip first: everything else is reported relative to it, and a tip
+	// read afterwards could be ahead of the answers already given.
+	let tip = electrum_client
+		.block_headers_subscribe()
+		.map_err(|e| chain_failed("reading the tip", e))?;
+	let tip_height = tip.height as u32;
+	let tip_header = tip.header;
+	let tip_hash = tip_header.block_hash();
+
+	let mut confirmed = Vec::new();
+	let mut unconfirmed = Vec::new();
+
+	// Resolve each watched transaction to one of its own scripts, which is
+	// the only handle Electrum offers on its history.
+	let mut probe_scripts: Vec<ScriptBuf> = Vec::with_capacity(watched_txs.len());
+	let mut probes: Vec<(Txid, Option<BlockHash>, Transaction)> =
+		Vec::with_capacity(watched_txs.len());
+
+	for (txid, known) in watched_txs {
+		match electrum_client.transaction_get(&txid) {
+			Ok(tx) => {
+				// Bitcoin's Merkle tree cannot distinguish an inner node from
+				// a 64-byte leaf, so a 64-byte transaction is refused rather
+				// than trusted. Same guard LDK applies.
+				if tx.total_size() == 64 {
+					log_error!(logger, "Skipping transaction {}: suspicious 64-byte length", txid);
+					continue;
+				}
+				let Some(first_out) = tx.output.first() else {
+					log_error!(logger, "Skipping transaction {}: it has no outputs", txid);
+					continue;
+				};
+				probe_scripts.push(first_out.script_pubkey.clone());
+				probes.push((txid, known, tx));
+			},
+			Err(electrum_client::Error::Protocol(_)) => {
+				// The server does not have it. Only worth saying so if the
+				// caller believed otherwise.
+				if known.is_some() {
+					unconfirmed.push(txid.to_string());
+				}
+			},
+			Err(e) => return Err(chain_failed("looking up a watched transaction", e)),
+		}
+	}
+
+	let num_tx_probes = probe_scripts.len();
+	for (_outpoint, script) in &watched_outputs {
+		probe_scripts.push(script.clone());
+	}
+
+	// One round trip for every script, transactions and outputs together.
+	// This batching is the whole reason Electrum can serve a Dependent node
+	// without exhausting a request budget.
+	let histories = electrum_client
+		.batch_script_get_history(probe_scripts.iter().map(|s| s.as_script()))
+		.map_err(|e| chain_failed("reading script histories", e))?;
+	let (tx_histories, output_histories) = histories.split_at(num_tx_probes);
+
+	for ((txid, known, tx), history) in probes.iter().zip(tx_histories) {
+		let Some(entry) = history.iter().find(|h| h.tx_hash == *txid) else {
+			// Not in the best chain at all.
+			if known.is_some() {
+				unconfirmed.push(txid.to_string());
+			}
+			continue;
+		};
+		// Electrum reports 0 for unconfirmed and -1 for unconfirmed with
+		// unconfirmed parents; both mean "in the mempool".
+		if entry.height <= 0 {
+			if known.is_some() {
+				unconfirmed.push(txid.to_string());
+			}
+			continue;
+		}
+		let height = entry.height as u32;
+		if let Some(wire_tx) = confirmed_tx_entry(electrum_client, logger, tx, height, *known)? {
+			confirmed.push(wire_tx);
+		}
+	}
+
+	for ((outpoint, _script), history) in watched_outputs.iter().zip(output_histories) {
+		for candidate in history {
+			if candidate.height <= 0 {
+				continue;
+			}
+			let spend = match electrum_client.transaction_get(&candidate.tx_hash) {
+				Ok(tx) => tx,
+				Err(electrum_client::Error::Protocol(_)) => continue,
+				Err(e) => return Err(chain_failed("looking up a possible spend", e)),
+			};
+			if !spend.input.iter().any(|txin| txin.previous_output == *outpoint) {
+				continue;
+			}
+			let height = candidate.height as u32;
+			if let Some(wire_tx) =
+				confirmed_tx_entry(electrum_client, logger, &spend, height, None)?
+			{
+				confirmed.push(wire_tx);
+			}
+		}
+	}
+
+	Ok(WireLightningSyncResponse {
+		version: CHAIN_WIRE_VERSION,
+		tip: WireBlockId { height: tip_height, hash: tip_hash.to_string() },
+		tip_header_hex: header_to_wire(&tip_header),
+		confirmed,
+		unconfirmed,
+	})
+}
+
+/// Build one confirmed-transaction answer, or `None` when the caller already
+/// knows what we would tell it.
+///
+/// `pos_in_block` comes from the Merkle proof because LDK's `Confirm` requires
+/// it; the proof is not re-validated here, since a Dependent node takes this
+/// node's word for the chain by definition.
+fn confirmed_tx_entry(
+	electrum_client: &ElectrumClient, logger: &Logger, tx: &Transaction, height: u32,
+	known: Option<BlockHash>,
+) -> Result<Option<WireConfirmedTx>, Error> {
+	let header = electrum_client.block_header(height as usize).map_err(|e| {
+		log_error!(logger, "Failed to read the header at height {}: {}", height, e);
+		Error::ChainServeFailed
+	})?;
+	let block_hash = header.block_hash();
+
+	// Still in the same block the caller already recorded: nothing to say.
+	if known == Some(block_hash) {
+		return Ok(None);
+	}
+
+	let txid = tx.compute_txid();
+	let proof = electrum_client.transaction_get_merkle(&txid, height as usize).map_err(|e| {
+		log_error!(logger, "Failed to read the Merkle proof for {} at {}: {}", txid, height, e);
+		Error::ChainServeFailed
+	})?;
+
+	Ok(Some(WireConfirmedTx {
+		tx_hex: tx_to_wire(tx),
+		block: WireBlockId { height, hash: block_hash.to_string() },
+		pos_in_block: proof.pos as u32,
+		header_hex: header_to_wire(&header),
+	}))
 }
 
 impl Filter for ElectrumRuntimeClient {

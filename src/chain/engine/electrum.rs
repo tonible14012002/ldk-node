@@ -22,6 +22,9 @@ use bdk_wallet::Update as BdkUpdate;
 
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::chain::engine::{run_tx_based_sync_loop, SyncEngine, TxBasedBackend};
+use crate::chain::provider::{
+	WireLightningSyncRequest, WireLightningSyncResponse, WireSyncRequest, WireUpdate,
+};
 use crate::chain::{
 	periodically_archive_fully_resolved_monitors, ChainLayer, ElectrumRuntimeStatus,
 	WalletSyncStatus,
@@ -45,6 +48,25 @@ pub(crate) struct ElectrumSyncEngine {
 	pub(crate) config: Arc<Config>,
 	pub(crate) logger: Arc<Logger>,
 	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
+}
+
+impl ElectrumSyncEngine {
+	/// The live client, or a refusal.
+	///
+	/// Serving is only possible while this node's own chain source is up; a
+	/// node that cannot see the chain must not answer for it.
+	fn serving_client(&self) -> Result<Arc<ElectrumRuntimeClient>, Error> {
+		match self.electrum_runtime_status.read().unwrap().client().as_ref() {
+			Some(client) => Ok(Arc::clone(client)),
+			None => {
+				log_error!(
+					self.logger,
+					"Refusing to serve chain data: the Electrum chain source is not running"
+				);
+				Err(Error::ChainServeFailed)
+			},
+		}
+	}
 }
 
 #[async_trait]
@@ -232,6 +254,16 @@ impl SyncEngine for ElectrumSyncEngine {
 
 	fn stop(&self) {
 		self.electrum_runtime_status.write().unwrap().stop();
+	}
+
+	async fn serve_wallet_sync(&self, req: &WireSyncRequest) -> Result<WireUpdate, Error> {
+		self.serving_client()?.serve_wallet_sync(req).await
+	}
+
+	async fn serve_lightning_sync(
+		&self, req: &WireLightningSyncRequest,
+	) -> Result<WireLightningSyncResponse, Error> {
+		self.serving_client()?.serve_lightning_sync(req).await
 	}
 
 	async fn sync_once(
