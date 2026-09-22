@@ -317,12 +317,53 @@ impl Node {
 			);
 		}
 
-		// Block to ensure we update our fee rate cache once on startup
+		// Refresh the fee rate cache once on startup — but do NOT let a failure
+		// stop the node coming up.
+		//
+		// DEVIATION from upstream ldk-node, which propagates this error with
+		// `?` and refuses to start. Upstream's rule is a reachability probe on
+		// the chain source, using the cheapest call available: fail fast rather
+		// than come up blind. That is sound for a node whose chain source is an
+		// external server it can retry until the network appears.
+		//
+		// It is wrong for a node whose chain source is reached through this
+		// node's own transport. There the probe is gated on the node it is
+		// gating — identity and message signing are served by the application
+		// wrapping this crate, and that application cannot answer until start()
+		// returns. The node then retries forever against a dependency that can
+		// never be satisfied.
+		//
+		// Two facts make continuing safe rather than reckless:
+		//
+		//   * `FeeEstimator::estimate_fee_rate` cannot fail. Every target has a
+		//     hardcoded fallback, so an empty cache yields constants, not an
+		//     error. A node with no estimates runs.
+		//   * this crate ALREADY tolerates indefinite fee failures — the
+		//     background loop discards them (`let _ = …update_fee_rate_estimates`).
+		//     A node whose provider dies after startup keeps running on a stale
+		//     cache. Only the very first fetch was fatal, which is an asymmetry
+		//     rather than a safety property.
+		//
+		// What replaces the guarantee: the failure is recorded rather than
+		// swallowed. `latest_fee_rate_cache_update_timestamp` stays `None`,
+		// which [`Node::chain_freshness`] reports so the embedding application
+		// can refuse the operations where a wrong fee rate costs money —
+		// building or broadcasting a transaction — while still serving reads.
+		// Degraded and honest beats absent.
 		let chain_source = Arc::clone(&self.chain_source);
 		let runtime_ref = &runtime;
-		tokio::task::block_in_place(move || {
+		let fee_update = tokio::task::block_in_place(move || {
 			runtime_ref.block_on(async move { chain_source.update_fee_rate_estimates().await })
-		})?;
+		});
+		if let Err(e) = fee_update {
+			log_error!(
+				self.logger,
+				"Initial fee rate cache update failed: {}. Continuing startup with fallback fee \
+				 estimates; transaction-building operations should be refused until a refresh \
+				 succeeds (see Node::chain_freshness).",
+				e
+			);
+		}
 
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 		let stop_sync_receiver = self.stop_sender.subscribe();
@@ -789,6 +830,40 @@ impl Node {
 
 		log_info!(self.logger, "Shutdown complete.");
 		Ok(())
+	}
+
+	/// Returns the status of the [`Node`].
+	/// How current this node's chain-derived state is.
+	///
+	/// Two INDEPENDENT axes, because they fail differently and gate different
+	/// operations. A node can hold either one alone: fresh fees with a wallet
+	/// that has never synced, or a synced wallet behind a dead fee source.
+	///
+	/// ```text
+	///   fee rates stale   estimates are hardcoded fallbacks, not observations
+	///                     -> refuse to BUILD or BROADCAST transactions; a
+	///                        wrong fee rate on a timing-critical path (an
+	///                        HTLC sweep, a force close) loses money
+	///
+	///   wallet stale      balances and transaction states may not be true
+	///                     -> still serve reads, but say so; a last-known
+	///                        balance is useful, a silent zero is not
+	/// ```
+	///
+	/// Exists because [`Node::start`] no longer refuses to come up when the
+	/// chain source is unreachable. The guarantee that used to provide has to
+	/// live somewhere, and this is where: the embedding application reads it
+	/// and decides, per operation, what is still safe to do.
+	///
+	/// `None` means never — no successful update since this node was created,
+	/// not merely since the process started, as these timestamps are persisted.
+	pub fn chain_freshness(&self) -> ChainFreshness {
+		let locked_node_metrics = self.node_metrics.read().unwrap();
+		ChainFreshness {
+			fee_rates_updated_at: locked_node_metrics.latest_fee_rate_cache_update_timestamp,
+			onchain_wallet_synced_at: locked_node_metrics.latest_onchain_wallet_sync_timestamp,
+			lightning_wallet_synced_at: locked_node_metrics.latest_lightning_wallet_sync_timestamp,
+		}
 	}
 
 	/// Returns the status of the [`Node`].
@@ -1663,9 +1738,9 @@ impl Node {
 			.map_err(malformed)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		runtime.block_on(async move {
-			chain_source.serve_tx_status(txid, script_pubkey.as_ref()).await
-		})
+		runtime.block_on(
+			async move { chain_source.serve_tx_status(txid, script_pubkey.as_ref()).await },
+		)
 	}
 
 	/// Run another node's on-chain wallet scan against this node's chain
@@ -2029,6 +2104,93 @@ pub struct NodeStatus {
 	///
 	/// Will be `None` if we haven't archived any monitors of closed channels yet.
 	pub latest_channel_monitor_archival_height: Option<u32>,
+}
+
+/// How current this node's chain-derived state is — see
+/// [`Node::chain_freshness`].
+///
+/// Every field is a Unix timestamp of the last SUCCESSFUL update, or `None`
+/// for never. They are read, not judged: what counts as "too old" is a policy
+/// question for the caller, which knows what it is about to do. A read-only
+/// dashboard and an HTLC sweep should not agree on that threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainFreshness {
+	/// Last successful fee-rate cache update. `None` means every estimate in
+	/// use is a hardcoded fallback.
+	pub fee_rates_updated_at: Option<u64>,
+	/// Last successful on-chain (BDK) wallet sync. `None` means balances have
+	/// never been confirmed against the chain.
+	pub onchain_wallet_synced_at: Option<u64>,
+	/// Last successful Lightning (LDK `Confirm`) sync.
+	pub lightning_wallet_synced_at: Option<u64>,
+}
+
+impl ChainFreshness {
+	/// Whether fee estimates have ever been observed rather than assumed.
+	///
+	/// `false` means the cache is empty and `estimate_fee_rate` is returning
+	/// constants. Callers that build or broadcast transactions should refuse.
+	pub fn has_fee_rates(&self) -> bool {
+		self.fee_rates_updated_at.is_some()
+	}
+
+	/// Whether the on-chain wallet has ever synced.
+	///
+	/// `false` means a reported balance is a starting assumption, not an
+	/// observation. Reads may still be served — flagged, never as fact.
+	pub fn has_synced_onchain(&self) -> bool {
+		self.onchain_wallet_synced_at.is_some()
+	}
+}
+
+#[cfg(test)]
+mod chain_freshness_tests {
+	use super::ChainFreshness;
+
+	fn freshness(fee: Option<u64>, onchain: Option<u64>) -> ChainFreshness {
+		ChainFreshness {
+			fee_rates_updated_at: fee,
+			onchain_wallet_synced_at: onchain,
+			lightning_wallet_synced_at: None,
+		}
+	}
+
+	/// The state a node boots into when its chain source is unreachable. It is
+	/// running — `start()` no longer refuses — so the ONLY thing standing
+	/// between it and a transaction built at an unobserved fee rate is this
+	/// returning false.
+	#[test]
+	fn a_node_that_never_reached_its_chain_source_has_neither() {
+		let f = freshness(None, None);
+		assert!(!f.has_fee_rates());
+		assert!(!f.has_synced_onchain());
+	}
+
+	/// The two axes are independent and must not be collapsed into one
+	/// "healthy" bit: fee staleness gates writes, sync staleness only flags
+	/// reads, and a node can genuinely be in either corner.
+	#[test]
+	fn the_two_axes_are_independent() {
+		let fees_only = freshness(Some(1_700_000_000), None);
+		assert!(fees_only.has_fee_rates());
+		assert!(!fees_only.has_synced_onchain(), "balances are not yet a fact");
+
+		let sync_only = freshness(None, Some(1_700_000_000));
+		assert!(!sync_only.has_fee_rates(), "estimates are still constants");
+		assert!(sync_only.has_synced_onchain());
+	}
+
+	/// Age is deliberately NOT judged here. What counts as too old depends on
+	/// what the caller is about to do — a dashboard and an HTLC sweep should
+	/// not share a threshold — so this reports the timestamp and leaves the
+	/// policy to the caller.
+	#[test]
+	fn an_ancient_timestamp_still_counts_as_observed() {
+		let f = freshness(Some(1), Some(1));
+		assert!(f.has_fee_rates());
+		assert!(f.has_synced_onchain());
+		assert_eq!(f.fee_rates_updated_at, Some(1));
+	}
 }
 
 /// Status fields that are persisted across restarts.
