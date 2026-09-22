@@ -60,11 +60,31 @@ pub(crate) struct ElectrumRuntimeClient {
 	logger: Arc<Logger>,
 }
 
+/// Choose a TLS backend before the first `ssl://` handshake.
+///
+/// `rustls` 0.23 will not guess when more than one crypto provider is compiled
+/// in, and it does not return an error — it panics. A node that links both
+/// `ring` and `aws-lc-rs` (which happens through ordinary feature unification,
+/// since several dependencies pull rustls in independently) therefore dies the
+/// first time the Electrum client opens a TLS connection. That panic used to
+/// land on the startup thread while it held the runtime lock, poisoning it, so
+/// every later call failed with `PoisonError` and the real cause was three
+/// removes away.
+///
+/// Either provider is fine; what matters is that one is chosen. `ring` is the
+/// lighter of the two. An `Err` means somebody installed one first, which is
+/// equally fine.
+fn install_default_crypto_provider() {
+	let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 impl ElectrumRuntimeClient {
 	pub(crate) fn new(
 		server_url: String, runtime: Arc<tokio::runtime::Runtime>, config: Arc<Config>,
 		logger: Arc<Logger>,
 	) -> Result<Self, Error> {
+		install_default_crypto_provider();
+
 		let electrum_config = ElectrumConfigBuilder::new()
 			.retry(ELECTRUM_CLIENT_NUM_RETRIES)
 			.timeout(Some(ELECTRUM_CLIENT_TIMEOUT_SECS))
