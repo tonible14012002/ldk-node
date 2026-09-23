@@ -26,7 +26,7 @@ use std::time::Duration;
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
 const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
 const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
-const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
+pub(crate) const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
@@ -183,6 +183,68 @@ impl Default for Config {
 			node_alias: None,
 		}
 	}
+}
+
+/// Configuration of the compact-block-filter (BIP157/158) chain source.
+///
+/// ### Defaults
+///
+/// | Parameter                 | Value  |
+/// |---------------------------|--------|
+/// | `wallet_birthday_height`  | None   |
+/// | `external_fee`            | None   |
+/// | `utxo_source`             | false  |
+/// | `required_peers`          | 1      |
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CbfConfig {
+	/// The lowest height whose block may hold a transaction of this wallet: the wallet
+	/// birthday. Rounded *down* to the nearest checkpoint compiled into the crate (mainnet
+	/// only), which seeds a fresh wallet and floors the height the filter sync resumes from.
+	///
+	/// A filter scan never starts from genesis: a wallet whose persisted chain offers no
+	/// usable checkpoint resumes from this birthday, and refuses to sync at all when none is
+	/// configured. Set it for every wallet handed over from another chain source.
+	pub wallet_birthday_height: Option<u32>,
+	/// An external, mempool-aware server asked for fee estimates ahead of the node's own
+	/// coinbase-derived ones. Without it the FEE slot has only the blocks the node downloads.
+	pub external_fee: Option<CbfExternalFee>,
+	/// Whether to verify BOLT-7 channel announcements against the filters: existence-only,
+	/// since a block filter can say an output was created and not yet spent, but not what it
+	/// holds. Off by default; announcements are then accepted unverified.
+	pub utxo_source: bool,
+	/// Number of peers that must agree on filter headers before they are accepted.
+	pub required_peers: u8,
+}
+
+#[cfg(feature = "cbf")]
+impl Default for CbfConfig {
+	fn default() -> Self {
+		Self {
+			wallet_birthday_height: None,
+			external_fee: None,
+			utxo_source: false,
+			required_peers: DEFAULT_CBF_REQUIRED_PEERS,
+		}
+	}
+}
+
+/// Number of peers that must agree on filter headers before they are accepted.
+#[cfg(feature = "cbf")]
+pub(crate) const DEFAULT_CBF_REQUIRED_PEERS: u8 = 1;
+
+/// An external fee-estimation server for a compact-block-filter node.
+///
+/// By default CBF derives fee rates from recent blocks' coinbase outputs. An external source
+/// provides more accurate, per-target estimates from a mempool-aware server; it is asked
+/// first, and the coinbase-derived rates stand in when it cannot answer.
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CbfExternalFee {
+	/// An Esplora HTTP server, by URL.
+	Esplora(String),
+	/// An Electrum server, by URL.
+	Electrum(String),
 }
 
 /// Configuration options pertaining to 'Anchor' channels, i.e., channels for which the

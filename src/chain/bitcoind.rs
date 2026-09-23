@@ -1128,7 +1128,7 @@ pub(crate) fn listener_action(
 
 /// How a gated disconnect treats one listener for one header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisconnectAction {
+pub(crate) enum DisconnectAction {
 	/// The header is the listener's current tip: rewind it.
 	Rewind,
 	/// The listener never connected this height; there is nothing to rewind.
@@ -1138,7 +1138,9 @@ enum DisconnectAction {
 	Diverged,
 }
 
-fn disconnect_action(best: &BestBlock, header: &Header, height: u32) -> DisconnectAction {
+pub(crate) fn disconnect_action(
+	best: &BestBlock, header: &Header, height: u32,
+) -> DisconnectAction {
 	if best.height < height {
 		DisconnectAction::NotReached
 	} else if best.height == height && best.block_hash == header.block_hash() {
@@ -1148,9 +1150,9 @@ fn disconnect_action(best: &BestBlock, header: &Header, height: u32) -> Disconne
 	}
 }
 
-// Wired by T7: the filter-driven engine's applicator is the caller of every gated method and
-// of the divergence ledger; nothing on the bitcoind path touches them.
-#[allow(dead_code)]
+// The filter-driven engine's applicator (`chain::cbf::applicator`) is the caller of every gated
+// method and of the divergence ledger; nothing on the bitcoind path touches them.
+#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 impl ChainListener {
 	pub(crate) fn new(
 		onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
@@ -1314,9 +1316,14 @@ impl ChainListener {
 	}
 
 	/// Gated fan-out of a full block. See [`Self::gated_filtered_block_connected`].
+	///
+	/// The wallet takes the block as it is; only the Lightning listeners need it as `txdata`.
+	/// Rebuilding a block from its own `txdata` for the wallet would clone every transaction
+	/// of a matched block for nothing.
 	pub(crate) fn gated_block_connected(&self, block: &bitcoin::Block, height: u32) {
+		self.onchain_wallet.block_connected(block, height);
 		let txdata: Vec<_> = block.txdata.iter().enumerate().collect();
-		self.gated_filtered_block_connected(&block.header, &txdata, height);
+		self.gated_lightning_block_connected(&block.header, &txdata, height);
 	}
 
 	/// Gated fan-out of a (possibly filtered) block: each Lightning listener is handed the block
@@ -1331,7 +1338,14 @@ impl ChainListener {
 		&self, header: &Header, txdata: &TransactionData, height: u32,
 	) {
 		self.onchain_wallet.filtered_block_connected(header, txdata, height);
+		self.gated_lightning_block_connected(header, txdata, height);
+	}
 
+	/// The Lightning half of [`Self::gated_filtered_block_connected`]: every listener but the
+	/// wallet, each behind its gate.
+	fn gated_lightning_block_connected(
+		&self, header: &Header, txdata: &TransactionData, height: u32,
+	) {
 		let block_hash = header.block_hash();
 
 		let cm_best = self.channel_manager.current_best_block();

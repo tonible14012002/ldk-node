@@ -62,8 +62,8 @@ impl KVStoreWalletPersister {
 	/// Turning deferral off does not flush. Callers pair this with [`Self::flush_local_chain`];
 	/// a non-deferred write that follows also clears the backlog, because it writes the full
 	/// aggregate.
-	// Wired by T7: reached through `Wallet::set_bulk_chain_persistence` / `flush_chain_persistence`.
-	#[allow(dead_code)]
+	// Reached through `Wallet::set_bulk_chain_persistence` from the filter-driven engine.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn set_defer_local_chain(&mut self, defer: bool) {
 		self.defer_local_chain = defer;
 	}
@@ -75,8 +75,8 @@ impl KVStoreWalletPersister {
 	}
 
 	/// Writes the in-memory `local_chain` aggregate once if any change was deferred.
-	// Wired by T7: reached through `Wallet::set_bulk_chain_persistence` / `flush_chain_persistence`.
-	#[allow(dead_code)]
+	// Reached through `Wallet::flush_chain_persistence` from the filter-driven engine.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn flush_local_chain(&mut self) -> Result<(), std::io::Error> {
 		if self.pending_local_chain.is_empty() {
 			return Ok(());

@@ -149,10 +149,21 @@ where
 	///
 	/// A filter-driven engine seeds its header chain from this instead of the bare
 	/// [`Self::current_best_block`] so it can resume without re-fetching the ancestors.
-	// Wired by T7: called by the filter-driven sync engine.
-	#[allow(dead_code)]
+	// Called by the filter-driven sync engine only.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn latest_checkpoint(&self) -> bdk_chain::local_chain::CheckPoint {
 		self.inner.lock().unwrap().latest_checkpoint()
+	}
+
+	/// How many script pubkeys [`Self::list_watched_scripts`] would return.
+	///
+	/// The set only ever grows — BDK reveals keys, it never forgets them — so a filter-driven
+	/// engine matching thousands of block filters against it can keep a copy and refresh it
+	/// only when this count moves, instead of cloning every script per filter.
+	// Called by the filter-driven sync engine only.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
+	pub(crate) fn watched_script_count(&self) -> usize {
+		self.inner.lock().unwrap().spk_index().inner().all_spks().len()
 	}
 
 	/// Every script pubkey the wallet watches for on-chain activity: all revealed SPKs of both
@@ -162,8 +173,8 @@ where
 	/// block may pay an address the wallet has not explicitly revealed yet (on recovery a fresh
 	/// wallet has revealed nothing at all) but which is still inside the gap limit, and a
 	/// filter that only carried revealed scripts would silently miss that deposit.
-	// Wired by T7: called by the filter-driven sync engine.
-	#[allow(dead_code)]
+	// Called by the filter-driven sync engine only.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn list_watched_scripts(&self) -> Vec<ScriptBuf> {
 		self.inner.lock().unwrap().spk_index().inner().all_spks().values().cloned().collect()
 	}
@@ -173,15 +184,15 @@ where
 	/// See [`KVStoreWalletPersister::set_defer_local_chain`] for why only the chain is deferred
 	/// and why a crash mid-sync stays recoverable. Callers pair this with
 	/// [`Self::flush_chain_persistence`]; nothing flushes implicitly.
-	// Wired by T7: called by the filter-driven sync engine.
-	#[allow(dead_code)]
+	// Called by the filter-driven sync engine only.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn set_bulk_chain_persistence(&self, enabled: bool) {
 		self.persister.lock().unwrap().set_defer_local_chain(enabled);
 	}
 
 	/// Persists any chain state deferred by [`Self::set_bulk_chain_persistence`].
-	// Wired by T7: called by the filter-driven sync engine.
-	#[allow(dead_code)]
+	// Called by the filter-driven sync engine only.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn flush_chain_persistence(&self) -> Result<(), Error> {
 		self.persister.lock().unwrap().flush_local_chain().map_err(|e| {
 			log_error!(self.logger, "Failed to flush deferred on-chain wallet chain state: {}", e);

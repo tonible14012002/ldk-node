@@ -7,6 +7,8 @@
 
 pub(crate) mod adapters;
 pub(crate) mod bitcoind;
+#[cfg(feature = "cbf")]
+pub(crate) mod cbf;
 pub(crate) mod electrum;
 pub(crate) mod engine;
 mod layer;
@@ -37,6 +39,27 @@ pub(crate) const DEFAULT_ESPLORA_SERVER_URL: &str = "https://blockstream.info/ap
 pub(crate) const DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS: u64 = 10;
 
 pub(crate) const CHAIN_POLLING_INTERVAL_SECS: u64 = 2;
+
+/// A simplified, externally-consumable snapshot of the compact-block-filter (CBF) sync
+/// engine's state.
+///
+/// This deliberately does NOT expose the crate-internal, error-carrying sync state the engine
+/// tracks — only whether it is still catching up, has caught up to the network tip, or has
+/// given up. Defined unconditionally so an embedding application compiles against it whether
+/// or not the `cbf` feature is on; only a node built with the feature ever reports one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum CbfSyncStatus {
+	/// CBF has not yet caught up to the network tip — either the initial compact-filter sync,
+	/// or catching up again after falling behind.
+	Syncing,
+	/// CBF has caught up to the network tip and applied all pending blocks.
+	Synced,
+	/// The CBF background restart loop gave up after repeated failures, the engine refused to
+	/// resume without a usable checkpoint, or the engine has been cleanly stopped (e.g. during
+	/// node shutdown). Not currently making sync progress either way.
+	Failed,
+}
 
 pub(crate) enum WalletSyncStatus {
 	Completed,

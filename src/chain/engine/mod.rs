@@ -31,6 +31,8 @@
 //! is three implementations, not two.
 
 pub(crate) mod bitcoind;
+#[cfg(feature = "cbf")]
+pub(crate) mod cbf;
 pub(crate) mod dependent;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
@@ -39,6 +41,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::{Script, Txid};
+
+use bdk_chain::BlockId;
 
 use lightning::chain::WatchedOutput;
 
@@ -205,6 +209,23 @@ pub(crate) trait SyncEngine: Send + Sync {
 	/// chain is empty and a Dependent node's is its provider.
 	fn serves_mempool(&self) -> bool {
 		false
+	}
+
+	/// Whether `block` is on the chain this engine considers best: `Some(true)`
+	/// if it is, `Some(false)` if this engine knows a different block at that
+	/// height, `None` if it cannot say.
+	///
+	/// The reorg-consistency check a hybrid node runs on an answer a provider
+	/// [`Anchored`] to its own tip: an answer computed on a chain this node does
+	/// not consider best is refused, and the chain advances. Defaults to `None`
+	/// — an engine that follows no header chain of its own (transaction-based,
+	/// Dependent) cannot check, and an unchecked answer is applied as it always
+	/// was. Only an engine with its own view of the headers answers.
+	///
+	/// [`Anchored`]: crate::chain::seam::Anchored
+	#[allow(dead_code)] // called by the hybrid reorg-consistency check once it lands (T10)
+	async fn is_on_chain(&self, _block: &BlockId) -> Option<bool> {
+		None
 	}
 
 	/// `Filter` registration. Transaction-based engines must watch these;

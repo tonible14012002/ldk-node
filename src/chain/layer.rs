@@ -59,6 +59,11 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogg
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
+#[cfg(feature = "cbf")]
+use crate::chain::engine::cbf::{CbfSyncEngine, ExternalElectrum};
+#[cfg(feature = "cbf")]
+use crate::config::{CbfConfig, CbfExternalFee};
+
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusResponse;
 #[cfg(feature = "swaps")]
@@ -405,6 +410,111 @@ impl ChainLayer {
 		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
 
+	/// A node following the chain by compact block filters over P2P, borrowing
+	/// what filters cannot show it from an external fee source and, on a
+	/// hybrid node, from a provider.
+	///
+	/// The chains, in order: FEE = [external fee, if configured; provider, if
+	/// any], BROADCAST = [provider], TX_STATUS = [provider], MEMPOOL =
+	/// [provider], SCRIPT_HISTORY = [provider], UTXO = none. The CBF adapters
+	/// that fill the remaining positions — coinbase-derived fees, P2P
+	/// broadcast, the forward-only watch, the existence-only UTXO source
+	/// `cbf_config.utxo_source` enables — are T8's, and slot in around these;
+	/// `wallet_birthday_height` floors the resume checkpoint here and seeds a
+	/// fresh wallet in the builder (T9). Without a provider a pure CBF node's
+	/// BROADCAST chain is empty until T8: the drain finds no ready adapter and
+	/// leaves the queue alone, which is lossy once it fills, and logged.
+	// Wired by T9: the builder's `set_chain_source_cbf` preset is the caller.
+	#[cfg(feature = "cbf")]
+	#[allow(clippy::too_many_arguments, dead_code)]
+	pub(crate) fn new_cbf(
+		peers: Vec<String>, cbf_config: CbfConfig, fallback: Option<Arc<dyn ChainDataProvider>>,
+		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
+		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+	) -> Result<Self, Error> {
+		let mut fee: Vec<Arc<dyn FeeAction>> = Vec::new();
+		let mut external_electrum = None;
+		match cbf_config.external_fee {
+			Some(CbfExternalFee::Esplora(server_url)) => {
+				let mut client_builder = esplora_client::Builder::new(&server_url);
+				client_builder = client_builder.timeout(DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS);
+				let esplora_client = client_builder.build_async().map_err(|e| {
+					log_error!(logger, "Failed to build the external Esplora fee client: {}", e);
+					Error::ConnectionFailed
+				})?;
+				fee.push(Arc::new(EsploraChainAdapter::new(
+					esplora_client,
+					Arc::clone(&config),
+					Arc::clone(&logger),
+				)));
+			},
+			Some(CbfExternalFee::Electrum(server_url)) => {
+				let status = Arc::new(RwLock::new(ElectrumRuntimeStatus::new()));
+				fee.push(Arc::new(ElectrumChainAdapter::new(
+					Arc::clone(&status),
+					Arc::clone(&logger),
+				)));
+				external_electrum = Some(ExternalElectrum { server_url, status });
+			},
+			None => {},
+		}
+
+		let provider = fallback
+			.map(|provider| Arc::new(DependentChainAdapter::new(provider, Arc::clone(&logger))));
+		if let Some(provider) = &provider {
+			fee.push(Arc::clone(provider) as Arc<dyn FeeAction>);
+		}
+		let broadcast: Vec<Arc<dyn BroadcastAction>> =
+			provider.iter().map(|p| Arc::clone(p) as Arc<dyn BroadcastAction>).collect();
+		#[cfg(feature = "swaps")]
+		let tx_status: Vec<Arc<dyn TxStatusAction>> =
+			provider.iter().map(|p| Arc::clone(p) as Arc<dyn TxStatusAction>).collect();
+		let mempool: Vec<Arc<dyn MempoolAction>> =
+			provider.iter().map(|p| Arc::clone(p) as Arc<dyn MempoolAction>).collect();
+		let script_history: Vec<Arc<dyn ScriptHistoryAction>> =
+			provider.iter().map(|p| Arc::clone(p) as Arc<dyn ScriptHistoryAction>).collect();
+
+		let engine = Arc::new(CbfSyncEngine::new(
+			peers,
+			cbf_config.required_peers,
+			cbf_config.wallet_birthday_height,
+			external_electrum,
+			onchain_wallet,
+			Arc::clone(&kv_store),
+			config,
+			Arc::clone(&logger),
+			Arc::clone(&node_metrics),
+		)?);
+
+		let slots = ChainSlots {
+			fee: ActionChain::new("fee", FEE_BUDGET, fee, Arc::clone(&logger)),
+			#[cfg(feature = "swaps")]
+			tx_status: ActionChain::new(
+				"tx_status",
+				TX_STATUS_BUDGET,
+				tx_status,
+				Arc::clone(&logger),
+			),
+			broadcast: ActionChain::new(
+				"broadcast",
+				BROADCAST_BUDGET,
+				broadcast,
+				Arc::clone(&logger),
+			),
+			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, mempool, Arc::clone(&logger)),
+			script_history: ActionChain::new(
+				"script_history",
+				SCRIPT_HISTORY_BUDGET,
+				script_history,
+				Arc::clone(&logger),
+			),
+			utxo: None,
+		};
+
+		Ok(Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics))
+	}
+
 	/// Which adapters currently occupy each slot. For logs and diagnostics;
 	/// nothing may branch on it.
 	pub(crate) fn slot_adapters(&self) -> ChainSlotAdapters {
@@ -665,6 +775,14 @@ impl ChainLayer {
 	) -> Result<(), Error> {
 		self.update_fee_rate_estimates().await?;
 		self.engine.sync_once(self, channel_manager, chain_monitor, output_sweeper).await
+	}
+
+	/// Whether any adapter fills the MEMPOOL slot. An engine with no mempool
+	/// view of its own asks this before a pass rather than running an empty
+	/// chain and logging its exhaustion every time.
+	#[cfg(feature = "cbf")]
+	pub(crate) fn has_mempool_chain(&self) -> bool {
+		!self.slots.mempool.is_empty()
 	}
 
 	/// Ask the MEMPOOL chain.
@@ -1626,5 +1744,129 @@ mod tests {
 			Err(Error::ChainServeFailed)
 		));
 		assert_eq!(local.queries().len(), 1);
+	}
+
+	/// A provider that answers nothing, for a preset whose shape — not whose
+	/// answers — is under test.
+	#[cfg(feature = "cbf")]
+	struct SilentProvider;
+
+	#[cfg(feature = "cbf")]
+	#[async_trait]
+	impl ChainDataProvider for SilentProvider {
+		fn name(&self) -> String {
+			"silent".into()
+		}
+
+		async fn fee_estimates(
+			&self,
+		) -> Result<WireFeeEstimates, crate::chain::provider::ChainProviderError> {
+			Err(crate::chain::provider::ChainProviderError::Unreachable("silent".into()))
+		}
+
+		async fn broadcast(
+			&self, _req: crate::chain::provider::WireBroadcastRequest,
+		) -> Result<(), crate::chain::provider::ChainProviderError> {
+			Err(crate::chain::provider::ChainProviderError::Unreachable("silent".into()))
+		}
+
+		async fn tx_status(
+			&self, _req: crate::chain::provider::WireTxStatusRequest,
+		) -> Result<
+			crate::chain::provider::WireTxStatusResponse,
+			crate::chain::provider::ChainProviderError,
+		> {
+			Err(crate::chain::provider::ChainProviderError::Unreachable("silent".into()))
+		}
+
+		async fn wallet_sync(
+			&self, _req: WireSyncRequest,
+		) -> Result<WireUpdate, crate::chain::provider::ChainProviderError> {
+			Err(crate::chain::provider::ChainProviderError::Unreachable("silent".into()))
+		}
+
+		async fn lightning_sync(
+			&self, _req: WireLightningSyncRequest,
+		) -> Result<WireLightningSyncResponse, crate::chain::provider::ChainProviderError> {
+			Err(crate::chain::provider::ChainProviderError::Unreachable("silent".into()))
+		}
+	}
+
+	/// Builds the CBF preset over a fresh regtest wallet. Nothing connects:
+	/// the engine parses its peers and resolves the birthday, the external
+	/// Electrum status waits for `start`, and the provider is silent.
+	#[cfg(feature = "cbf")]
+	fn cbf_layer(
+		peers: Vec<String>, cbf_config: CbfConfig, fallback: Option<Arc<dyn ChainDataProvider>>,
+	) -> Result<ChainLayer, Error> {
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
+		ChainLayer::new_cbf(
+			peers,
+			cbf_config,
+			fallback,
+			wallet,
+			fee_estimator,
+			broadcaster,
+			kv_store,
+			config,
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		)
+	}
+
+	/// The CBF preset with a provider: the external fee source is asked
+	/// before the provider, and every other slot the filters cannot fill is
+	/// the provider's. The CBF adapters slot in around these in T8.
+	#[cfg(feature = "cbf")]
+	#[test]
+	fn new_cbf_orders_the_external_fee_before_the_provider() {
+		let cbf_config = CbfConfig {
+			external_fee: Some(CbfExternalFee::Electrum("tcp://127.0.0.1:1".into())),
+			..CbfConfig::default()
+		};
+		let layer = cbf_layer(
+			vec!["127.0.0.1:18444".into(), "bitcoind.local:18444".into()],
+			cbf_config,
+			Some(Arc::new(SilentProvider)),
+		)
+		.expect("a well-formed preset");
+
+		let slots = layer.slot_adapters();
+		assert_eq!(slots.engine, "cbf");
+		assert_eq!(slots.fee, vec!["electrum", "dependent"]);
+		assert_eq!(slots.broadcast, vec!["dependent"]);
+		#[cfg(feature = "swaps")]
+		assert_eq!(slots.tx_status, vec!["dependent"]);
+		assert_eq!(slots.mempool, vec!["dependent"]);
+		assert_eq!(slots.script_history, vec!["dependent"]);
+		assert!(slots.utxo.is_none(), "no CBF UTXO source until T8");
+		assert!(layer.has_mempool_chain());
+		assert!(layer.engine.tracks_own_broadcasts(), "the tail must echo own broadcasts");
+		assert!(!layer.engine.serves_mempool(), "a borrowed mempool is never served on");
+	}
+
+	/// A pure CBF node: nothing borrowed, every slot empty until T8 fills it,
+	/// and a mistyped peer is a construction error rather than a dropped entry.
+	#[cfg(feature = "cbf")]
+	#[test]
+	fn new_cbf_without_a_provider_leaves_the_borrowed_slots_empty() {
+		let layer =
+			cbf_layer(Vec::new(), CbfConfig::default(), None).expect("a well-formed preset");
+		let slots = layer.slot_adapters();
+		assert!(slots.fee.is_empty());
+		assert!(slots.broadcast.is_empty());
+		assert!(slots.mempool.is_empty());
+		assert!(slots.script_history.is_empty());
+		assert!(!layer.has_mempool_chain());
+
+		let err = cbf_layer(vec!["no-port-here".into()], CbfConfig::default(), None)
+			.err()
+			.expect("a peer without a port is refused");
+		assert_eq!(err, Error::InvalidSocketAddress);
 	}
 }

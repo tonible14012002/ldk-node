@@ -117,6 +117,7 @@ pub use lightning_types;
 pub use vss_client;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
+pub use chain::CbfSyncStatus;
 pub use error::Error as NodeError;
 use error::Error;
 
