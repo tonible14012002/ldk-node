@@ -8,15 +8,21 @@
 //! Electrum-backed chain ability adapters.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use bitcoin::Transaction;
 
 use crate::chain::electrum::ElectrumRuntimeClient;
-use crate::chain::seam::{ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate};
+use crate::chain::seam::{
+	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, ADAPTER_BUDGET_MARGIN,
+};
 use crate::chain::ElectrumRuntimeStatus;
+use crate::config::FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS;
 use crate::logger::Logger;
 use crate::Error;
 
+#[cfg(feature = "swaps")]
+use crate::chain::electrum::{ELECTRUM_CLIENT_NUM_RETRIES, ELECTRUM_CLIENT_TIMEOUT_SECS};
 #[cfg(feature = "swaps")]
 use crate::chain::seam::{Anchored, TxStatusAction};
 #[cfg(feature = "swaps")]
@@ -27,6 +33,18 @@ use crate::logger::{log_error, LdkLogger};
 use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
+
+/// TX_STATUS budget: pre-seam `swap_query_tx` had no bound of its own — two
+/// socket calls (script history, then headers subscribe), each bounded only by
+/// the Electrum client's `ELECTRUM_CLIENT_TIMEOUT_SECS` per attempt across
+/// `ELECTRUM_CLIENT_NUM_RETRIES` reconnects. The worst case of that plus the
+/// margin is strictly above anything the path could take before, so the
+/// client's own error — never a seam timeout — is what gets reported.
+#[cfg(feature = "swaps")]
+pub(crate) const ELECTRUM_TX_STATUS_BUDGET: Duration = Duration::from_secs(
+	2 * (ELECTRUM_CLIENT_TIMEOUT_SECS as u64) * (ELECTRUM_CLIENT_NUM_RETRIES as u64 + 1)
+		+ ADAPTER_BUDGET_MARGIN.as_secs(),
+);
 
 /// Fee estimates from an Electrum server.
 ///
@@ -75,6 +93,13 @@ impl FeeAction for ElectrumChainAdapter {
 		"electrum"
 	}
 
+	/// Pre-seam timing preserved: the client's batched call bounds itself at
+	/// `FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS`; the margin lets that timeout, and
+	/// its error log, fire before the seam's.
+	fn budget(&self) -> Option<Duration> {
+		Some(Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS) + ADAPTER_BUDGET_MARGIN)
+	}
+
 	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
 		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
 	}
@@ -90,6 +115,10 @@ impl TxStatusAction for ElectrumChainAdapter {
 		"electrum"
 	}
 
+	fn budget(&self) -> Option<Duration> {
+		Some(ELECTRUM_TX_STATUS_BUDGET)
+	}
+
 	async fn tx_status(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> ActionResult<Anchored<RawTxObservation>> {
@@ -101,22 +130,22 @@ impl TxStatusAction for ElectrumChainAdapter {
 					"swap_query_tx: Electrum backend requires a watched scriptPubKey for {} (register via watch_txid)",
 					txid
 				);
-				return Err(ChainActionError::Unavailable(
-					"no watched scriptPubKey for the txid".to_string(),
-				));
+				return Err(ChainActionError::unavailable("no watched scriptPubKey for the txid"));
 			},
 		};
 		let client = match self.client() {
 			Some(client) => client,
 			None => {
 				log_error!(self.logger, "swap_query_tx: Electrum chain source not started");
-				return Err(ChainActionError::Unavailable("chain source not started".to_string()));
+				return Err(ChainActionError::unavailable("chain source not started"));
 			},
 		};
 		match client.swap_query_tx(txid, script_pubkey).await {
-			// The client has already logged why.
+			// The client has already logged why. It folds every failure —
+			// socket timeout included — into `Unreachable` without saying
+			// which, so no timeout can be claimed here.
 			RawTxObservation::Unreachable => {
-				Err(ChainActionError::Unavailable("Electrum query failed".to_string()))
+				Err(ChainActionError::unavailable("Electrum query failed"))
 			},
 			value => Ok(Anchored { value, tip: None }),
 		}

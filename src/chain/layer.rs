@@ -426,8 +426,8 @@ impl ChainLayer {
 
 		let update = match self.slots.fee.run(|a| async move { a.fee_rate_update().await }).await {
 			Ok(answered) => answered.value,
-			Err(e @ ChainActionError::Unavailable(_)) => {
-				return Err(if e.is_timeout() {
+			Err(ChainActionError::Unavailable { timed_out, .. }) => {
+				return Err(if timed_out {
 					Error::FeerateEstimationUpdateTimeout
 				} else {
 					Error::FeerateEstimationUpdateFailed

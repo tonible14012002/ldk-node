@@ -17,7 +17,9 @@ use esplora_client::AsyncClient as EsploraAsyncClient;
 
 use lightning::util::ser::Writeable;
 
-use crate::chain::seam::{ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate};
+use crate::chain::seam::{
+	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, ADAPTER_BUDGET_MARGIN,
+};
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
@@ -30,9 +32,32 @@ use crate::chain::seam::{Anchored, TxStatusAction};
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 #[cfg(feature = "swaps")]
+use crate::chain::DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS;
+#[cfg(feature = "swaps")]
 use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
+
+/// TX_STATUS budget: pre-seam `swap_query_tx` made two HTTP calls (status,
+/// then tip height), each bounded only by the client's own
+/// `DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS`; twice that plus the margin lets the
+/// client's timeout, and its log line, fire first.
+#[cfg(feature = "swaps")]
+pub(crate) const ESPLORA_TX_STATUS_BUDGET: Duration =
+	Duration::from_secs(2 * DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
+
+/// An `Unavailable` for a failed Esplora call, `timed_out` when the HTTP
+/// client's own timeout is what failed it.
+#[cfg(feature = "swaps")]
+fn unavailable_from(what: &str, e: &esplora_client::Error) -> ChainActionError {
+	let reason = format!("{}: {}", what, e);
+	match e {
+		esplora_client::Error::Reqwest(inner) if inner.is_timeout() => {
+			ChainActionError::timed_out(reason)
+		},
+		_ => ChainActionError::unavailable(reason),
+	}
+}
 
 /// Fee estimates from an Esplora server's `/fee-estimates` endpoint.
 pub(crate) struct EsploraChainAdapter {
@@ -113,6 +138,13 @@ impl FeeAction for EsploraChainAdapter {
 		"esplora"
 	}
 
+	/// Pre-seam timing preserved: the fetch bounds itself at
+	/// `FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS`; the margin lets that timeout, and
+	/// its error log, fire before the seam's.
+	fn budget(&self) -> Option<Duration> {
+		Some(Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS) + ADAPTER_BUDGET_MARGIN)
+	}
+
 	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
 		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
 	}
@@ -125,6 +157,10 @@ impl FeeAction for EsploraChainAdapter {
 impl TxStatusAction for EsploraChainAdapter {
 	fn name(&self) -> &'static str {
 		"esplora"
+	}
+
+	fn budget(&self) -> Option<Duration> {
+		Some(ESPLORA_TX_STATUS_BUDGET)
 	}
 
 	async fn tx_status(
@@ -145,7 +181,7 @@ impl TxStatusAction for EsploraChainAdapter {
 					txid,
 					e
 				);
-				return Err(ChainActionError::Unavailable(format!("status query failed: {}", e)));
+				return Err(unavailable_from("status query failed", &e));
 			},
 		};
 		if !status.confirmed {
@@ -159,9 +195,7 @@ impl TxStatusAction for EsploraChainAdapter {
 					"swap_query_tx: Esplora reported a confirmed tx {} without a block height",
 					txid
 				);
-				return Err(ChainActionError::Unavailable(
-					"confirmed without a block height".to_string(),
-				));
+				return Err(ChainActionError::unavailable("confirmed without a block height"));
 			},
 		};
 		// B5 LOW-2: the confirming-block height and the tip come from two
@@ -185,14 +219,14 @@ impl TxStatusAction for EsploraChainAdapter {
 					height,
 					txid
 				);
-				Err(ChainActionError::Unavailable(format!(
+				Err(ChainActionError::unavailable(format!(
 					"tip {} below confirming-block height {}",
 					tip_height, height
 				)))
 			},
 			Err(e) => {
 				log_error!(self.logger, "swap_query_tx: Esplora tip query failed: {}", e);
-				Err(ChainActionError::Unavailable(format!("tip query failed: {}", e)))
+				Err(unavailable_from("tip query failed", &e))
 			},
 		}
 	}

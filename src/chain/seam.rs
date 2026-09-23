@@ -14,7 +14,7 @@
 //!
 //! # The per-action slots
 //!
-//! | Slot             | Trait                   | Budget                   |
+//! | Slot             | Trait                   | Default budget           |
 //! |------------------|-------------------------|--------------------------|
 //! | FEE              | [`FeeAction`]           | [`FEE_BUDGET`]           |
 //! | BROADCAST        | [`BroadcastAction`]     | [`BROADCAST_BUDGET`]     |
@@ -22,6 +22,11 @@
 //! | MEMPOOL          | [`MempoolAction`]       | [`MEMPOOL_BUDGET`]       |
 //! | SCRIPT_HISTORY   | [`ScriptHistoryAction`] | [`SCRIPT_HISTORY_BUDGET`]|
 //! | UTXO             | [`UtxoCapability`]      | — (not an action)        |
+//!
+//! The slot default applies to an adapter that declares no budget of its own
+//! (`budget() == None`). An adapter whose backend already bounds itself
+//! declares a budget sitting just above that bound, so its own timeout fires
+//! first and the error it logs is the one an operator sees.
 //!
 //! Headers, blocks and filter matches are deliberately **not** slots: their
 //! only consumers are a `Listen`-driven sync engine and its `UtxoSource`, and a
@@ -53,10 +58,11 @@
 //!
 //! # Rules the combinator enforces
 //!
-//! * **Timeout ownership sits with the seam.** [`ActionChain`] imposes a
-//!   per-slot budget on every adapter call with [`tokio::time::timeout`]; an
-//!   adapter that overruns it is `Unavailable`. Adapters are not trusted to
-//!   bound themselves.
+//! * **Every call runs under a budget the seam enforces.** [`ActionChain`]
+//!   wraps each adapter call in [`tokio::time::timeout`] — the adapter's
+//!   declared budget, else the slot default — and an adapter that overruns it
+//!   is `Unavailable` with `timed_out` set. An adapter may say how long it
+//!   legitimately takes; it may not run unbounded.
 //! * **Exhaustion is an honest failure.** When no adapter answers, the slot
 //!   fails with `Unavailable`. The seam never fabricates an answer and never
 //!   serves a stale value a caller would act on.
@@ -144,20 +150,25 @@ pub(crate) trait BroadcastAdapter: Send + Sync {
 // belonging to slots not yet moved carry `dead_code` allowances that are
 // removed as each slot lands.
 
-/// Per-slot budget the seam imposes on every FEE adapter call.
+/// Default budget for a FEE adapter that declares none of its own.
 pub(crate) const FEE_BUDGET: Duration = Duration::from_secs(5);
-/// Per-slot budget the seam imposes on every BROADCAST adapter call.
+/// Default budget for a BROADCAST adapter that declares none of its own.
 #[allow(dead_code)] // consumed once the BROADCAST slot runs on an `ActionChain`
 pub(crate) const BROADCAST_BUDGET: Duration = Duration::from_secs(15);
-/// Per-slot budget the seam imposes on every TX_STATUS adapter call.
+/// Default budget for a TX_STATUS adapter that declares none of its own.
 #[cfg(feature = "swaps")]
 pub(crate) const TX_STATUS_BUDGET: Duration = Duration::from_secs(10);
-/// Per-slot budget the seam imposes on every MEMPOOL adapter call.
+/// Default budget for a MEMPOOL adapter that declares none of its own.
 #[allow(dead_code)] // consumed once the MEMPOOL slot runs on an `ActionChain`
 pub(crate) const MEMPOOL_BUDGET: Duration = Duration::from_secs(30);
-/// Per-slot budget the seam imposes on every SCRIPT_HISTORY adapter call.
+/// Default budget for a SCRIPT_HISTORY adapter that declares none of its own.
 #[allow(dead_code)] // consumed once the SCRIPT_HISTORY slot runs on an `ActionChain`
 pub(crate) const SCRIPT_HISTORY_BUDGET: Duration = Duration::from_secs(90);
+
+/// Headroom an adapter adds above the timeout its backend already enforces
+/// when declaring its budget, so the backend's own timeout fires first and the
+/// error it logs — not a bare seam timeout — is what an operator sees.
+pub(crate) const ADAPTER_BUDGET_MARGIN: Duration = Duration::from_secs(1);
 
 /// Why an adapter did not produce an accepted answer.
 ///
@@ -168,41 +179,43 @@ pub(crate) const SCRIPT_HISTORY_BUDGET: Duration = Duration::from_secs(90);
 pub(crate) enum ChainActionError<R = String> {
 	/// The adapter could not answer: unstarted, unreachable, timed out, or
 	/// handed back something it could not parse. The chain advances.
-	Unavailable(String),
+	Unavailable {
+		reason: String,
+		/// Whether running out of time is why: the seam's budget, the
+		/// backend's own wire timeout, or — for an exhausted chain — any
+		/// adapter that timed out. A chain of one reports exactly what its
+		/// adapter did; a longer chain reports a timeout when a timeout is
+		/// part of why it was exhausted, because a reachable-but-slow source
+		/// is the thing an operator can act on. Callers that distinguish
+		/// "timed out" from "failed" read this, never the reason text.
+		timed_out: bool,
+	},
 	/// The adapter answered, and the answer is no. Terminal for the chain.
 	#[allow(dead_code)] // built by the BROADCAST adapters once that slot runs on an `ActionChain`
 	Rejected(R),
 }
 
-/// The words every timeout reason carries, whether the seam's budget or an
-/// adapter's own wire timeout produced it. [`ChainActionError::is_timeout`]
-/// keys off this so a slot can report "timed out" and "failed" as the
-/// distinct errors its callers already distinguish.
-const TIMEOUT_MARKER: &str = "timed out";
-
 impl<R> ChainActionError<R> {
-	/// An `Unavailable` whose reason is that the call overran a budget.
-	fn timed_out(budget: Duration) -> Self {
-		Self::Unavailable(format!("{} after {}ms", TIMEOUT_MARKER, budget.as_millis()))
+	/// An `Unavailable` that did not run out of time.
+	pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+		Self::Unavailable { reason: reason.into(), timed_out: false }
 	}
 
-	/// Whether this reason records a timeout — the seam's budget, an adapter's
-	/// own wire timeout, or, for an exhausted chain, any adapter that timed
-	/// out. A chain of one reports exactly what its adapter did; a longer
-	/// chain reports a timeout when a timeout is part of why it failed,
-	/// because a reachable-but-slow source is the thing an operator can act on.
-	pub(crate) fn is_timeout(&self) -> bool {
-		match self {
-			Self::Unavailable(reason) => reason.contains(TIMEOUT_MARKER),
-			Self::Rejected(_) => false,
-		}
+	/// An `Unavailable` whose cause is running out of time.
+	pub(crate) fn timed_out(reason: impl Into<String>) -> Self {
+		Self::Unavailable { reason: reason.into(), timed_out: true }
+	}
+
+	/// An `Unavailable` recording that the call overran `budget`.
+	fn budget_exceeded(budget: Duration) -> Self {
+		Self::timed_out(format!("timed out after {}ms", budget.as_millis()))
 	}
 }
 
 impl<R: std::fmt::Debug> std::fmt::Display for ChainActionError<R> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Self::Unavailable(reason) => write!(f, "unavailable: {}", reason),
+			Self::Unavailable { reason, .. } => write!(f, "unavailable: {}", reason),
 			Self::Rejected(reason) => write!(f, "rejected: {:?}", reason),
 		}
 	}
@@ -213,21 +226,32 @@ impl<R: std::fmt::Debug> std::fmt::Display for ChainActionError<R> {
 /// version, nothing is known about the chain as a result, and the next
 /// adapter must get its turn. The variant's own `Display` text is kept as the
 /// reason so the fall-through log still says which of the four it was.
+///
+/// `Unreachable` covers "no response" as well as "no route", and the
+/// pre-chain Dependent adapter already reported it as a timeout; that rule
+/// lives here now.
 impl<R> From<ChainProviderError> for ChainActionError<R> {
 	fn from(e: ChainProviderError) -> Self {
-		Self::Unavailable(e.to_string())
+		let timed_out = matches!(e, ChainProviderError::Unreachable(_));
+		Self::Unavailable { reason: e.to_string(), timed_out }
 	}
 }
 
 /// A backend's own [`Error`] is never a rejection either: the pre-chain
 /// adapters reported every failure to answer as an `Error`, and none of those
-/// is the network saying no. The variant's `Display` text is the reason, which
-/// is what lets [`ChainActionError::is_timeout`] tell
-/// [`Error::FeerateEstimationUpdateTimeout`] from
+/// is the network saying no. The `*Timeout` variants set `timed_out`, which is
+/// what lets the FEE slot tell [`Error::FeerateEstimationUpdateTimeout`] from
 /// [`Error::FeerateEstimationUpdateFailed`] after the chain has run.
 impl<R> From<Error> for ChainActionError<R> {
 	fn from(e: Error) -> Self {
-		Self::Unavailable(e.to_string())
+		let timed_out = matches!(
+			e,
+			Error::FeerateEstimationUpdateTimeout
+				| Error::WalletOperationTimeout
+				| Error::TxSyncTimeout
+				| Error::GossipUpdateTimeout
+		);
+		Self::Unavailable { reason: e.to_string(), timed_out }
 	}
 }
 
@@ -267,6 +291,13 @@ pub(crate) trait FeeAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
 	fn name(&self) -> &'static str;
 
+	/// How long one call may legitimately take, when the backend already
+	/// bounds itself; `None` takes the slot default. Declared just above the
+	/// backend's own timeout so that timeout — and its log line — fires first.
+	fn budget(&self) -> Option<Duration> {
+		None
+	}
+
 	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate>;
 }
 
@@ -282,6 +313,13 @@ pub(crate) trait FeeAction: Send + Sync {
 pub(crate) trait BroadcastAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
 	fn name(&self) -> &'static str;
+
+	/// How long one call may legitimately take, when the backend already
+	/// bounds itself; `None` takes the slot default. Declared just above the
+	/// backend's own timeout so that timeout — and its log line — fires first.
+	fn budget(&self) -> Option<Duration> {
+		None
+	}
 
 	/// Whether the backend can broadcast right now. `false` is `Unavailable`
 	/// without the round trip.
@@ -304,6 +342,13 @@ pub(crate) trait BroadcastAction: Send + Sync {
 pub(crate) trait TxStatusAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
 	fn name(&self) -> &'static str;
+
+	/// How long one call may legitimately take, when the backend already
+	/// bounds itself; `None` takes the slot default. Declared just above the
+	/// backend's own timeout so that timeout — and its log line — fires first.
+	fn budget(&self) -> Option<Duration> {
+		None
+	}
 
 	async fn tx_status(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
@@ -341,6 +386,13 @@ pub(crate) trait MempoolAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
 	fn name(&self) -> &'static str;
 
+	/// How long one call may legitimately take, when the backend already
+	/// bounds itself; `None` takes the slot default. Declared just above the
+	/// backend's own timeout so that timeout — and its log line — fires first.
+	fn budget(&self) -> Option<Duration> {
+		None
+	}
+
 	async fn mempool(&self, query: MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>>;
 }
 
@@ -351,6 +403,13 @@ pub(crate) trait MempoolAction: Send + Sync {
 pub(crate) trait ScriptHistoryAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
 	fn name(&self) -> &'static str;
+
+	/// How long one call may legitimately take, when the backend already
+	/// bounds itself; `None` takes the slot default. Declared just above the
+	/// backend's own timeout so that timeout — and its log line — fires first.
+	fn budget(&self) -> Option<Duration> {
+		None
+	}
 
 	async fn script_history(
 		&self, req: WireSyncRequest,
@@ -389,11 +448,11 @@ pub(crate) trait UtxoCapability: Send + Sync {
 	fn utxo_source(&self) -> Option<(Arc<dyn UtxoSource>, UtxoVerification)>;
 }
 
-/// An ordered chain of adapters for one slot, run under the slot's budget.
+/// An ordered chain of adapters for one slot, each call run under a budget.
 ///
 /// `A` is the slot's action trait object (`dyn FeeAction`, ...). The chain
 /// owns the fallback rules described in the module docs; adapters own only
-/// their answer.
+/// their answer and, optionally, how long it may take.
 pub(crate) struct ActionChain<A: ?Sized> {
 	slot: &'static str,
 	budget: Duration,
@@ -403,7 +462,8 @@ pub(crate) struct ActionChain<A: ?Sized> {
 }
 
 impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
-	/// A chain for `slot`, trying `adapters` in order, each under `budget`.
+	/// A chain for `slot`, trying `adapters` in order, each under its own
+	/// declared budget or, failing that, `budget`.
 	pub(crate) fn new(
 		slot: &'static str, budget: Duration, adapters: Vec<Arc<A>>, logger: Arc<Logger>,
 	) -> Self {
@@ -438,11 +498,13 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 
 	/// Run `action` against each adapter in order until one answers.
 	///
-	/// `Unavailable` (including a budget timeout) advances to the next adapter;
-	/// `Rejected` returns at once and no later adapter is tried; `Ok` stops the
-	/// chain, records the answerer and returns it. An empty or exhausted chain
-	/// is `Unavailable` — never a stale or invented value — and an exhausted
-	/// one reports every adapter's reason, in order.
+	/// Each call runs under the adapter's declared budget, or the slot default
+	/// when it declares none. `Unavailable` (including a budget timeout)
+	/// advances to the next adapter; `Rejected` returns at once and no later
+	/// adapter is tried; `Ok` stops the chain, records the answerer and
+	/// returns it. An empty or exhausted chain is `Unavailable` — never a
+	/// stale or invented value — and an exhausted one reports every adapter's
+	/// reason, in order, and is `timed_out` if any of them was.
 	///
 	/// `action` receives an owned `Arc` so the future it builds borrows nothing
 	/// from the chain: that is what lets a single `Fut` type serve every
@@ -453,15 +515,16 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 		Fut: Future<Output = ActionResult<T, R>>,
 	{
 		let mut reasons: Vec<String> = Vec::with_capacity(self.adapters.len());
+		let mut any_timed_out = false;
 
 		for (idx, adapter) in self.adapters.iter().enumerate() {
 			let name = Self::adapter_name(adapter);
 			let next = self.adapters.get(idx + 1).map(Self::adapter_name);
+			let budget = SlotAdapter::budget(&**adapter).unwrap_or(self.budget);
 
-			let outcome = match tokio::time::timeout(self.budget, action(Arc::clone(adapter))).await
-			{
+			let outcome = match tokio::time::timeout(budget, action(Arc::clone(adapter))).await {
 				Ok(outcome) => outcome,
-				Err(_elapsed) => Err(ChainActionError::timed_out(self.budget)),
+				Err(_elapsed) => Err(ChainActionError::budget_exceeded(budget)),
 			};
 
 			match outcome {
@@ -479,7 +542,8 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 					);
 					return Err(ChainActionError::Rejected(reason));
 				},
-				Err(ChainActionError::Unavailable(reason)) => {
+				Err(ChainActionError::Unavailable { reason, timed_out }) => {
+					any_timed_out |= timed_out;
 					match next {
 						Some(next) => log_debug!(
 							self.logger,
@@ -507,7 +571,10 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 		} else {
 			reasons.join("; ")
 		};
-		Err(ChainActionError::Unavailable(format!("{}: exhausted: {}", self.slot, reason)))
+		Err(ChainActionError::Unavailable {
+			reason: format!("{}: exhausted: {}", self.slot, reason),
+			timed_out: any_timed_out,
+		})
 	}
 
 	fn adapter_name(adapter: &Arc<A>) -> &'static str {
@@ -515,22 +582,29 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 	}
 }
 
-/// The one thing every action trait shares: a stable name. Implemented for
-/// each action trait object so [`ActionChain`] can log and tag answers
-/// without knowing which slot it is running.
+/// What every action trait shares: a stable name and an optional budget.
+/// Implemented for each action trait object so [`ActionChain`] can log, tag
+/// answers and bound calls without knowing which slot it is running.
 pub(crate) trait SlotAdapter {
 	fn name(&self) -> &'static str;
+	fn budget(&self) -> Option<Duration>;
 }
 
 impl SlotAdapter for dyn FeeAction {
 	fn name(&self) -> &'static str {
 		FeeAction::name(self)
 	}
+	fn budget(&self) -> Option<Duration> {
+		FeeAction::budget(self)
+	}
 }
 
 impl SlotAdapter for dyn BroadcastAction {
 	fn name(&self) -> &'static str {
 		BroadcastAction::name(self)
+	}
+	fn budget(&self) -> Option<Duration> {
+		BroadcastAction::budget(self)
 	}
 }
 
@@ -539,17 +613,26 @@ impl SlotAdapter for dyn TxStatusAction {
 	fn name(&self) -> &'static str {
 		TxStatusAction::name(self)
 	}
+	fn budget(&self) -> Option<Duration> {
+		TxStatusAction::budget(self)
+	}
 }
 
 impl SlotAdapter for dyn MempoolAction {
 	fn name(&self) -> &'static str {
 		MempoolAction::name(self)
 	}
+	fn budget(&self) -> Option<Duration> {
+		MempoolAction::budget(self)
+	}
 }
 
 impl SlotAdapter for dyn ScriptHistoryAction {
 	fn name(&self) -> &'static str {
 		ScriptHistoryAction::name(self)
+	}
+	fn budget(&self) -> Option<Duration> {
+		ScriptHistoryAction::budget(self)
 	}
 }
 
@@ -558,11 +641,16 @@ mod tests {
 	use super::*;
 
 	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::time::Instant;
 
 	/// What one fake adapter does when asked.
 	enum Behaviour {
 		Ok(u64),
+		/// Answers `Ok` only after sleeping this long.
+		SlowOk(Duration, u64),
 		Unavailable,
+		/// Unavailable because its own backend timed out.
+		UnavailableTimedOut,
 		Rejected,
 		/// Never answers; only the seam's budget ends the call.
 		Hang,
@@ -571,17 +659,29 @@ mod tests {
 	struct FakeFee {
 		name: &'static str,
 		behaviour: Behaviour,
+		/// The budget the fake declares, if any.
+		budget: Option<Duration>,
 		calls: AtomicUsize,
 	}
 
 	impl FakeFee {
 		fn new(name: &'static str, behaviour: Behaviour) -> Arc<Self> {
-			Arc::new(Self { name, behaviour, calls: AtomicUsize::new(0) })
+			Arc::new(Self { name, behaviour, budget: None, calls: AtomicUsize::new(0) })
+		}
+
+		fn with_budget(name: &'static str, behaviour: Behaviour, budget: Duration) -> Arc<Self> {
+			Arc::new(Self { name, behaviour, budget: Some(budget), calls: AtomicUsize::new(0) })
 		}
 
 		fn calls(&self) -> usize {
 			self.calls.load(Ordering::SeqCst)
 		}
+	}
+
+	fn applied(rate: u64) -> FeeUpdate {
+		let mut cache = HashMap::new();
+		cache.insert(ConfirmationTarget::OnchainPayment, FeeRate::from_sat_per_kwu(rate));
+		FeeUpdate::Apply { cache, log_unchanged: false }
 	}
 
 	#[async_trait]
@@ -590,19 +690,23 @@ mod tests {
 			self.name
 		}
 
+		fn budget(&self) -> Option<Duration> {
+			self.budget
+		}
+
 		async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
 			self.calls.fetch_add(1, Ordering::SeqCst);
 			match self.behaviour {
-				Behaviour::Ok(rate) => {
-					let mut cache = HashMap::new();
-					cache.insert(
-						ConfirmationTarget::OnchainPayment,
-						FeeRate::from_sat_per_kwu(rate),
-					);
-					Ok(FeeUpdate::Apply { cache, log_unchanged: false })
+				Behaviour::Ok(rate) => Ok(applied(rate)),
+				Behaviour::SlowOk(delay, rate) => {
+					tokio::time::sleep(delay).await;
+					Ok(applied(rate))
 				},
 				Behaviour::Unavailable => {
-					Err(ChainActionError::Unavailable(format!("{} is down", self.name)))
+					Err(ChainActionError::unavailable(format!("{} is down", self.name)))
+				},
+				Behaviour::UnavailableTimedOut => {
+					Err(ChainActionError::timed_out(format!("{} wire timeout", self.name)))
 				},
 				Behaviour::Rejected => {
 					Err(ChainActionError::Rejected(format!("{} says no", self.name)))
@@ -705,48 +809,102 @@ mod tests {
 
 		let err = run(&chain).await.unwrap_err();
 
-		match err {
-			ChainActionError::Unavailable(reason) => {
-				assert_eq!(
-					reason, "fee: exhausted: down-a: down-a is down; down-b: down-b is down",
-					"every adapter's reason is reported, in order"
-				);
+		assert_eq!(
+			err,
+			ChainActionError::Unavailable {
+				reason: "fee: exhausted: down-a: down-a is down; down-b: down-b is down"
+					.to_string(),
+				timed_out: false,
 			},
-			other => panic!("exhaustion must be Unavailable, got {:?}", other),
-		}
+			"every adapter's reason is reported, in order"
+		);
 		assert_eq!(chain.last_answered(), Some("first"), "history is kept, but never served");
 	}
 
 	#[tokio::test]
-	async fn exhaustion_by_budget_reads_as_timeout() {
+	async fn exhaustion_by_budget_sets_timed_out() {
 		let hung = FakeFee::new("hung", Behaviour::Hang);
 		let chain = chain(Duration::from_millis(20), &[Arc::clone(&hung)]);
 
 		let err = run(&chain).await.unwrap_err();
 
-		assert!(err.is_timeout(), "{}", err);
+		assert!(matches!(err, ChainActionError::Unavailable { timed_out: true, .. }), "{}", err);
 
 		let down = FakeFee::new("down", Behaviour::Unavailable);
 		let chain = self::chain(Duration::from_millis(20), &[down]);
 		let err = run(&chain).await.unwrap_err();
-		assert!(!err.is_timeout(), "{}", err);
+		assert!(matches!(err, ChainActionError::Unavailable { timed_out: false, .. }), "{}", err);
+	}
+
+	/// A longer chain is `timed_out` when a timeout is part of why it was
+	/// exhausted, whichever adapter it was.
+	#[tokio::test]
+	async fn exhaustion_is_timed_out_if_any_adapter_was() {
+		let down = FakeFee::new("down", Behaviour::Unavailable);
+		let slow = FakeFee::new("slow", Behaviour::UnavailableTimedOut);
+		let chain = chain(Duration::from_secs(1), &[Arc::clone(&down), Arc::clone(&slow)]);
+
+		let err = run(&chain).await.unwrap_err();
+
+		assert!(matches!(err, ChainActionError::Unavailable { timed_out: true, .. }), "{}", err);
+		assert_eq!(slow.calls(), 1);
 	}
 
 	/// The FEE slot maps exhaustion back onto the two `Error` variants its
 	/// callers already distinguish, so a backend's own timeout must survive
-	/// the round trip through the reason text.
+	/// the round trip as the typed flag.
 	#[test]
 	fn backend_errors_keep_their_timeout_identity() {
 		let timeout: ChainActionError = Error::FeerateEstimationUpdateTimeout.into();
-		assert!(matches!(timeout, ChainActionError::Unavailable(_)));
-		assert!(timeout.is_timeout());
+		assert!(matches!(timeout, ChainActionError::Unavailable { timed_out: true, .. }));
 
 		let failed: ChainActionError = Error::FeerateEstimationUpdateFailed.into();
-		assert!(matches!(failed, ChainActionError::Unavailable(_)));
-		assert!(!failed.is_timeout());
+		assert!(matches!(failed, ChainActionError::Unavailable { timed_out: false, .. }));
+	}
 
-		let rejected: ChainActionError = ChainActionError::Rejected("no".to_string());
-		assert!(!rejected.is_timeout());
+	/// An adapter that declares a budget longer than the slot default gets it:
+	/// the seam does not cut a legitimately slow backend at the slot default.
+	#[tokio::test]
+	async fn adapter_budget_longer_than_slot_is_honoured() {
+		let slot_budget = Duration::from_millis(20);
+		let adapter_budget = Duration::from_millis(500);
+		let slow = FakeFee::with_budget(
+			"slow",
+			Behaviour::SlowOk(Duration::from_millis(100), 250),
+			adapter_budget,
+		);
+		let chain = chain(slot_budget, &[Arc::clone(&slow)]);
+
+		let answered = run(&chain).await.unwrap();
+
+		assert_eq!(answered.by, "slow");
+		assert_eq!(applied_rate(answered.value), 250);
+		assert_eq!(slow.calls(), 1);
+	}
+
+	/// An adapter that declares a budget shorter than the slot default is cut
+	/// at its own budget, not the slot's.
+	#[tokio::test]
+	async fn adapter_budget_shorter_than_slot_cuts_earlier() {
+		let slot_budget = Duration::from_secs(5);
+		let adapter_budget = Duration::from_millis(20);
+		let hung = FakeFee::with_budget("hung", Behaviour::Hang, adapter_budget);
+		let second = FakeFee::new("second", Behaviour::Ok(250));
+		let chain = chain(slot_budget, &[Arc::clone(&hung), Arc::clone(&second)]);
+
+		let started = Instant::now();
+		let answered = run(&chain).await.unwrap();
+		let elapsed = started.elapsed();
+
+		assert_eq!(answered.by, "second");
+		assert_eq!(hung.calls(), 1);
+		assert!(
+			elapsed < Duration::from_secs(1),
+			"the adapter's {:?} budget must cut the call, not the slot's {:?}; took {:?}",
+			adapter_budget,
+			slot_budget,
+			elapsed
+		);
 	}
 
 	/// A new chain over `adapters` that carries `previous`'s answer history —
@@ -769,7 +927,7 @@ mod tests {
 
 		let only_down = FakeFee::new("only", Behaviour::Unavailable);
 		let chain = self::chain(Duration::from_secs(1), &[only_down]);
-		assert!(matches!(run(&chain).await, Err(ChainActionError::Unavailable(_))));
+		assert!(matches!(run(&chain).await, Err(ChainActionError::Unavailable { .. })));
 	}
 
 	#[tokio::test]
@@ -782,23 +940,28 @@ mod tests {
 
 		assert_eq!(
 			err,
-			ChainActionError::Unavailable("fee: exhausted: no adapters configured".to_string())
+			ChainActionError::Unavailable {
+				reason: "fee: exhausted: no adapters configured".to_string(),
+				timed_out: false,
+			}
 		);
 		assert_eq!(chain.last_answered(), None);
 	}
 
+	/// Every provider failure is `Unavailable`; only `Unreachable` — no route
+	/// or no response — is a timeout, as the pre-chain Dependent adapter ruled.
 	#[test]
 	fn provider_errors_are_all_unavailable() {
 		let cases = vec![
-			ChainProviderError::Unreachable("no route".into()),
-			ChainProviderError::Refused("not serving".into()),
-			ChainProviderError::Malformed("bad hex".into()),
-			ChainProviderError::VersionMismatch { expected: 1, got: 2 },
+			(ChainProviderError::Unreachable("no route".into()), true),
+			(ChainProviderError::Refused("not serving".into()), false),
+			(ChainProviderError::Malformed("bad hex".into()), false),
+			(ChainProviderError::VersionMismatch { expected: 1, got: 2 }, false),
 		];
-		for case in cases {
-			let display = case.to_string();
+		for (case, timed_out) in cases {
+			let reason = case.to_string();
 			let err: ChainActionError = case.into();
-			assert_eq!(err, ChainActionError::Unavailable(display));
+			assert_eq!(err, ChainActionError::Unavailable { reason, timed_out });
 		}
 	}
 }

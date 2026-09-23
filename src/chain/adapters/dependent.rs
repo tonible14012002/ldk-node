@@ -26,18 +26,24 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bitcoin::{FeeRate, Transaction};
 
-use crate::chain::provider::{
-	ChainDataProvider, ChainProviderError, WireBroadcastRequest, CHAIN_WIRE_VERSION,
+use crate::chain::provider::{ChainDataProvider, WireBroadcastRequest, CHAIN_WIRE_VERSION};
+use crate::chain::seam::{
+	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, FEE_BUDGET,
 };
-use crate::chain::seam::{ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate};
 use crate::chain::wire_convert::{check_version, tx_to_wire};
 use crate::fee_estimator::{apply_post_estimation_adjustments, conf_target_from_wire_name};
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
-use crate::Error;
 
+#[cfg(feature = "swaps")]
+use crate::chain::adapters::bitcoind::BITCOIND_TX_STATUS_BUDGET;
+#[cfg(feature = "swaps")]
+use crate::chain::adapters::electrum::ELECTRUM_TX_STATUS_BUDGET;
+#[cfg(feature = "swaps")]
+use crate::chain::adapters::esplora::ESPLORA_TX_STATUS_BUDGET;
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusRequest;
 #[cfg(feature = "swaps")]
@@ -51,6 +57,38 @@ use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
+/// Headroom a Dependent adds to the serving node's own budget for the round
+/// trip, so it never times out while its provider is still legitimately
+/// working. Pre-seam the Dependent paths had no bound of their own at all.
+const DEPENDENT_TRANSPORT_MARGIN: Duration = Duration::from_secs(5);
+
+/// FEE budget: the serving node answers from its fee cache without running
+/// its own FEE chain, so the only time in the round trip is transport; the
+/// slot default plus the transport margin covers it.
+const DEPENDENT_FEE_BUDGET: Duration =
+	Duration::from_secs(FEE_BUDGET.as_secs() + DEPENDENT_TRANSPORT_MARGIN.as_secs());
+
+/// TX_STATUS budget: the serving node runs its own TX_STATUS chain, through
+/// whichever adapter it has, and this node cannot know which — so it must
+/// outlast the slowest of them plus transport, or it times out while the
+/// provider is still legitimately looking.
+#[cfg(feature = "swaps")]
+const DEPENDENT_TX_STATUS_BUDGET: Duration = Duration::from_secs(
+	max_secs(
+		max_secs(BITCOIND_TX_STATUS_BUDGET.as_secs(), ESPLORA_TX_STATUS_BUDGET.as_secs()),
+		ELECTRUM_TX_STATUS_BUDGET.as_secs(),
+	) + DEPENDENT_TRANSPORT_MARGIN.as_secs(),
+);
+
+#[cfg(feature = "swaps")]
+const fn max_secs(a: u64, b: u64) -> u64 {
+	if a > b {
+		a
+	} else {
+		b
+	}
+}
+
 /// Fills the FEE, TX_STATUS and BROADCAST slots from a remote node.
 pub(crate) struct DependentChainAdapter {
 	provider: Arc<dyn ChainDataProvider>,
@@ -63,19 +101,18 @@ impl DependentChainAdapter {
 	}
 
 	/// The pre-chain fee fetch, unchanged: the provider's answer, checked and
-	/// re-floored locally.
-	async fn fetch_fee_rate_update(&self) -> Result<FeeUpdate, Error> {
+	/// re-floored locally. Provider errors map straight onto the seam's error
+	/// — `Unreachable` is the timeout, as it was pre-chain — with no `Error`
+	/// in between.
+	async fn fetch_fee_rate_update(&self) -> ActionResult<FeeUpdate> {
 		let estimates = self.provider.fee_estimates().await.map_err(|e| {
 			log_error!(self.logger, "Failed to retrieve fee rate estimates from provider: {}", e);
-			match e {
-				ChainProviderError::Unreachable(_) => Error::FeerateEstimationUpdateTimeout,
-				_ => Error::FeerateEstimationUpdateFailed,
-			}
+			ChainActionError::from(e)
 		})?;
 
 		check_version(estimates.version).map_err(|e| {
 			log_error!(self.logger, "Rejecting fee rate estimates from provider: {}", e);
-			Error::FeerateEstimationUpdateFailed
+			ChainActionError::unavailable(e.to_string())
 		})?;
 
 		let mut new_fee_rate_cache = HashMap::with_capacity(estimates.targets.len());
@@ -106,7 +143,7 @@ impl DependentChainAdapter {
 				self.logger,
 				"Chain provider returned no usable fee rate estimates; keeping the previous cache"
 			);
-			return Err(Error::FeerateEstimationUpdateFailed);
+			return Err(ChainActionError::unavailable("no usable fee rate estimates"));
 		}
 
 		Ok(FeeUpdate::Apply { cache: new_fee_rate_cache, log_unchanged: false })
@@ -119,8 +156,12 @@ impl FeeAction for DependentChainAdapter {
 		"dependent"
 	}
 
+	fn budget(&self) -> Option<Duration> {
+		Some(DEPENDENT_FEE_BUDGET)
+	}
+
 	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
-		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
+		self.fetch_fee_rate_update().await
 	}
 }
 
@@ -165,6 +206,10 @@ impl TxStatusAction for DependentChainAdapter {
 		"dependent"
 	}
 
+	fn budget(&self) -> Option<Duration> {
+		Some(DEPENDENT_TX_STATUS_BUDGET)
+	}
+
 	async fn tx_status(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> ActionResult<Anchored<RawTxObservation>> {
@@ -199,7 +244,7 @@ impl TxStatusAction for DependentChainAdapter {
 				resp.version,
 				CHAIN_WIRE_VERSION
 			);
-			return Err(ChainActionError::Unavailable(format!(
+			return Err(ChainActionError::unavailable(format!(
 				"wire version {} (expected {})",
 				resp.version, CHAIN_WIRE_VERSION
 			)));
@@ -222,9 +267,7 @@ impl TxStatusAction for DependentChainAdapter {
 				"swap_query_tx: chain provider reported {} confirmed without a height/tip pair; failing closed",
 				txid
 			);
-			return Err(ChainActionError::Unavailable(
-				"confirmed without a height/tip pair".to_string(),
-			));
+			return Err(ChainActionError::unavailable("confirmed without a height/tip pair"));
 		};
 
 		if tip_height < height {
@@ -238,7 +281,7 @@ impl TxStatusAction for DependentChainAdapter {
 				height,
 				txid
 			);
-			return Err(ChainActionError::Unavailable(format!(
+			return Err(ChainActionError::unavailable(format!(
 				"tip {} below confirming-block height {}",
 				tip_height, height
 			)));

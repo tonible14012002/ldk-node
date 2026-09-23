@@ -48,8 +48,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BDK_ELECTRUM_CLIENT_BATCH_SIZE: usize = 5;
-const ELECTRUM_CLIENT_NUM_RETRIES: u8 = 3;
-const ELECTRUM_CLIENT_TIMEOUT_SECS: u8 = 20;
+pub(crate) const ELECTRUM_CLIENT_NUM_RETRIES: u8 = 3;
+pub(crate) const ELECTRUM_CLIENT_TIMEOUT_SECS: u8 = 20;
 
 pub(crate) struct ElectrumRuntimeClient {
 	electrum_client: Arc<ElectrumClient>,

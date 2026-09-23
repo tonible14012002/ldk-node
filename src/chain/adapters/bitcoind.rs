@@ -22,7 +22,7 @@ use lightning_block_sync::poll::ValidatedBlockHeader;
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
 use crate::chain::seam::{
 	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, UtxoCapability,
-	UtxoVerification,
+	UtxoVerification, ADAPTER_BUDGET_MARGIN,
 };
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
@@ -44,6 +44,22 @@ use bitcoin::{ScriptBuf, Txid};
 use lightning_block_sync::BlockSource;
 
 use async_trait::async_trait;
+
+/// The longest one bitcoind RPC/REST call can take before the HTTP client
+/// gives up on its own: `lightning_block_sync::http`'s 5s connect + 5s write
+/// + 300s response wait (`TCP_STREAM_TIMEOUT` and `TCP_STREAM_RESPONSE_TIMEOUT`).
+/// Mirrored here because the crate keeps them private.
+#[cfg(feature = "swaps")]
+const BITCOIND_HTTP_CALL_BOUND_SECS: u64 = 5 + 5 + 300;
+
+/// TX_STATUS budget: pre-seam `swap_query_tx` had no bound of its own, only
+/// the HTTP client's per-call one, and makes two calls (`getrawtransaction`,
+/// then a fresh best-block read). Twice that bound plus the margin is
+/// strictly above anything the path could take before, so the client's own
+/// I/O error — never a seam timeout — is what gets reported.
+#[cfg(feature = "swaps")]
+pub(crate) const BITCOIND_TX_STATUS_BUDGET: Duration =
+	Duration::from_secs(2 * BITCOIND_HTTP_CALL_BOUND_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
 
 /// Fee estimates from a bitcoind RPC/REST endpoint.
 ///
@@ -179,6 +195,16 @@ impl FeeAction for BitcoindChainAdapter {
 		"bitcoind"
 	}
 
+	/// Pre-seam timing preserved: one RPC per confirmation target, each under
+	/// `FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS`, run sequentially — so the whole
+	/// fetch may legitimately take `targets × timeout` before the adapter's own
+	/// per-target timeout (and its error log) fires.
+	fn budget(&self) -> Option<Duration> {
+		let per_target = Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS);
+		let targets = get_all_conf_targets().len() as u32;
+		Some(per_target * targets + ADAPTER_BUDGET_MARGIN)
+	}
+
 	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
 		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
 	}
@@ -189,6 +215,10 @@ impl FeeAction for BitcoindChainAdapter {
 impl TxStatusAction for BitcoindChainAdapter {
 	fn name(&self) -> &'static str {
 		"bitcoind"
+	}
+
+	fn budget(&self) -> Option<Duration> {
+		Some(BITCOIND_TX_STATUS_BUDGET)
 	}
 
 	/// A confirmed observation is anchored to the tip its height was derived
@@ -236,7 +266,12 @@ impl TxStatusAction for BitcoindChainAdapter {
 			Ok(None) => Ok(Anchored { value: RawTxObservation::NotFound, tip: None }),
 			Err(e) => {
 				log_error!(self.logger, "swap_query_tx: Bitcoind query failed for {}: {}", txid, e);
-				Err(ChainActionError::Unavailable(format!("query failed: {}", e)))
+				let reason = format!("query failed: {}", e);
+				Err(if e.kind() == std::io::ErrorKind::TimedOut {
+					ChainActionError::timed_out(reason)
+				} else {
+					ChainActionError::unavailable(reason)
+				})
 			},
 		}
 	}
