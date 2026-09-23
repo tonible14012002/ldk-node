@@ -372,11 +372,14 @@ impl MempoolAction for BitcoindChainAdapter {
 	/// serving path asks for, filtered by the query and leaving the poll's
 	/// watermark alone.
 	///
-	/// Either answer is anchored to the tip the engine has synced up to: the
-	/// engine polls the tip immediately before it asks, so that is the tip
-	/// the mempool was read against. `None` only before the first sync.
+	/// Either answer is anchored to the tip the engine has synced up to,
+	/// read after the mempool is so the anchor is never behind the data it
+	/// anchors: the engine polls the tip immediately before it asks, and a
+	/// tip that advanced while a served snapshot was read is at worst ahead
+	/// of it, which an asker that applies unconfirmed transactions
+	/// idempotently absorbs when it syncs that block. `None` only before the
+	/// first sync.
 	async fn mempool(&self, query: &MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>> {
-		let tip = self.cached_tip();
 		let value = match query.scope {
 			MempoolScope::Incremental { best_processed_height } => {
 				let (unconfirmed, evicted) = self
@@ -390,9 +393,10 @@ impl MempoolAction for BitcoindChainAdapter {
 				MempoolAnswer { unconfirmed, evicted }
 			},
 			MempoolScope::Complete => {
+				let relevance = query.relevance();
 				let unconfirmed = self
 					.api_client
-					.get_mempool_snapshot(|tx| query.is_relevant(tx))
+					.get_mempool_snapshot(|tx| relevance.is_relevant(tx))
 					.await
 					.map_err(mempool_poll_error)?;
 				let now =
@@ -407,6 +411,7 @@ impl MempoolAction for BitcoindChainAdapter {
 				MempoolAnswer { unconfirmed, evicted }
 			},
 		};
+		let tip = self.cached_tip();
 		Ok(Anchored { value, tip })
 	}
 }

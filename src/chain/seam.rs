@@ -94,7 +94,7 @@
 //! transactions the network refused, and the layer's shared tail evicts them
 //! from the on-chain wallet so their inputs are spendable again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -174,6 +174,19 @@ pub(crate) const MAX_BROADCAST_PACKAGE_TXS: u64 = 25;
 pub(crate) const PER_TX_BROADCAST_BUDGET: Duration = Duration::from_secs(
 	TX_BROADCAST_TIMEOUT_SECS * MAX_BROADCAST_PACKAGE_TXS + ADAPTER_BUDGET_MARGIN.as_secs(),
 );
+
+/// The most items — watched scripts plus known-unconfirmed txids — one
+/// mempool question from another node may carry. A served question is
+/// refused above this before it is decoded and before it reaches the
+/// adapter, whose caches it locks for the length of the answer. Sized for a
+/// real asker with room to spare: a wallet reveals one script per address it
+/// has ever handed out plus a lookahead per keychain, and LDK watches one
+/// output per channel funding, commitment and HTLC output it must see spent
+/// — thousands for a long-lived busy node, not tens of thousands — while an
+/// asker's own unconfirmed transactions are a handful. Ten thousand entries
+/// decode in milliseconds and index in well under a megabyte, which nothing
+/// on a small node notices.
+pub(crate) const MAX_MEMPOOL_QUERY_ITEMS: usize = 10_000;
 
 /// Why an adapter did not produce an accepted answer.
 ///
@@ -483,25 +496,46 @@ pub(crate) struct MempoolQuery {
 }
 
 impl MempoolQuery {
-	/// Whether `tx` concerns the asker: it pays one of the watched scripts,
-	/// it is one of the transactions the asker already knows, or it spends an
-	/// output of one of those (a replacement, or a child).
-	///
-	/// The rule a `Complete` answer is filtered by, shared so every adapter
-	/// answers the same question. Inputs are matched by parent txid only: the
-	/// asker's own unconfirmed transactions are the only outpoints it has
-	/// told us about, and a spend of a *confirmed* coin of the asker's pays no
-	/// watched script only if it sends everything elsewhere, which the
-	/// asker's own broadcast echo covers.
+	/// The rule a `Complete` answer is filtered by, indexed once so that
+	/// checking a transaction costs its inputs and outputs and not the size
+	/// of the query — a served question may carry up to
+	/// [`MAX_MEMPOOL_QUERY_ITEMS`], and the walk it filters is the whole
+	/// mempool. Built by the adapter answering a `Complete` question, and
+	/// only then: the `Incremental` poll does not filter and pays nothing.
+	pub(crate) fn relevance(&self) -> MempoolRelevance {
+		MempoolRelevance {
+			scripts: self.scripts.iter().cloned().collect(),
+			known_unconfirmed: self.known_unconfirmed.iter().copied().collect(),
+		}
+	}
+}
+
+/// What makes a transaction concern the asker of a [`MempoolQuery`]: it pays
+/// one of the watched scripts, it is one of the transactions the asker
+/// already knows, or it spends an output of one of those (a replacement, or
+/// a child). Shared so every adapter answers the same question.
+///
+/// Inputs are matched by parent txid only: the asker's own unconfirmed
+/// transactions are the only outpoints it has told us about, and a spend of
+/// a *confirmed* coin of the asker's pays no watched script only if it sends
+/// everything elsewhere, which the asker's own broadcast echo covers.
+#[derive(Debug, Clone)]
+pub(crate) struct MempoolRelevance {
+	scripts: HashSet<ScriptBuf>,
+	known_unconfirmed: HashSet<Txid>,
+}
+
+impl MempoolRelevance {
+	/// Whether `tx` concerns the asker. One hash lookup per output and, when
+	/// the asker holds anything unconfirmed, per input.
 	pub(crate) fn is_relevant(&self, tx: &Transaction) -> bool {
-		if tx.output.iter().any(|o| self.scripts.iter().any(|s| *s == o.script_pubkey)) {
+		if tx.output.iter().any(|o| self.scripts.contains(&o.script_pubkey)) {
 			return true;
 		}
 		if self.known_unconfirmed.is_empty() {
 			return false;
 		}
-		let txid = tx.compute_txid();
-		self.known_unconfirmed.contains(&txid)
+		self.known_unconfirmed.contains(&tx.compute_txid())
 			|| tx.input.iter().any(|i| self.known_unconfirmed.contains(&i.previous_output.txid))
 	}
 }
@@ -785,6 +819,9 @@ mod tests {
 	use std::time::Instant;
 
 	use bitcoin::hashes::Hash;
+	use bitcoin::{
+		absolute, transaction, Amount, OutPoint, Sequence, TxIn, TxOut, WPubkeyHash, Witness,
+	};
 
 	/// What one fake adapter does when asked.
 	enum Behaviour {
@@ -1158,5 +1195,85 @@ mod tests {
 			let err: ChainActionError = case.into();
 			assert_eq!(err, ChainActionError::Unavailable { reason, timed_out });
 		}
+	}
+
+	fn script(seed: u8) -> ScriptBuf {
+		ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&[seed; 33]))
+	}
+
+	fn txid(seed: u8) -> Txid {
+		Txid::from_byte_array([seed; 32])
+	}
+
+	fn tx(parent: Txid, pays: ScriptBuf) -> Transaction {
+		Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint { txid: parent, vout: 0 },
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: pays }],
+		}
+	}
+
+	/// The rule as it was written before it was indexed: linear scans of the
+	/// query's lists. The index must agree with it on every shape of
+	/// transaction, with and without anything known unconfirmed.
+	fn relevant_by_scanning(query: &MempoolQuery, tx: &Transaction) -> bool {
+		if tx.output.iter().any(|o| query.scripts.iter().any(|s| *s == o.script_pubkey)) {
+			return true;
+		}
+		if query.known_unconfirmed.is_empty() {
+			return false;
+		}
+		query.known_unconfirmed.contains(&tx.compute_txid())
+			|| tx.input.iter().any(|i| query.known_unconfirmed.contains(&i.previous_output.txid))
+	}
+
+	#[test]
+	fn indexed_relevance_matches_the_scanning_rule() {
+		let (watched, unwatched) = (script(1), script(2));
+		let known = tx(txid(9), unwatched.clone());
+		let known_txid = known.compute_txid();
+
+		let pays_watched = tx(txid(7), watched.clone());
+		let pays_unwatched = tx(txid(7), unwatched.clone());
+		let spends_known = tx(known_txid, unwatched.clone());
+		let spends_unknown = tx(txid(8), unwatched.clone());
+		let cases = [&pays_watched, &pays_unwatched, &known, &spends_known, &spends_unknown];
+
+		let with_known = MempoolQuery {
+			scripts: vec![watched.clone()],
+			known_unconfirmed: vec![known_txid],
+			scope: MempoolScope::Complete,
+		};
+		let relevance = with_known.relevance();
+		let verdicts: Vec<bool> = cases.iter().map(|tx| relevance.is_relevant(tx)).collect();
+		assert_eq!(verdicts, vec![true, false, true, true, false]);
+		for case in cases {
+			assert_eq!(relevance.is_relevant(case), relevant_by_scanning(&with_known, case));
+		}
+
+		let nothing_known = MempoolQuery {
+			scripts: vec![watched],
+			known_unconfirmed: Vec::new(),
+			scope: MempoolScope::Complete,
+		};
+		let relevance = nothing_known.relevance();
+		let verdicts: Vec<bool> = cases.iter().map(|tx| relevance.is_relevant(tx)).collect();
+		assert_eq!(verdicts, vec![true, false, false, false, false]);
+		for case in cases {
+			assert_eq!(relevance.is_relevant(case), relevant_by_scanning(&nothing_known, case));
+		}
+
+		let nothing_at_all = MempoolQuery {
+			scripts: Vec::new(),
+			known_unconfirmed: Vec::new(),
+			scope: MempoolScope::Complete,
+		};
+		assert!(cases.iter().all(|tx| !nothing_at_all.relevance().is_relevant(tx)));
 	}
 }

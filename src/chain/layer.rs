@@ -46,7 +46,7 @@ use crate::chain::seam::{
 	ActionChain, ActionResult, Anchored, Answered, BroadcastAction, BroadcastRejection,
 	ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery,
 	ScriptHistoryAction, UtxoCapability, UtxoVerification, BROADCAST_BUDGET, FEE_BUDGET,
-	MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
+	MAX_MEMPOOL_QUERY_ITEMS, MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
 };
 use crate::chain::wire_convert::{mempool_answer_to_wire, wire_to_mempool_query};
 use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
@@ -832,7 +832,10 @@ impl ChainLayer {
 	/// answer taken before the engine has synced to any tip: the wire
 	/// requires the tip, because an asker that follows the chain itself
 	/// must be able to place the answer on its chain, and a mempool view
-	/// anchored nowhere is not one it should act on.
+	/// anchored nowhere is not one it should act on. So is a question of
+	/// more than [`MAX_MEMPOOL_QUERY_ITEMS`] scripts and txids together,
+	/// refused before it is decoded: the adapter filters the whole mempool
+	/// by it under the locks the local poll shares.
 	///
 	/// [`MempoolScope::Complete`]: crate::chain::seam::MempoolScope::Complete
 	pub(crate) async fn serve_mempool(
@@ -840,6 +843,18 @@ impl ChainLayer {
 	) -> Result<WireMempoolResponse, Error> {
 		if !self.engine.serves_mempool() || self.slots.mempool.is_empty() {
 			return Err(Error::ChainServeUnsupported);
+		}
+
+		let items = req.spks.len().saturating_add(req.known_unconfirmed.len());
+		if items > MAX_MEMPOOL_QUERY_ITEMS {
+			log_info!(
+				self.shared.logger,
+				"Refusing a mempool question of {} scripts and {} known txids: more than the {} this node answers",
+				req.spks.len(),
+				req.known_unconfirmed.len(),
+				MAX_MEMPOOL_QUERY_ITEMS
+			);
+			return Err(Error::ChainServeFailed);
 		}
 
 		let query = wire_to_mempool_query(req).map_err(|e| {
@@ -1562,5 +1577,54 @@ mod tests {
 		assert_eq!(asked[0].scope, MempoolScope::Complete);
 		assert_eq!(asked[0].scripts, vec![someone_elses_script()]);
 		assert_eq!(asked[0].known_unconfirmed, vec![known]);
+	}
+
+	/// A question of more scripts and txids together than
+	/// `MAX_MEMPOOL_QUERY_ITEMS` is refused before the adapter is asked;
+	/// one exactly at the bound is answered in full.
+	#[tokio::test]
+	async fn serve_mempool_refuses_a_question_above_the_bound() {
+		let tip = BlockId { height: 7, hash: BlockHash::from_byte_array([7u8; 32]) };
+		let local = FakeMempool::new(
+			"local",
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
+		);
+		let h = mempool_harness(&[Arc::clone(&local)], true);
+		let known = txid_to_wire(&Txid::from_byte_array([3u8; 32]));
+		let spk = script_to_wire(&someone_elses_script());
+
+		// Exactly the bound: MAX - 1 scripts and one txid.
+		let at_bound = WireMempoolRequest {
+			version: CHAIN_WIRE_VERSION,
+			spks: vec![spk.clone(); MAX_MEMPOOL_QUERY_ITEMS - 1],
+			known_unconfirmed: vec![known.clone()],
+		};
+		let resp = h.layer.serve_mempool(&at_bound).await.unwrap();
+		assert_eq!(resp.evicted, vec![known.clone()]);
+		let asked = local.queries();
+		assert_eq!(asked.len(), 1);
+		assert_eq!(asked[0].scripts.len(), MAX_MEMPOOL_QUERY_ITEMS - 1);
+		assert_eq!(asked[0].known_unconfirmed.len(), 1);
+
+		// One txid over, and the adapter is not asked.
+		let mut over_by_a_txid = at_bound.clone();
+		over_by_a_txid.known_unconfirmed.push(known);
+		assert!(matches!(
+			h.layer.serve_mempool(&over_by_a_txid).await,
+			Err(Error::ChainServeFailed)
+		));
+		assert_eq!(local.queries().len(), 1, "refused before the adapter is asked");
+
+		// Scripts alone can exceed it too.
+		let over_by_scripts = WireMempoolRequest {
+			version: CHAIN_WIRE_VERSION,
+			spks: vec![spk; MAX_MEMPOOL_QUERY_ITEMS + 1],
+			known_unconfirmed: Vec::new(),
+		};
+		assert!(matches!(
+			h.layer.serve_mempool(&over_by_scripts).await,
+			Err(Error::ChainServeFailed)
+		));
+		assert_eq!(local.queries().len(), 1);
 	}
 }
