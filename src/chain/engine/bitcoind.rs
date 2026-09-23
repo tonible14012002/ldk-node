@@ -54,6 +54,11 @@ impl SyncEngine for BitcoindSyncEngine {
 		Some(&self.onchain_wallet)
 	}
 
+	/// The MEMPOOL chain is this node's own bitcoind.
+	fn serves_mempool(&self) -> bool {
+		true
+	}
+
 	/// Poll the tip, then the mempool, then record the pass — in that order,
 	/// as pre-seam. The mempool comes through the layer's MEMPOOL chain now;
 	/// what it answers is applied exactly where, and how, the client's own

@@ -1762,6 +1762,24 @@ impl Node {
 		runtime.block_on(async move { chain_source.serve_lightning_sync(&req).await })
 	}
 
+	/// Answer another node's mempool question from this node's own mempool.
+	///
+	/// Errors with [`Error::ChainServeUnsupported`] when this node has no
+	/// mempool of its own to answer from — an Esplora- or Electrum-backed
+	/// node, or a Dependent node, which must never forward the question —
+	/// and with [`Error::ChainServeFailed`] when it has one but could not
+	/// read it, or has not yet synced to a tip to anchor the answer at.
+	pub fn chain_serve_mempool(
+		&self, req: &chain_provider::WireMempoolRequest,
+	) -> Result<chain_provider::WireMempoolResponse, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_mempool(&req).await })
+	}
+
 	/// Close a previously opened channel.
 	///
 	/// Will attempt to close a channel coopertively. If this fails, users might need to resort to

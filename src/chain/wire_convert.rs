@@ -13,8 +13,12 @@
 //! ```text
 //!   DEPENDENT   SyncRequest      -> WireSyncRequest      (drain BDK's own request)
 //!               WireUpdate       -> Update               (apply to the wallet)
+//!               MempoolQuery     -> WireMempoolRequest   (ask about the mempool)
+//!               WireMempoolResponse -> MempoolAnswer     (apply what it holds)
 //!   PRO         WireSyncRequest  -> SyncRequest          (rebuild, scan for real)
 //!               SyncResponse     -> WireUpdate           (project the answer)
+//!               WireMempoolRequest -> MempoolQuery       (ask the local MEMPOOL slot)
+//!               MempoolAnswer    -> WireMempoolResponse  (project the answer)
 //! ```
 //!
 //! # The request is drained, not rebuilt
@@ -45,9 +49,11 @@ use bdk_chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use bdk_wallet::{KeychainKind, Update};
 
 use crate::chain::provider::{
-	ChainProviderError, WireAnchor, WireBlockId, WireOutPoint, WireSeenAt, WireSyncRequest,
-	WireTxOut, WireUpdate, CHAIN_WIRE_VERSION,
+	ChainProviderError, WireAnchor, WireBlockId, WireMempoolRequest, WireMempoolResponse,
+	WireOutPoint, WireSeenAt, WireSyncRequest, WireTxOut, WireUnconfirmedTx, WireUpdate,
+	CHAIN_WIRE_VERSION,
 };
+use crate::chain::seam::{MempoolAnswer, MempoolQuery, MempoolScope};
 
 // ── small helpers ────────────────────────────────────────────────────────────
 
@@ -270,6 +276,72 @@ pub(crate) fn wire_update_to_bdk(
 	Ok(Update { last_active_indices: last_active, tx_update, chain })
 }
 
+// ── DEPENDENT: mempool ───────────────────────────────────────────────────────
+
+/// Ask a provider what a [`MempoolQuery`] asks. The scope does not travel:
+/// a provider remembers nothing about the asker and answers completely.
+pub(crate) fn mempool_query_to_wire(query: &MempoolQuery) -> WireMempoolRequest {
+	WireMempoolRequest {
+		version: CHAIN_WIRE_VERSION,
+		spks: query.scripts.iter().map(script_to_wire).collect(),
+		known_unconfirmed: query.known_unconfirmed.iter().map(txid_to_wire).collect(),
+	}
+}
+
+/// Turn a provider's answer into a [`MempoolAnswer`] and the tip it was
+/// taken at.
+///
+/// `evicted_at` is the asker's own clock: the wire carries no eviction time,
+/// and the moment this node learned of the eviction is the moment that
+/// matters to its wallet.
+pub(crate) fn wire_to_mempool_answer(
+	wire: &WireMempoolResponse, evicted_at: u64,
+) -> Result<(MempoolAnswer, BlockId), ChainProviderError> {
+	check_version(wire.version)?;
+	let tip = block_id_from_wire(&wire.tip)?;
+	let unconfirmed = wire
+		.unconfirmed
+		.iter()
+		.map(|entry| Ok((tx_from_wire(&entry.tx_hex)?, entry.seen_at)))
+		.collect::<Result<Vec<_>, ChainProviderError>>()?;
+	let evicted = wire
+		.evicted
+		.iter()
+		.map(|txid| Ok((txid_from_wire(txid)?, evicted_at)))
+		.collect::<Result<Vec<_>, ChainProviderError>>()?;
+	Ok((MempoolAnswer { unconfirmed, evicted }, tip))
+}
+
+// ── PRO: mempool ─────────────────────────────────────────────────────────────
+
+/// Rebuild another node's question as a [`MempoolQuery`] for the local
+/// MEMPOOL slot. Always [`MempoolScope::Complete`]: nothing is remembered
+/// about the asker, so nothing can be left out.
+pub(crate) fn wire_to_mempool_query(
+	wire: &WireMempoolRequest,
+) -> Result<MempoolQuery, ChainProviderError> {
+	check_version(wire.version)?;
+	let scripts = wire.spks.iter().map(|s| script_from_wire(s)).collect::<Result<Vec<_>, _>>()?;
+	let known_unconfirmed =
+		wire.known_unconfirmed.iter().map(|t| txid_from_wire(t)).collect::<Result<Vec<_>, _>>()?;
+	Ok(MempoolQuery { scripts, known_unconfirmed, scope: MempoolScope::Complete })
+}
+
+/// Project the local slot's answer, taken at `tip`, onto the wire. Eviction
+/// times stay behind; see [`WireMempoolResponse::evicted`].
+pub(crate) fn mempool_answer_to_wire(answer: &MempoolAnswer, tip: &BlockId) -> WireMempoolResponse {
+	WireMempoolResponse {
+		version: CHAIN_WIRE_VERSION,
+		tip: block_id_to_wire(tip),
+		unconfirmed: answer
+			.unconfirmed
+			.iter()
+			.map(|(tx, seen_at)| WireUnconfirmedTx { tx_hex: tx_to_wire(tx), seen_at: *seen_at })
+			.collect(),
+		evicted: answer.evicted.iter().map(|(txid, _)| txid_to_wire(txid)).collect(),
+	}
+}
+
 // ── PRO: inbound request ─────────────────────────────────────────────────────
 
 /// Rebuild a real [`SyncRequest`] from the wire so the serving node can run an
@@ -352,6 +424,81 @@ pub(crate) fn tx_update_to_wire(
 mod tests {
 	use super::*;
 	use bitcoin::hashes::Hash;
+	use bitcoin::{absolute, transaction, Amount, TxOut};
+
+	use crate::chain::provider::WireTxStatusResponse;
+
+	/// N4: a mempool question and its answer survive the wire in both
+	/// directions, and the answer comes back stamped on the asker's clock.
+	#[test]
+	fn mempool_request_response_roundtrip() {
+		let script = ScriptBuf::from_bytes(vec![0x00, 0x14, 0xde, 0xad, 0xbe, 0xef]);
+		let known = Txid::from_byte_array([7u8; 32]);
+		let query = MempoolQuery {
+			scripts: vec![script.clone()],
+			known_unconfirmed: vec![known],
+			scope: MempoolScope::Incremental { best_processed_height: 100 },
+		};
+
+		let wire = mempool_query_to_wire(&query);
+		let json = serde_json::to_string(&wire).unwrap();
+		let decoded: WireMempoolRequest = serde_json::from_str(&json).unwrap();
+		assert_eq!(decoded, wire);
+		assert_eq!(decoded.version, CHAIN_WIRE_VERSION);
+
+		let rebuilt = wire_to_mempool_query(&decoded).unwrap();
+		assert_eq!(rebuilt.scripts, vec![script.clone()]);
+		assert_eq!(rebuilt.known_unconfirmed, vec![known]);
+		assert_eq!(rebuilt.scope, MempoolScope::Complete, "the scope does not travel");
+
+		let tx = Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: script }],
+		};
+		let tip = BlockId { height: 101, hash: BlockHash::from_byte_array([1u8; 32]) };
+		let answer = MempoolAnswer {
+			unconfirmed: vec![(tx.clone(), 1_700_000_000)],
+			evicted: vec![(known, 1_700_000_001)],
+		};
+
+		let wire = mempool_answer_to_wire(&answer, &tip);
+		let json = serde_json::to_string(&wire).unwrap();
+		let decoded: WireMempoolResponse = serde_json::from_str(&json).unwrap();
+		assert_eq!(decoded, wire);
+
+		let (rebuilt, rebuilt_tip) = wire_to_mempool_answer(&decoded, 42).unwrap();
+		assert_eq!(rebuilt_tip, tip);
+		assert_eq!(rebuilt.unconfirmed, vec![(tx, 1_700_000_000)]);
+		assert_eq!(
+			rebuilt.evicted,
+			vec![(known, 42)],
+			"evictions are stamped on the asker's clock"
+		);
+
+		let mut stale = decoded;
+		stale.version += 1;
+		assert!(matches!(
+			wire_to_mempool_answer(&stale, 42),
+			Err(ChainProviderError::VersionMismatch { .. })
+		));
+	}
+
+	/// N4: `tip_hash` was added after the port shipped, so an answer written
+	/// without it — by a serving node running the older crate — still decodes.
+	#[test]
+	fn tx_status_response_without_tip_hash_still_decodes() {
+		let json = r#"{"version":1,"confirmed":true,"in_mempool":false,"confirmation_height":10,"tip_height":12}"#;
+		let decoded: WireTxStatusResponse = serde_json::from_str(json).unwrap();
+		assert_eq!(decoded.tip_hash, None);
+		assert_eq!(decoded.confirmation_height, Some(10));
+		assert_eq!(decoded.tip_height, Some(12));
+
+		let json = r#"{"version":1,"confirmed":true,"in_mempool":false,"confirmation_height":10,"tip_height":12,"tip_hash":"ab"}"#;
+		let decoded: WireTxStatusResponse = serde_json::from_str(json).unwrap();
+		assert_eq!(decoded.tip_hash.as_deref(), Some("ab"));
+	}
 
 	#[test]
 	fn version_mismatch_is_rejected() {
@@ -393,10 +540,7 @@ mod tests {
 			.map(|h| {
 				let mut bytes = [0u8; 32];
 				bytes[0..4].copy_from_slice(&h.to_le_bytes());
-				WireBlockId {
-					height: *h,
-					hash: BlockHash::from_byte_array(bytes).to_string(),
-				}
+				WireBlockId { height: *h, hash: BlockHash::from_byte_array(bytes).to_string() }
 			})
 			.collect()
 	}
@@ -427,10 +571,8 @@ mod tests {
 
 		// Height 150 sits below the tip and is not yet in the chain — exactly
 		// the shape that used to panic.
-		let widened = tip.insert(BlockId {
-			height: 150,
-			hash: BlockHash::from_byte_array([9u8; 32]),
-		});
+		let widened =
+			tip.insert(BlockId { height: 150, hash: BlockHash::from_byte_array([9u8; 32]) });
 		assert_eq!(widened.height(), 200);
 		assert!(widened.get(150).is_some());
 		assert!(widened.get(0).is_some(), "the chain still reaches genesis");

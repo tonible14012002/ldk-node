@@ -9,9 +9,9 @@
 //!
 //! [`ChainLayer`] is the single entry point the rest of the crate uses to reach
 //! the Bitcoin chain. Each chain *ability* occupies a slot: FEE, BROADCAST,
-//! TX_STATUS and MEMPOOL are ordered adapter chains ([`ActionChain`]), and
-//! UTXO is a capability declared once at startup. The wallet sync engine is a
-//! separate explicit axis.
+//! TX_STATUS, MEMPOOL and SCRIPT_HISTORY are ordered adapter chains
+//! ([`ActionChain`]), and UTXO is a capability declared once at startup. The
+//! wallet sync engine is a separate explicit axis.
 //!
 //! Nothing outside slot construction branches on which backend is configured.
 
@@ -39,13 +39,16 @@ use crate::chain::engine::esplora::EsploraSyncEngine;
 use crate::chain::engine::SyncEngine;
 use crate::chain::provider::{
 	ChainDataProvider, WireFeeEstimates, WireFeeTarget, WireLightningSyncRequest,
-	WireLightningSyncResponse, WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
+	WireLightningSyncResponse, WireMempoolRequest, WireMempoolResponse, WireSyncRequest,
+	WireUpdate, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{
 	ActionChain, ActionResult, Anchored, Answered, BroadcastAction, BroadcastRejection,
 	ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery,
-	UtxoCapability, UtxoVerification, BROADCAST_BUDGET, FEE_BUDGET, MEMPOOL_BUDGET,
+	ScriptHistoryAction, UtxoCapability, UtxoVerification, BROADCAST_BUDGET, FEE_BUDGET,
+	MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
 };
+use crate::chain::wire_convert::{mempool_answer_to_wire, wire_to_mempool_query};
 use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
 use crate::fee_estimator::{
@@ -76,6 +79,9 @@ pub(crate) struct ChainSlotAdapters {
 	/// Empty for an engine that carries unconfirmed transactions in its own
 	/// sync and never asks the slot.
 	pub(crate) mempool: Vec<&'static str>,
+	/// Empty for every engine that scans its own chain source; filled only
+	/// on a hybrid node.
+	pub(crate) script_history: Vec<&'static str>,
 	/// The adapter verifying BOLT-7 channel announcements and how far it
 	/// checks them. `None` means the routing graph carries unverified
 	/// capacities.
@@ -90,6 +96,7 @@ impl fmt::Display for ChainSlotAdapters {
 		write!(f, " tx_status=[{}]", self.tx_status.join(","))?;
 		write!(f, " broadcast=[{}]", self.broadcast.join(","))?;
 		write!(f, " mempool=[{}]", self.mempool.join(","))?;
+		write!(f, " script_history=[{}]", self.script_history.join(","))?;
 		match self.utxo {
 			Some((name, verification)) => write!(f, " utxo={}({})", name, verification.as_str())?,
 			None => write!(f, " utxo=none")?,
@@ -111,6 +118,10 @@ pub(crate) struct ChainSlots {
 	/// whose own sync carries them; an empty chain is never run by such an
 	/// engine, so it costs nothing and logs nothing.
 	pub(crate) mempool: ActionChain<dyn MempoolAction>,
+	/// SCRIPT_HISTORY — the wide wallet scan run elsewhere. Empty for every
+	/// engine that scans its own chain source; a hybrid node fills it from
+	/// its provider.
+	pub(crate) script_history: ActionChain<dyn ScriptHistoryAction>,
 	/// UTXO — verification of BOLT-7 channel announcements, if any adapter can.
 	pub(crate) utxo: Option<Arc<dyn UtxoCapability>>,
 }
@@ -163,7 +174,8 @@ impl ChainLayer {
 	///
 	/// MEMPOOL is passed separately because only a block-polling backend
 	/// has one to fill; the others carry unconfirmed transactions in their
-	/// own sync and leave the chain empty.
+	/// own sync and leave the chain empty. SCRIPT_HISTORY is empty for all
+	/// of them: each scans its own chain source.
 	fn slots_for_single_adapter<A>(
 		adapter: Arc<A>, mempool: Vec<Arc<dyn MempoolAction>>,
 		utxo: Option<Arc<dyn UtxoCapability>>, logger: &Arc<Logger>,
@@ -192,6 +204,12 @@ impl ChainLayer {
 				Arc::clone(logger),
 			),
 			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, mempool, Arc::clone(logger)),
+			script_history: ActionChain::new(
+				"script_history",
+				SCRIPT_HISTORY_BUDGET,
+				Vec::new(),
+				Arc::clone(logger),
+			),
 			utxo,
 		}
 	}
@@ -396,6 +414,7 @@ impl ChainLayer {
 			tx_status: self.slots.tx_status.names(),
 			broadcast: self.slots.broadcast.names(),
 			mempool: self.slots.mempool.names(),
+			script_history: self.slots.script_history.names(),
 			utxo: self
 				.slots
 				.utxo
@@ -671,14 +690,24 @@ impl ChainLayer {
 	/// confirmation either.
 	#[cfg(feature = "swaps")]
 	async fn observe_tx(&self, txid: Txid, script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
+		self.observe_tx_anchored(txid, script_pubkey).await.value
+	}
+
+	/// [`ChainLayer::observe_tx`] keeping the tip the answering adapter
+	/// derived the observation against, for the serving path to pass on. An
+	/// unreachable observation has no tip.
+	#[cfg(feature = "swaps")]
+	async fn observe_tx_anchored(
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
+	) -> Anchored<RawTxObservation> {
 		match self
 			.slots
 			.tx_status
 			.run(|a| async move { a.tx_status(txid, script_pubkey).await })
 			.await
 		{
-			Ok(answered) => answered.value.value,
-			Err(_) => RawTxObservation::Unreachable,
+			Ok(answered) => answered.value,
+			Err(_) => Anchored { value: RawTxObservation::Unreachable, tip: None },
 		}
 	}
 
@@ -752,26 +781,31 @@ impl ChainLayer {
 	pub(crate) async fn serve_tx_status(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> Result<WireTxStatusResponse, Error> {
-		let (confirmed, in_mempool, confirmation_height, tip_height) =
-			match self.observe_tx(txid, script_pubkey).await {
-				RawTxObservation::Confirmed { height, confirmations } => {
-					// Reconstruct the tip the adapter derived depth against,
-					// so the caller can recompute rather than trust a count
-					// taken at a tip it cannot see.
-					let tip = height.map(|h| h + confirmations.saturating_sub(1));
-					(true, false, height, tip)
-				},
-				RawTxObservation::InMempool => (false, true, None, None),
-				RawTxObservation::NotFound => (false, false, None, None),
-				RawTxObservation::Unreachable => {
-					log_info!(
+		let observed = self.observe_tx_anchored(txid, script_pubkey).await;
+		// The tip the adapter derived the answer against, when it reported
+		// one. `tip_height` below is still reconstructed from the depth, as
+		// it always was; the hash is the addition, for an asker that can
+		// place it on its own chain.
+		let tip_hash = observed.tip.map(|tip| tip.hash.to_string());
+		let (confirmed, in_mempool, confirmation_height, tip_height) = match observed.value {
+			RawTxObservation::Confirmed { height, confirmations } => {
+				// Reconstruct the tip the adapter derived depth against,
+				// so the caller can recompute rather than trust a count
+				// taken at a tip it cannot see.
+				let tip = height.map(|h| h + confirmations.saturating_sub(1));
+				(true, false, height, tip)
+			},
+			RawTxObservation::InMempool => (false, true, None, None),
+			RawTxObservation::NotFound => (false, false, None, None),
+			RawTxObservation::Unreachable => {
+				log_info!(
 						self.shared.logger,
 						"Refusing to answer a chain lookup for {}: this node's own lookup is unreachable",
 						txid
 					);
-					return Err(Error::ChainServeFailed);
-				},
-			};
+				return Err(Error::ChainServeFailed);
+			},
+		};
 
 		Ok(WireTxStatusResponse {
 			version: CHAIN_WIRE_VERSION,
@@ -779,7 +813,67 @@ impl ChainLayer {
 			in_mempool,
 			confirmation_height,
 			tip_height,
+			tip_hash,
 		})
+	}
+
+	/// Answer another node's mempool question from this node's MEMPOOL
+	/// chain.
+	///
+	/// Refused — [`Error::ChainServeUnsupported`] — unless the engine says
+	/// the chain answers from a mempool this node observes itself
+	/// ([`SyncEngine::serves_mempool`]) and the chain has an adapter at all.
+	/// That is the rule every serve has: a Dependent node's chain is filled
+	/// from a provider, and answering from it would forward the question to
+	/// a third node. The question is asked in [`MempoolScope::Complete`],
+	/// so the poll loop's own memory of what it answered is left alone.
+	///
+	/// An exhausted chain is [`Error::ChainServeFailed`], and so is an
+	/// answer taken before the engine has synced to any tip: the wire
+	/// requires the tip, because an asker that follows the chain itself
+	/// must be able to place the answer on its chain, and a mempool view
+	/// anchored nowhere is not one it should act on.
+	///
+	/// [`MempoolScope::Complete`]: crate::chain::seam::MempoolScope::Complete
+	pub(crate) async fn serve_mempool(
+		&self, req: &WireMempoolRequest,
+	) -> Result<WireMempoolResponse, Error> {
+		if !self.engine.serves_mempool() || self.slots.mempool.is_empty() {
+			return Err(Error::ChainServeUnsupported);
+		}
+
+		let query = wire_to_mempool_query(req).map_err(|e| {
+			log_error!(self.shared.logger, "Refusing a malformed mempool request: {}", e);
+			Error::ChainServeFailed
+		})?;
+
+		let answered = self.mempool(&query).await.map_err(|e| {
+			log_error!(
+				self.shared.logger,
+				"Could not answer another node's mempool question: {}",
+				e
+			);
+			Error::ChainServeFailed
+		})?;
+
+		let Anchored { value: answer, tip } = answered.value;
+		let Some(tip) = tip else {
+			log_info!(
+				self.shared.logger,
+				"Refusing to answer a mempool question: this node has not synced to a tip yet"
+			);
+			return Err(Error::ChainServeFailed);
+		};
+
+		log_trace!(
+			self.shared.logger,
+			"Served a mempool question via {}: {} unconfirmed, {} evicted, at height {}",
+			answered.by,
+			answer.unconfirmed.len(),
+			answer.evicted.len(),
+			tip.height
+		);
+		Ok(mempool_answer_to_wire(&answer, &tip))
 	}
 
 	/// Run another node's on-chain wallet scan against this node's chain
@@ -840,21 +934,24 @@ mod tests {
 	//! N2: the BROADCAST drain and its shared tail, run against fake adapters,
 	//! a fake engine and a real on-chain wallet — the tail's effect is what
 	//! the wallet then offers to spend, so nothing narrower would prove it.
+	//! N4: the MEMPOOL chain and the serving path over it.
 	use super::*;
 
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::Duration;
 
+	use bdk_chain::BlockId;
 	use bdk_wallet::Wallet as BdkWallet;
 	use bitcoin::hashes::Hash;
 	use bitcoin::{
-		absolute, transaction, Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut,
-		WPubkeyHash, Witness,
+		absolute, transaction, Amount, BlockHash, Network, OutPoint, ScriptBuf, Sequence, TxIn,
+		TxOut, WPubkeyHash, Witness,
 	};
 	use lightning::chain::chaininterface::BroadcasterInterface;
 	use lightning::util::test_utils::TestStore;
 
-	use crate::chain::seam::ActionResult;
+	use crate::chain::seam::{ActionResult, MempoolScope};
+	use crate::chain::wire_convert::{script_to_wire, tx_to_wire, txid_to_wire};
 	use crate::io::{
 		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 	};
@@ -923,11 +1020,63 @@ mod tests {
 		}
 	}
 
-	/// An engine that syncs nothing and only answers the two questions the
-	/// BROADCAST tail asks it.
+	/// What one fake MEMPOOL adapter answers.
+	enum MempoolBehaviour {
+		/// Answers these transactions, anchored to this tip.
+		Answer {
+			unconfirmed: Vec<Transaction>,
+			tip: Option<BlockId>,
+		},
+		Unavailable,
+	}
+
+	struct FakeMempool {
+		name: &'static str,
+		behaviour: MempoolBehaviour,
+		/// Every query the adapter was asked, so a test can check what
+		/// reached it.
+		queries: Mutex<Vec<MempoolQuery>>,
+	}
+
+	impl FakeMempool {
+		fn new(name: &'static str, behaviour: MempoolBehaviour) -> Arc<Self> {
+			Arc::new(Self { name, behaviour, queries: Mutex::new(Vec::new()) })
+		}
+
+		fn queries(&self) -> Vec<MempoolQuery> {
+			self.queries.lock().unwrap().clone()
+		}
+	}
+
+	#[async_trait]
+	impl MempoolAction for FakeMempool {
+		fn name(&self) -> &'static str {
+			self.name
+		}
+
+		async fn mempool(&self, query: &MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>> {
+			self.queries.lock().unwrap().push(query.clone());
+			match &self.behaviour {
+				MempoolBehaviour::Answer { unconfirmed, tip } => Ok(Anchored {
+					value: MempoolAnswer {
+						unconfirmed: unconfirmed.iter().map(|tx| (tx.clone(), 1)).collect(),
+						evicted: query.known_unconfirmed.iter().map(|txid| (*txid, 2)).collect(),
+					},
+					tip: *tip,
+				}),
+				MempoolBehaviour::Unavailable => {
+					Err(ChainActionError::unavailable(format!("{} is down", self.name)))
+				},
+			}
+		}
+	}
+
+	/// An engine that syncs nothing and only answers the questions the
+	/// BROADCAST tail and the serving path ask it.
 	struct FakeEngine {
 		wallet: Arc<Wallet>,
 		tracks_own_broadcasts: bool,
+		serves_mempool: bool,
 	}
 
 	#[async_trait]
@@ -942,6 +1091,10 @@ mod tests {
 
 		fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
 			Some(&self.wallet)
+		}
+
+		fn serves_mempool(&self) -> bool {
+			self.serves_mempool
 		}
 
 		async fn sync_once(
@@ -965,14 +1118,35 @@ mod tests {
 		broadcaster: Arc<Broadcaster>,
 	}
 
-	fn harness(adapters: &[Arc<FakeBroadcast>], tracks_own_broadcasts: bool) -> Harness {
-		let logger = Arc::new(Logger::new_log_facade());
-		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
-		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
-		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
-		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
+	/// Which fakes fill which slots, and what the fake engine answers.
+	struct HarnessSpec {
+		broadcast: Vec<Arc<dyn BroadcastAction>>,
+		mempool: Vec<Arc<dyn MempoolAction>>,
+		tracks_own_broadcasts: bool,
+		serves_mempool: bool,
+		/// An existing wallet to build over, so a test can fund a wallet
+		/// once and then run different chains against it.
+		wallet: Option<Arc<Wallet>>,
+	}
 
-		let mut persister = KVStoreWalletPersister::new(Arc::clone(&kv_store), Arc::clone(&logger));
+	impl Default for HarnessSpec {
+		fn default() -> Self {
+			Self {
+				broadcast: Vec::new(),
+				mempool: Vec::new(),
+				tracks_own_broadcasts: false,
+				serves_mempool: false,
+				wallet: None,
+			}
+		}
+	}
+
+	fn fresh_wallet(
+		kv_store: &Arc<DynStore>, broadcaster: &Arc<Broadcaster>,
+		fee_estimator: &Arc<OnchainFeeEstimator>, logger: &Arc<Logger>,
+	) -> Arc<Wallet> {
+		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
+		let mut persister = KVStoreWalletPersister::new(Arc::clone(kv_store), Arc::clone(logger));
 		let bdk_wallet = BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
 			.network(Network::Regtest)
 			.create_wallet(&mut persister)
@@ -981,20 +1155,35 @@ mod tests {
 			Vec::new(),
 			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
 			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
-			Arc::clone(&kv_store),
-			Arc::clone(&logger),
+			Arc::clone(kv_store),
+			Arc::clone(logger),
 		));
-		let wallet = Arc::new(Wallet::new(
+		Arc::new(Wallet::new(
 			bdk_wallet,
 			persister,
-			Arc::clone(&broadcaster),
-			Arc::clone(&fee_estimator),
+			Arc::clone(broadcaster),
+			Arc::clone(fee_estimator),
 			payment_store,
 			config,
-			Arc::clone(&logger),
-		));
+			Arc::clone(logger),
+		))
+	}
 
-		let engine = Arc::new(FakeEngine { wallet: Arc::clone(&wallet), tracks_own_broadcasts });
+	fn build(spec: HarnessSpec) -> Harness {
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+
+		let wallet = spec
+			.wallet
+			.unwrap_or_else(|| fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger));
+
+		let engine = Arc::new(FakeEngine {
+			wallet: Arc::clone(&wallet),
+			tracks_own_broadcasts: spec.tracks_own_broadcasts,
+			serves_mempool: spec.serves_mempool,
+		});
 		let slots = ChainSlots {
 			fee: ActionChain::new("fee", FEE_BUDGET, Vec::new(), Arc::clone(&logger)),
 			#[cfg(feature = "swaps")]
@@ -1007,10 +1196,16 @@ mod tests {
 			broadcast: ActionChain::new(
 				"broadcast",
 				BROADCAST_BUDGET,
-				adapters.iter().map(|a| Arc::clone(a) as Arc<dyn BroadcastAction>).collect(),
+				spec.broadcast,
 				Arc::clone(&logger),
 			),
-			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, Vec::new(), Arc::clone(&logger)),
+			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, spec.mempool, Arc::clone(&logger)),
+			script_history: ActionChain::new(
+				"script_history",
+				SCRIPT_HISTORY_BUDGET,
+				Vec::new(),
+				Arc::clone(&logger),
+			),
 			utxo: None,
 		};
 		let layer = ChainLayer::new(
@@ -1024,6 +1219,43 @@ mod tests {
 		);
 
 		Harness { layer, wallet, broadcaster }
+	}
+
+	fn as_broadcast(adapters: &[Arc<FakeBroadcast>]) -> Vec<Arc<dyn BroadcastAction>> {
+		adapters.iter().map(|a| Arc::clone(a) as Arc<dyn BroadcastAction>).collect()
+	}
+
+	fn as_mempool(adapters: &[Arc<FakeMempool>]) -> Vec<Arc<dyn MempoolAction>> {
+		adapters.iter().map(|a| Arc::clone(a) as Arc<dyn MempoolAction>).collect()
+	}
+
+	fn harness(adapters: &[Arc<FakeBroadcast>], tracks_own_broadcasts: bool) -> Harness {
+		build(HarnessSpec {
+			broadcast: as_broadcast(adapters),
+			tracks_own_broadcasts,
+			..HarnessSpec::default()
+		})
+	}
+
+	/// A harness over an existing wallet, so a test can fund a wallet once and
+	/// then run different chains against it.
+	fn harness_with_wallet(
+		adapters: &[Arc<FakeBroadcast>], tracks_own_broadcasts: bool, wallet: Arc<Wallet>,
+	) -> Harness {
+		build(HarnessSpec {
+			broadcast: as_broadcast(adapters),
+			tracks_own_broadcasts,
+			wallet: Some(wallet),
+			..HarnessSpec::default()
+		})
+	}
+
+	fn mempool_harness(adapters: &[Arc<FakeMempool>], serves_mempool: bool) -> Harness {
+		build(HarnessSpec {
+			mempool: as_mempool(adapters),
+			serves_mempool,
+			..HarnessSpec::default()
+		})
 	}
 
 	fn someone_elses_script() -> ScriptBuf {
@@ -1229,43 +1461,106 @@ mod tests {
 		);
 	}
 
-	/// A harness over an existing wallet, so a test can fund a wallet once and
-	/// then run different chains against it.
-	fn harness_with_wallet(
-		adapters: &[Arc<FakeBroadcast>], tracks_own_broadcasts: bool, wallet: Arc<Wallet>,
-	) -> Harness {
-		let logger = Arc::new(Logger::new_log_facade());
-		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
-		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
-		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
-		let engine = Arc::new(FakeEngine { wallet: Arc::clone(&wallet), tracks_own_broadcasts });
-		let slots = ChainSlots {
-			fee: ActionChain::new("fee", FEE_BUDGET, Vec::new(), Arc::clone(&logger)),
-			#[cfg(feature = "swaps")]
-			tx_status: ActionChain::new(
-				"tx_status",
-				TX_STATUS_BUDGET,
-				Vec::new(),
-				Arc::clone(&logger),
-			),
-			broadcast: ActionChain::new(
-				"broadcast",
-				BROADCAST_BUDGET,
-				adapters.iter().map(|a| Arc::clone(a) as Arc<dyn BroadcastAction>).collect(),
-				Arc::clone(&logger),
-			),
-			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, Vec::new(), Arc::clone(&logger)),
-			utxo: None,
-		};
-		let layer = ChainLayer::new(
-			slots,
-			engine,
-			fee_estimator,
-			Arc::clone(&broadcaster),
-			kv_store,
-			logger,
-			Arc::new(RwLock::new(NodeMetrics::default())),
+	/// N4: the MEMPOOL chain hands an answer back as its adapter produced it —
+	/// anchored to the adapter's tip, tagged with the adapter — and an empty
+	/// chain is `Unavailable`, which is what every engine with one relies on
+	/// by never asking.
+	#[tokio::test]
+	async fn mempool_answer_comes_through_the_chain_anchored_and_attributed() {
+		let tip = BlockId { height: 7, hash: BlockHash::from_byte_array([7u8; 32]) };
+		let tx = unrelated(1);
+		let fake = FakeMempool::new(
+			"fake",
+			MempoolBehaviour::Answer { unconfirmed: vec![tx.clone()], tip: Some(tip) },
 		);
-		Harness { layer, wallet, broadcaster }
+		let h = mempool_harness(&[Arc::clone(&fake)], true);
+		let known = Txid::from_byte_array([3u8; 32]);
+		let query = MempoolQuery {
+			scripts: vec![someone_elses_script()],
+			known_unconfirmed: vec![known],
+			scope: MempoolScope::Incremental { best_processed_height: 6 },
+		};
+
+		let answered = h.layer.mempool(&query).await.unwrap();
+
+		assert_eq!(answered.by, "fake");
+		assert_eq!(answered.value.tip, Some(tip));
+		assert_eq!(answered.value.value.unconfirmed, vec![(tx, 1)]);
+		assert_eq!(answered.value.value.evicted, vec![(known, 2)]);
+		assert_eq!(fake.queries(), vec![query.clone()], "the query reaches the adapter as asked");
+
+		let h = mempool_harness(&[], true);
+		let err = h.layer.mempool(&query).await.unwrap_err();
+		assert!(matches!(err, ChainActionError::Unavailable { timed_out: false, .. }), "{}", err);
+	}
+
+	/// N4: serving is refused unless this node observes a mempool itself —
+	/// never forwarded — and fails, rather than answering, when the chain
+	/// cannot answer or has no tip to anchor at. A served question is asked
+	/// in `Complete` scope, so it never advances the poll loop's memory.
+	#[tokio::test]
+	async fn serve_mempool_refuses_without_local_mempool() {
+		let tip = BlockId { height: 7, hash: BlockHash::from_byte_array([7u8; 32]) };
+		let tx = unrelated(1);
+		let known = Txid::from_byte_array([3u8; 32]);
+		let req = WireMempoolRequest {
+			version: CHAIN_WIRE_VERSION,
+			spks: vec![script_to_wire(&someone_elses_script())],
+			known_unconfirmed: vec![txid_to_wire(&known)],
+		};
+
+		// No adapter at all: a transaction-based engine.
+		let h = mempool_harness(&[], false);
+		assert!(matches!(h.layer.serve_mempool(&req).await, Err(Error::ChainServeUnsupported)));
+
+		// An adapter, but an engine that does not observe a mempool itself:
+		// the Dependent shape, whose adapter would forward.
+		let forwarding = FakeMempool::new(
+			"forwarding",
+			MempoolBehaviour::Answer { unconfirmed: vec![tx.clone()], tip: Some(tip) },
+		);
+		let h = mempool_harness(&[Arc::clone(&forwarding)], false);
+		assert!(matches!(h.layer.serve_mempool(&req).await, Err(Error::ChainServeUnsupported)));
+		assert!(forwarding.queries().is_empty(), "a refused question is never asked");
+
+		// A local mempool that cannot answer: an error, never an empty answer.
+		let down = FakeMempool::new("down", MempoolBehaviour::Unavailable);
+		let h = mempool_harness(&[down], true);
+		assert!(matches!(h.layer.serve_mempool(&req).await, Err(Error::ChainServeFailed)));
+
+		// A local mempool read before the engine has synced to any tip.
+		let untipped = FakeMempool::new(
+			"untipped",
+			MempoolBehaviour::Answer { unconfirmed: vec![tx.clone()], tip: None },
+		);
+		let h = mempool_harness(&[untipped], true);
+		assert!(matches!(h.layer.serve_mempool(&req).await, Err(Error::ChainServeFailed)));
+
+		// A malformed request is failed, not answered.
+		let local = FakeMempool::new(
+			"local",
+			MempoolBehaviour::Answer { unconfirmed: vec![tx.clone()], tip: Some(tip) },
+		);
+		let h = mempool_harness(&[Arc::clone(&local)], true);
+		let mut stale = req.clone();
+		stale.version += 1;
+		assert!(matches!(h.layer.serve_mempool(&stale).await, Err(Error::ChainServeFailed)));
+		assert!(local.queries().is_empty());
+
+		// The one shape that serves.
+		let resp = h.layer.serve_mempool(&req).await.unwrap();
+		assert_eq!(resp.version, CHAIN_WIRE_VERSION);
+		assert_eq!(resp.tip.height, 7);
+		assert_eq!(resp.tip.hash, tip.hash.to_string());
+		assert_eq!(resp.unconfirmed.len(), 1);
+		assert_eq!(resp.unconfirmed[0].tx_hex, tx_to_wire(&tx));
+		assert_eq!(resp.unconfirmed[0].seen_at, 1);
+		assert_eq!(resp.evicted, vec![txid_to_wire(&known)]);
+
+		let asked = local.queries();
+		assert_eq!(asked.len(), 1);
+		assert_eq!(asked[0].scope, MempoolScope::Complete);
+		assert_eq!(asked[0].scripts, vec![someone_elses_script()]);
+		assert_eq!(asked[0].known_unconfirmed, vec![known]);
 	}
 }

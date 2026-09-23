@@ -16,8 +16,10 @@
 //! ```text
 //!   node-app-ldk-node          ldk-node
 //!   ─────────────────          ────────
-//!   impl ChainDataProvider  ->  DependentChainAdapter   fills FEE/LOOKUP/BROADCAST
-//!     core.network.send         DependentSyncEngine     fills the sync axis
+//!   impl ChainDataProvider  ->  DependentChainAdapter   fills FEE/LOOKUP/BROADCAST,
+//!     core.network.send                                 and MEMPOOL/SCRIPT_HISTORY
+//!                                                       for a hybrid node
+//!                               DependentSyncEngine     fills the sync axis
 //! ```
 //!
 //! # Why the wire types live here
@@ -224,6 +226,62 @@ pub struct WireTxStatusResponse {
 	/// consumer can compute depth itself rather than trusting a count that
 	/// might have been derived against a different tip.
 	pub tip_height: Option<u32>,
+	/// Hash of that tip, hex, when the serving node's lookup reported the tip
+	/// it derived the answer against — so a consumer that follows the chain
+	/// itself can check the answer was taken on its chain. Absent from
+	/// serving nodes whose lookup reports no tip, and from answers written
+	/// before the field existed; a consumer must not require it.
+	#[serde(default)]
+	pub tip_hash: Option<String>,
+}
+
+// ── MEMPOOL ──────────────────────────────────────────────────────────────────
+
+/// "Here is what I watch and what I already hold unconfirmed — what is in
+/// your mempool for me, and which of mine has left it?"
+///
+/// Asked by a node that has no mempool view of its own — a block-filter
+/// node — of one that does. The serving node holds no per-peer state and
+/// answers completely every time; the asker applies the answer
+/// idempotently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireMempoolRequest {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Scripts the asker watches, hex. The answer is filtered to
+	/// transactions paying one of them, plus those below.
+	pub spks: Vec<String>,
+	/// Txids, hex, the asker holds as unconfirmed. The answer reports which
+	/// of them the serving node's mempool no longer holds, and includes any
+	/// transaction that spends one of them — a replacement, or a child.
+	pub known_unconfirmed: Vec<String>,
+}
+
+/// One unconfirmed transaction and when the serving node first saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireUnconfirmedTx {
+	/// Consensus-encoded transaction, hex.
+	pub tx_hex: String,
+	/// Unix timestamp at which the serving node's mempool first saw it.
+	pub seen_at: u64,
+}
+
+/// What the serving node's mempool holds for the asker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireMempoolResponse {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// The serving node's chain tip the mempool was read against. Required:
+	/// an asker that follows the chain itself must be able to tell an answer
+	/// taken on its chain from one taken on a fork.
+	pub tip: WireBlockId,
+	/// Relevant unconfirmed transactions, each with its first-seen time.
+	pub unconfirmed: Vec<WireUnconfirmedTx>,
+	/// Those of `known_unconfirmed` the serving node's mempool no longer
+	/// holds, hex txids. No time is carried: the asker stamps the moment it
+	/// learned of the eviction on its own clock, as it does for
+	/// [`WireSyncRequest::start_time`].
+	pub evicted: Vec<String>,
 }
 
 // ── ON-CHAIN WALLET SYNC ─────────────────────────────────────────────────────
@@ -422,4 +480,16 @@ pub trait ChainDataProvider: Send + Sync {
 	async fn lightning_sync(
 		&self, req: WireLightningSyncRequest,
 	) -> Result<WireLightningSyncResponse, ChainProviderError>;
+
+	/// The serving node's mempool, for the asker's scripts and transactions.
+	///
+	/// Added after the port shipped, so it has a body: an implementation
+	/// that predates it refuses, which the asking side treats as "could not
+	/// use this provider" and moves on from, never as an answer. An
+	/// implementation that carries the route overrides it.
+	async fn mempool(
+		&self, _req: WireMempoolRequest,
+	) -> Result<WireMempoolResponse, ChainProviderError> {
+		Err(ChainProviderError::Refused("unsupported".into()))
+	}
 }

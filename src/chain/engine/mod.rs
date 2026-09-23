@@ -194,6 +194,19 @@ pub(crate) trait SyncEngine: Send + Sync {
 		None
 	}
 
+	/// Whether this node's MEMPOOL chain answers from a mempool this node
+	/// observes itself, so [`ChainLayer::serve_mempool`] may answer other
+	/// nodes from it.
+	///
+	/// Defaults to refusing, for the reason [`SyncEngine::serve_wallet_sync`]
+	/// does: a chain filled from a provider would forward another node's
+	/// question to a third node. Only the block-polling engine, whose chain
+	/// is its own bitcoind, answers `true`; a transaction-based engine's
+	/// chain is empty and a Dependent node's is its provider.
+	fn serves_mempool(&self) -> bool {
+		false
+	}
+
 	/// `Filter` registration. Transaction-based engines must watch these;
 	/// block-polling engines see every block anyway and ignore them.
 	fn register_tx(&self, _txid: &Txid, _script_pubkey: &Script) {}

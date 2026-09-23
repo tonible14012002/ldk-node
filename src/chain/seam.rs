@@ -69,8 +69,9 @@
 //! * **A chain of length one is legal.** That is how "no fallback" is spelled.
 //!   An empty chain is legal to construct and always `Unavailable`.
 //!
-//! FEE, BROADCAST, TX_STATUS and MEMPOOL run on chains; SCRIPT_HISTORY
-//! follows.
+//! Every action slot runs on a chain. SCRIPT_HISTORY is empty in every
+//! preset today: the adapter that can fill it exists, and the presets that
+//! will are the hybrid ones.
 //!
 //! # MEMPOOL answers in one of two scopes
 //!
@@ -140,9 +141,7 @@ pub(crate) enum FeeUpdate {
 //
 // Everything below is the per-action shape of the seam: one result type, one
 // trait per action, and the combinator that runs an ordered adapter chain
-// under a budget. FEE, BROADCAST, TX_STATUS and MEMPOOL are wired into
-// `ChainLayer`; the items belonging to slots not yet moved carry `dead_code`
-// allowances that are removed as each slot lands.
+// under a budget.
 
 /// Default budget for a FEE adapter that declares none of its own.
 pub(crate) const FEE_BUDGET: Duration = Duration::from_secs(5);
@@ -154,7 +153,6 @@ pub(crate) const TX_STATUS_BUDGET: Duration = Duration::from_secs(10);
 /// Default budget for a MEMPOOL adapter that declares none of its own.
 pub(crate) const MEMPOOL_BUDGET: Duration = Duration::from_secs(30);
 /// Default budget for a SCRIPT_HISTORY adapter that declares none of its own.
-#[allow(dead_code)] // consumed once the SCRIPT_HISTORY slot runs on an `ActionChain`
 pub(crate) const SCRIPT_HISTORY_BUDGET: Duration = Duration::from_secs(90);
 
 /// Headroom an adapter adds above the timeout its backend already enforces
@@ -466,7 +464,6 @@ pub(crate) enum MempoolScope {
 	/// depends on: the two askers share the adapter, and a served answer
 	/// that moved the poll loop's watermark would hide transactions from the
 	/// local wallet for good.
-	#[allow(dead_code)] // constructed by the serving path once it lands
 	Complete,
 }
 
@@ -539,7 +536,6 @@ pub(crate) trait MempoolAction: Send + Sync {
 
 /// SCRIPT_HISTORY — the wide wallet scan, phrased on the wire type because
 /// BDK's own request holds a closure and cannot be handed to a remote adapter.
-#[allow(dead_code)] // consumed once the SCRIPT_HISTORY slot runs on an `ActionChain`
 #[async_trait]
 pub(crate) trait ScriptHistoryAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
@@ -552,6 +548,9 @@ pub(crate) trait ScriptHistoryAction: Send + Sync {
 		None
 	}
 
+	/// Run the scan `req` describes; the answer is [`Anchored`] to the
+	/// update's checkpoint tip when the scan produced one.
+	#[allow(dead_code)] // run once a hybrid preset fills the chain and its engine asks
 	async fn script_history(
 		&self, req: WireSyncRequest,
 	) -> ActionResult<Anchored<bdk_wallet::Update>>;
@@ -634,7 +633,6 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 	/// Whether the slot has no adapter at all — legal, and always
 	/// `Unavailable`. Cheaper than running the chain to find out, for a
 	/// caller that must not log an exhausted chain every tick.
-	#[allow(dead_code)] // read by the serving path once it lands
 	pub(crate) fn is_empty(&self) -> bool {
 		self.adapters.is_empty()
 	}

@@ -26,23 +26,28 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{FeeRate, Transaction};
 
-use crate::chain::provider::{ChainDataProvider, WireBroadcastRequest, CHAIN_WIRE_VERSION};
-use crate::chain::seam::{
-	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
-	FeeUpdate, TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, MAX_BROADCAST_PACKAGE_TXS,
+use crate::chain::provider::{
+	ChainDataProvider, WireBroadcastRequest, WireSyncRequest, CHAIN_WIRE_VERSION,
 };
-use crate::chain::wire_convert::{check_version, tx_to_wire};
+use crate::chain::seam::{
+	package_result, ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError,
+	FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, ScriptHistoryAction,
+	TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, MAX_BROADCAST_PACKAGE_TXS,
+};
+use crate::chain::wire_convert::{
+	check_version, mempool_query_to_wire, tx_to_wire, wire_to_mempool_answer, wire_update_to_bdk,
+};
 use crate::fee_estimator::{apply_post_estimation_adjustments, conf_target_from_wire_name};
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
 
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusRequest;
 #[cfg(feature = "swaps")]
-use crate::chain::seam::{Anchored, TxStatusAction};
+use crate::chain::seam::TxStatusAction;
 #[cfg(feature = "swaps")]
 use crate::chain::wire_convert::{script_to_wire, txid_to_wire};
 #[cfg(feature = "swaps")]
@@ -83,7 +88,19 @@ const DEPENDENT_BROADCAST_BUDGET: Duration =
 #[cfg(feature = "swaps")]
 const DEPENDENT_TX_STATUS_BUDGET: Duration = DEPENDENT_CALL_BUDGET;
 
-/// Fills the FEE, TX_STATUS and BROADCAST slots from a remote node.
+/// MEMPOOL budget: one provider call, which answers completely and
+/// filtered, so its size is the asker's own transactions, not the mempool.
+const DEPENDENT_MEMPOOL_BUDGET: Duration = DEPENDENT_CALL_BUDGET;
+
+/// SCRIPT_HISTORY budget: one provider call. The serving node runs a real
+/// scan behind it, which is the heaviest thing a provider does, but the app
+/// bounds the call at its ceiling regardless — as it does for the Dependent
+/// engine's own wallet sync, which is the same route.
+const DEPENDENT_SCRIPT_HISTORY_BUDGET: Duration = DEPENDENT_CALL_BUDGET;
+
+/// Fills the FEE, TX_STATUS and BROADCAST slots from a remote node, and the
+/// MEMPOOL and SCRIPT_HISTORY slots of a hybrid node that follows the chain
+/// itself but has no mempool and no script index to scan.
 pub(crate) struct DependentChainAdapter {
 	provider: Arc<dyn ChainDataProvider>,
 	logger: Arc<Logger>,
@@ -312,9 +329,153 @@ impl TxStatusAction for DependentChainAdapter {
 	}
 }
 
+/// The provider answers completely every time, whatever scope the query
+/// asks — it remembers nothing about this node — and the answer is anchored
+/// to the tip it reports, which a hybrid node checks against its own chain.
+#[async_trait]
+impl MempoolAction for DependentChainAdapter {
+	fn name(&self) -> &'static str {
+		"dependent"
+	}
+
+	fn budget(&self) -> Option<Duration> {
+		Some(DEPENDENT_MEMPOOL_BUDGET)
+	}
+
+	async fn mempool(&self, query: &MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>> {
+		let req = mempool_query_to_wire(query);
+		let resp = self.provider.mempool(req).await.map_err(|e| {
+			log_error!(self.logger, "Chain provider could not answer a mempool question: {}", e);
+			ChainActionError::from(e)
+		})?;
+
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let (answer, tip) = wire_to_mempool_answer(&resp, now).map_err(|e| {
+			log_error!(self.logger, "Chain provider returned an unusable mempool answer: {}", e);
+			ChainActionError::unavailable(e.to_string())
+		})?;
+		Ok(Anchored { value: answer, tip: Some(tip) })
+	}
+}
+
+/// The wide scan, run on the provider: the same route the Dependent engine's
+/// own wallet sync takes, phrased on the wire request the engine already
+/// builds with [`sync_request_to_wire`] and
+/// [`full_scan_request_batch_to_wire`].
+///
+/// The request carries scripts only, so the update's `last_active_indices`
+/// is empty: which keys the scripts came from is the asking wallet's own
+/// knowledge, and the caller that owns the wallet derives the indices from
+/// the returned transactions and its `revealed_spk_index`, as the engine
+/// does. The answer is anchored to the update's checkpoint tip, if the scan
+/// produced one.
+///
+/// [`sync_request_to_wire`]: crate::chain::wire_convert::sync_request_to_wire
+/// [`full_scan_request_batch_to_wire`]: crate::chain::wire_convert::full_scan_request_batch_to_wire
+#[async_trait]
+impl ScriptHistoryAction for DependentChainAdapter {
+	fn name(&self) -> &'static str {
+		"dependent"
+	}
+
+	fn budget(&self) -> Option<Duration> {
+		Some(DEPENDENT_SCRIPT_HISTORY_BUDGET)
+	}
+
+	async fn script_history(
+		&self, req: WireSyncRequest,
+	) -> ActionResult<Anchored<bdk_wallet::Update>> {
+		let spk_count = req.spks.len();
+		let wire_update = self.provider.wallet_sync(req).await.map_err(|e| {
+			log_error!(
+				self.logger,
+				"Chain provider could not scan {} scripts' history: {}",
+				spk_count,
+				e
+			);
+			ChainActionError::from(e)
+		})?;
+
+		let update = wire_update_to_bdk(&wire_update, &HashMap::new()).map_err(|e| {
+			log_error!(self.logger, "Chain provider returned an unusable update: {}", e);
+			ChainActionError::unavailable(e.to_string())
+		})?;
+		let tip = update.chain.as_ref().map(|checkpoint| checkpoint.block_id());
+		Ok(Anchored { value: update, tip })
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	use crate::chain::provider::{
+		ChainProviderError, WireFeeEstimates, WireLightningSyncRequest, WireLightningSyncResponse,
+		WireTxStatusRequest, WireTxStatusResponse, WireUpdate,
+	};
+	use crate::chain::seam::MempoolScope;
+	use crate::logger::Logger;
+
+	/// A provider built against the port as it shipped: it implements the
+	/// five original calls and inherits `mempool`'s refusing default.
+	struct OlderProvider;
+
+	#[async_trait]
+	impl ChainDataProvider for OlderProvider {
+		fn name(&self) -> String {
+			"older".into()
+		}
+
+		async fn fee_estimates(&self) -> Result<WireFeeEstimates, ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+
+		async fn broadcast(&self, _req: WireBroadcastRequest) -> Result<(), ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+
+		async fn tx_status(
+			&self, _req: WireTxStatusRequest,
+		) -> Result<WireTxStatusResponse, ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+
+		async fn wallet_sync(
+			&self, _req: WireSyncRequest,
+		) -> Result<WireUpdate, ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+
+		async fn lightning_sync(
+			&self, _req: WireLightningSyncRequest,
+		) -> Result<WireLightningSyncResponse, ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+	}
+
+	/// N4: a provider that does not carry the mempool route refuses, and the
+	/// adapter reports that as `Unavailable` — not timed out, and never an
+	/// empty mempool — so the chain advances past it.
+	#[tokio::test]
+	async fn dependent_mempool_maps_refused_to_unavailable() {
+		let adapter =
+			DependentChainAdapter::new(Arc::new(OlderProvider), Arc::new(Logger::new_log_facade()));
+		let query = MempoolQuery {
+			scripts: Vec::new(),
+			known_unconfirmed: Vec::new(),
+			scope: MempoolScope::Complete,
+		};
+
+		let err = adapter.mempool(&query).await.unwrap_err();
+
+		assert_eq!(
+			err,
+			ChainActionError::Unavailable {
+				reason: ChainProviderError::Refused("unsupported".into()).to_string(),
+				timed_out: false,
+			}
+		);
+	}
 
 	/// The budgets are the app's per-call ceiling plus the margin, so the
 	/// app's own timeout always fires first.
@@ -325,6 +486,8 @@ mod tests {
 		assert_eq!(DEPENDENT_FEE_BUDGET, Duration::from_secs(21));
 		assert_eq!(DEPENDENT_BROADCAST_BUDGET, Duration::from_secs(21 * MAX_BROADCAST_PACKAGE_TXS));
 		assert_eq!(DEPENDENT_BROADCAST_BUDGET, Duration::from_secs(525));
+		assert_eq!(DEPENDENT_MEMPOOL_BUDGET, Duration::from_secs(21));
+		assert_eq!(DEPENDENT_SCRIPT_HISTORY_BUDGET, Duration::from_secs(21));
 		#[cfg(feature = "swaps")]
 		{
 			assert!(DEPENDENT_TX_STATUS_BUDGET > app_ceiling);
