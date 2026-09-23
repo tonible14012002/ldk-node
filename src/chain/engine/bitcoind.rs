@@ -112,12 +112,13 @@ impl SyncEngine for BitcoindSyncEngine {
 
 		let mut locked_header_cache = header_cache.lock().await;
 		let chain_poller = ChainPoller::new(Arc::clone(&api_client), config.network);
-		let chain_listener = ChainListener {
-			onchain_wallet: Arc::clone(&onchain_wallet),
-			channel_manager: Arc::clone(&channel_manager),
+		let chain_listener = ChainListener::new(
+			Arc::clone(&onchain_wallet),
+			Arc::clone(&channel_manager),
 			chain_monitor,
 			output_sweeper,
-		};
+			Arc::clone(&logger),
+		);
 		let mut spv_client =
 			SpvClient::new(chain_tip, chain_poller, &mut *locked_header_cache, &chain_listener);
 

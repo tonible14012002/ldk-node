@@ -38,6 +38,10 @@ swaps = []
 # Gates the `Node::send_along_route` entry point; the `PaymentKind::Rebalance`
 # variant and its `event.rs` claim path stay ungated for TLV compatibility.
 cycles = []
+# BIP157/158 compact-block-filter chain source (T6 groundwork; the engine lands in T7).
+# Pulls in `bip157` (kyoto) and the tokio `net` feature its peer sockets need, so the
+# default build stays free of both.
+cbf = ["dep:bip157", "tokio/net"]
 
 [dependencies]
 lightning = { version = "0.1.0", features = ["std"] }
@@ -77,6 +81,7 @@ bdk_chain = { version = "0.23.0", default-features = false, features = ["std"] }
 bdk_esplora = { version = "0.22.0", default-features = false, features = ["async-https-rustls", "tokio"]}
 bdk_electrum = { version = "0.23.0", default-features = false, features = ["use-rustls"]}
 bdk_wallet = { version = "2.0.0", default-features = false, features = ["std", "keys-bip39"]}
+bip157 = { version = "0.6.3", default-features = false, optional = true }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Only to pick a crypto provider explicitly: rustls panics rather than guess
