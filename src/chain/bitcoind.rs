@@ -210,7 +210,7 @@ impl BitcoindClient {
 	async fn get_raw_transaction_rpc(
 		rpc_client: Arc<RpcClient>, txid: &Txid,
 	) -> std::io::Result<Option<Transaction>> {
-		let txid_hex = bitcoin::consensus::encode::serialize_hex(txid);
+		let txid_hex = txid_to_rpc_hex(txid);
 		let txid_json = serde_json::json!(txid_hex);
 		match rpc_client
 			.call_method::<GetRawTransactionResponse>("getrawtransaction", &[txid_json])
@@ -248,7 +248,7 @@ impl BitcoindClient {
 	async fn get_raw_transaction_rest(
 		rest_client: Arc<RestClient>, txid: &Txid,
 	) -> std::io::Result<Option<Transaction>> {
-		let txid_hex = bitcoin::consensus::encode::serialize_hex(txid);
+		let txid_hex = txid_to_rpc_hex(txid);
 		let tx_path = format!("tx/{}.json", txid_hex);
 		match rest_client
 			.request_resource::<JsonResponse, GetRawTransactionResponse>(&tx_path)
@@ -312,13 +312,12 @@ impl BitcoindClient {
 			BitcoindClient::Rpc { rpc_client, .. } => Arc::clone(rpc_client),
 			BitcoindClient::Rest { rpc_client, .. } => Arc::clone(rpc_client),
 		};
-		// `getrawtransaction` expects the txid in RPC/display (big-endian) order —
-		// exactly `Txid`'s `Display`. `consensus::encode::serialize_hex` emits the
-		// INTERNAL (little-endian) bytes, i.e. the REVERSED hex, which bitcoind rejects
-		// with -5 "No such transaction". That -5 is mapped to `Ok(None)` below, so the
-		// swap watcher would mistake EVERY confirmed opening tx for NotFound and never
-		// arm the confirmation/CSV ladder — wedging every swap on the bitcoind backend.
-		let txid_hex = txid.to_string();
+		// Display order, as every txid handed to Core must be (see
+		// [`txid_to_rpc_hex`]): the reversed hex is answered with -5, which is
+		// mapped to `Ok(None)` below, so the swap watcher would mistake EVERY
+		// confirmed opening tx for NotFound and never arm the confirmation/CSV
+		// ladder — wedging every swap on the bitcoind backend.
+		let txid_hex = txid_to_rpc_hex(txid);
 		let txid_json = serde_json::json!(txid_hex);
 		let verbose_json = serde_json::json!(true);
 		match rpc_client
@@ -405,7 +404,7 @@ impl BitcoindClient {
 	async fn get_mempool_entry_inner(
 		client: Arc<RpcClient>, txid: Txid,
 	) -> std::io::Result<Option<MempoolEntry>> {
-		let txid_hex = bitcoin::consensus::encode::serialize_hex(&txid);
+		let txid_hex = txid_to_rpc_hex(&txid);
 		let txid_json = serde_json::json!(txid_hex);
 
 		match client.call_method::<GetMempoolEntryResponse>("getmempoolentry", &[txid_json]).await {
@@ -544,15 +543,17 @@ impl BitcoindClient {
 	}
 
 	/// Which of `txids` the mempool no longer holds, as of the entries
-	/// cache's last refresh — a refresh [`Self::get_mempool_snapshot`] has
-	/// just done when the two are called together.
+	/// cache's last refresh — a refresh [`Self::get_mempool_snapshot`] and
+	/// [`Self::get_mempool_transactions_and_timestamp_at_height`] have each
+	/// just done when called together with this. The one definition of
+	/// "evicted" ([`txids_missing_from`]), whichever scope asks.
 	pub(crate) async fn txids_missing_from_mempool(&self, txids: &[Txid]) -> Vec<Txid> {
 		let mempool_entries_cache = match self {
 			BitcoindClient::Rpc { mempool_entries_cache, .. }
 			| BitcoindClient::Rest { mempool_entries_cache, .. } => mempool_entries_cache,
 		};
 		let mempool_entries_cache = mempool_entries_cache.lock().await;
-		txids.iter().copied().filter(|txid| !mempool_entries_cache.contains_key(txid)).collect()
+		txids_missing_from(&mempool_entries_cache, txids)
 	}
 
 	/// Get mempool transactions, alongside their first-seen unix timestamps.
@@ -658,45 +659,55 @@ impl BitcoindClient {
 
 	// Retrieve a list of Txids that have been evicted from the mempool.
 	//
-	// To this end, we first update our local mempool_entries_cache and then return all unconfirmed
-	// wallet `Txid`s that don't appear in the mempool still.
+	// The poll this follows has just refreshed the local mempool_entries_cache, so
+	// every unconfirmed wallet `Txid` the cache lacks is one the mempool no longer
+	// holds. Each is stamped with the poll's watermark — the latest mempool time
+	// seen — as the time it was last seen absent.
 	async fn get_evicted_mempool_txids_and_timestamp(
 		&self, unconfirmed_txids: Vec<Txid>,
 	) -> std::io::Result<Vec<(Txid, u64)>> {
-		match self {
-			BitcoindClient::Rpc { latest_mempool_timestamp, mempool_entries_cache, .. } => {
-				Self::get_evicted_mempool_txids_and_timestamp_inner(
-					latest_mempool_timestamp,
-					mempool_entries_cache,
-					unconfirmed_txids,
-				)
-				.await
-			},
-			BitcoindClient::Rest { latest_mempool_timestamp, mempool_entries_cache, .. } => {
-				Self::get_evicted_mempool_txids_and_timestamp_inner(
-					latest_mempool_timestamp,
-					mempool_entries_cache,
-					unconfirmed_txids,
-				)
-				.await
-			},
+		let latest_mempool_timestamp = match self {
+			BitcoindClient::Rpc { latest_mempool_timestamp, .. }
+			| BitcoindClient::Rest { latest_mempool_timestamp, .. } => latest_mempool_timestamp,
 		}
-	}
-
-	async fn get_evicted_mempool_txids_and_timestamp_inner(
-		latest_mempool_timestamp: &AtomicU64,
-		mempool_entries_cache: &tokio::sync::Mutex<HashMap<Txid, MempoolEntry>>,
-		unconfirmed_txids: Vec<Txid>,
-	) -> std::io::Result<Vec<(Txid, u64)>> {
-		let latest_mempool_timestamp = latest_mempool_timestamp.load(Ordering::Relaxed);
-		let mempool_entries_cache = mempool_entries_cache.lock().await;
-		let evicted_txids = unconfirmed_txids
+		.load(Ordering::Relaxed);
+		let evicted_txids = self
+			.txids_missing_from_mempool(&unconfirmed_txids)
+			.await
 			.into_iter()
-			.filter(|txid| mempool_entries_cache.contains_key(txid))
 			.map(|txid| (txid, latest_mempool_timestamp))
 			.collect();
 		Ok(evicted_txids)
 	}
+}
+
+/// Which of `txids` `mempool_entries` — the entries cache, as of its last
+/// refresh — does not contain: the one definition of "evicted" for both the
+/// wallet's incremental poll and the snapshot served to another node. A txid
+/// the cache still holds is in the mempool, not evicted; the pre-seam filter
+/// had this inverted, reporting exactly the transactions that were still
+/// there, and never a real eviction (upstream ldk-node 3fe4f2f).
+fn txids_missing_from(mempool_entries: &HashMap<Txid, MempoolEntry>, txids: &[Txid]) -> Vec<Txid> {
+	txids.iter().copied().filter(|txid| !mempool_entries.contains_key(txid)).collect()
+}
+
+/// A txid as Bitcoin Core's RPC and REST interfaces speak it: display order,
+/// the byte-reversed hex `Txid`'s `Display` prints — never consensus byte
+/// order. `consensus::encode::serialize_hex` emits the internal bytes, i.e.
+/// the reversed string, which Core answers with -5 "No such mempool or
+/// blockchain transaction" (RPC) or 404 (REST).
+fn txid_to_rpc_hex(txid: &Txid) -> String {
+	txid.to_string()
+}
+
+/// A txid as Bitcoin Core's RPC and REST interfaces return it: the inverse
+/// of [`txid_to_rpc_hex`]. `consensus::encode::deserialize_hex` would read
+/// the display-order string as internal bytes and yield the byte-reversed
+/// txid — one that happens to round-trip back to Core through the matching
+/// encode mistake, but never equals a `Txid` computed from a transaction, so
+/// a cache keyed by it never contains the wallet's own transactions.
+fn txid_from_rpc_hex(hex: &str) -> Option<Txid> {
+	hex.parse::<Txid>().ok()
 }
 
 impl BlockSource for BitcoindClient {
@@ -834,9 +845,9 @@ impl TryInto<GetRawMempoolResponse> for JsonResponse {
 
 		for hex in res {
 			let txid = if let Some(hex_str) = hex.as_str() {
-				match bitcoin::consensus::encode::deserialize_hex(hex_str) {
-					Ok(txid) => txid,
-					Err(_) => {
+				match txid_from_rpc_hex(hex_str) {
+					Some(txid) => txid,
+					None => {
 						return Err(std::io::Error::new(
 							std::io::ErrorKind::Other,
 							"Failed to parse getrawmempool response",
@@ -1003,5 +1014,71 @@ impl std::fmt::Display for HttpError {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 		let contents = String::from_utf8_lossy(&self.contents);
 		write!(f, "status_code: {}, contents: {}", self.status_code, contents)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use bitcoin::hashes::Hash;
+
+	fn txid(seed: u8) -> Txid {
+		Txid::from_byte_array([seed; 32])
+	}
+
+	fn entry(txid: Txid) -> MempoolEntry {
+		MempoolEntry { txid, time: 1_700_000_000, height: 100 }
+	}
+
+	/// Core speaks txids in display order. The consensus codec is the
+	/// byte-reversed string: encoding with it asks Core about a txid that
+	/// does not exist, and decoding with it yields a txid that is not the
+	/// transaction's — the two mistakes cancel over the wire and leave every
+	/// cache keyed by a txid nothing else in the node will ever look up.
+	#[test]
+	fn rpc_txid_hex_is_display_order_and_round_trips() {
+		let mut bytes = [0u8; 32];
+		for (i, b) in bytes.iter_mut().enumerate() {
+			*b = i as u8;
+		}
+		let id = Txid::from_byte_array(bytes);
+
+		let hex = txid_to_rpc_hex(&id);
+		assert_eq!(hex, id.to_string());
+		assert_eq!(txid_from_rpc_hex(&hex), Some(id), "round-trips through Core's own format");
+
+		let consensus_hex = bitcoin::consensus::encode::serialize_hex(&id);
+		assert_ne!(hex, consensus_hex, "the consensus codec is the reversed string");
+		let misread: Txid = bitcoin::consensus::encode::deserialize_hex(&hex).unwrap();
+		assert_ne!(misread, id, "decoding Core's string as consensus bytes is not the txid");
+		assert_eq!(
+			bitcoin::consensus::encode::serialize_hex(&misread),
+			hex,
+			"which is why the two mistakes used to cancel on the way back to Core"
+		);
+
+		assert_eq!(txid_from_rpc_hex("not hex"), None);
+		assert_eq!(txid_from_rpc_hex(&hex[..10]), None, "a short string is not a txid");
+	}
+
+	/// Evicted is what the entries cache lacks — not what it holds.
+	#[test]
+	fn evicted_is_what_the_entries_cache_lacks() {
+		let (still_there, gone, also_gone) = (txid(1), txid(2), txid(3));
+		let mut cache = HashMap::new();
+		cache.insert(still_there, entry(still_there));
+
+		assert_eq!(
+			txids_missing_from(&cache, &[still_there, gone, also_gone]),
+			vec![gone, also_gone]
+		);
+		assert_eq!(txids_missing_from(&cache, &[still_there]), Vec::<Txid>::new());
+		assert_eq!(txids_missing_from(&cache, &[]), Vec::<Txid>::new());
+		assert_eq!(
+			txids_missing_from(&HashMap::new(), &[still_there, gone]),
+			vec![still_there, gone],
+			"an empty mempool has evicted everything the wallet still holds"
+		);
 	}
 }
