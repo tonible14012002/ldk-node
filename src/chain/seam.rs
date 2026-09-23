@@ -69,8 +69,17 @@
 //! * **A chain of length one is legal.** That is how "no fallback" is spelled.
 //!   An empty chain is legal to construct and always `Unavailable`.
 //!
-//! FEE, BROADCAST and TX_STATUS run on chains; MEMPOOL and SCRIPT_HISTORY
-//! follow.
+//! FEE, BROADCAST, TX_STATUS and MEMPOOL run on chains; SCRIPT_HISTORY
+//! follows.
+//!
+//! # MEMPOOL answers in one of two scopes
+//!
+//! A poll loop wants only what changed since the last answer, because its
+//! asker keeps everything it was told and re-applying a whole mempool every
+//! tick is pure cost. A question asked on behalf of another node wants
+//! everything relevant, because nothing is remembered about that node. The
+//! [`MempoolQuery`] says which ([`MempoolScope`]); an adapter that keeps no
+//! per-asker memory answers everything either way, which is also correct.
 //!
 //! # BROADCAST is package-shaped
 //!
@@ -131,9 +140,9 @@ pub(crate) enum FeeUpdate {
 //
 // Everything below is the per-action shape of the seam: one result type, one
 // trait per action, and the combinator that runs an ordered adapter chain
-// under a budget. FEE, BROADCAST and TX_STATUS are wired into `ChainLayer`;
-// the items belonging to slots not yet moved carry `dead_code` allowances
-// that are removed as each slot lands.
+// under a budget. FEE, BROADCAST, TX_STATUS and MEMPOOL are wired into
+// `ChainLayer`; the items belonging to slots not yet moved carry `dead_code`
+// allowances that are removed as each slot lands.
 
 /// Default budget for a FEE adapter that declares none of its own.
 pub(crate) const FEE_BUDGET: Duration = Duration::from_secs(5);
@@ -143,7 +152,6 @@ pub(crate) const BROADCAST_BUDGET: Duration = Duration::from_secs(15);
 #[cfg(feature = "swaps")]
 pub(crate) const TX_STATUS_BUDGET: Duration = Duration::from_secs(10);
 /// Default budget for a MEMPOOL adapter that declares none of its own.
-#[allow(dead_code)] // consumed once the MEMPOOL slot runs on an `ActionChain`
 pub(crate) const MEMPOOL_BUDGET: Duration = Duration::from_secs(30);
 /// Default budget for a SCRIPT_HISTORY adapter that declares none of its own.
 #[allow(dead_code)] // consumed once the SCRIPT_HISTORY slot runs on an `ActionChain`
@@ -349,9 +357,6 @@ pub(crate) type ActionResult<T, R = String> = Result<T, ChainActionError<R>>;
 /// not consider best: a provider's `tip` that is not on our chain makes the
 /// answer `Unavailable` and the chain advances. `None` means the adapter has
 /// no notion of a tip to report (a fee cache, for instance).
-// Without `swaps` only MEMPOOL and SCRIPT_HISTORY carry a tip, and neither
-// runs on a chain yet.
-#[cfg_attr(not(feature = "swaps"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Anchored<T> {
 	pub value: T,
@@ -441,21 +446,70 @@ pub(crate) trait TxStatusAction: Send + Sync {
 	) -> ActionResult<Anchored<RawTxObservation>>;
 }
 
+/// How much of the mempool a [`MempoolQuery`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MempoolScope {
+	/// What changed since this adapter last answered this node — the shape
+	/// of a poll loop, whose asker keeps everything it was told. An adapter
+	/// with a memory of what it answered advances that memory; one without
+	/// answers everything, which the asker applies idempotently.
+	Incremental {
+		/// The asker's best processed height. An adapter that remembers what
+		/// it answered may skip a transaction it already answered once the
+		/// asker has processed the block it entered the mempool at, because
+		/// the asker then holds every ancestor the transaction depends on.
+		best_processed_height: u32,
+	},
+	/// Everything relevant, whatever was answered before — the shape of a
+	/// question asked on behalf of another node, about which nothing is
+	/// remembered. Must not advance any memory an `Incremental` asker
+	/// depends on: the two askers share the adapter, and a served answer
+	/// that moved the poll loop's watermark would hide transactions from the
+	/// local wallet for good.
+	#[allow(dead_code)] // constructed by the serving path once it lands
+	Complete,
+}
+
 /// What the wallet wants to know about the mempool.
-#[allow(dead_code)] // consumed once the MEMPOOL slot runs on an `ActionChain`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MempoolQuery {
-	/// Scripts the wallet watches.
+	/// Scripts the asker watches. A `Complete` answer is filtered to these;
+	/// an `Incremental` one may over-answer, because the asker filters on
+	/// apply and the adapter's own memory is what keeps it cheap.
 	pub scripts: Vec<ScriptBuf>,
-	/// Unconfirmed transactions the wallet already knows, so the adapter can
-	/// report evictions.
+	/// Unconfirmed transactions the asker already knows, so the adapter can
+	/// report evictions, and so a `Complete` answer includes their fate and
+	/// anything that spends them.
 	pub known_unconfirmed: Vec<Txid>,
-	/// The wallet's current height, so the adapter can bound its answer.
-	pub height_hint: u32,
+	/// How much of the mempool the answer must cover.
+	pub scope: MempoolScope,
+}
+
+impl MempoolQuery {
+	/// Whether `tx` concerns the asker: it pays one of the watched scripts,
+	/// it is one of the transactions the asker already knows, or it spends an
+	/// output of one of those (a replacement, or a child).
+	///
+	/// The rule a `Complete` answer is filtered by, shared so every adapter
+	/// answers the same question. Inputs are matched by parent txid only: the
+	/// asker's own unconfirmed transactions are the only outpoints it has
+	/// told us about, and a spend of a *confirmed* coin of the asker's pays no
+	/// watched script only if it sends everything elsewhere, which the
+	/// asker's own broadcast echo covers.
+	pub(crate) fn is_relevant(&self, tx: &Transaction) -> bool {
+		if tx.output.iter().any(|o| self.scripts.iter().any(|s| *s == o.script_pubkey)) {
+			return true;
+		}
+		if self.known_unconfirmed.is_empty() {
+			return false;
+		}
+		let txid = tx.compute_txid();
+		self.known_unconfirmed.contains(&txid)
+			|| tx.input.iter().any(|i| self.known_unconfirmed.contains(&i.previous_output.txid))
+	}
 }
 
 /// What the mempool said.
-#[allow(dead_code)] // consumed once the MEMPOOL slot runs on an `ActionChain`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MempoolAnswer {
 	/// Relevant unconfirmed transactions with the time they were first seen.
@@ -466,7 +520,6 @@ pub(crate) struct MempoolAnswer {
 }
 
 /// MEMPOOL — relevant unconfirmed transactions and evictions.
-#[allow(dead_code)] // consumed once the MEMPOOL slot runs on an `ActionChain`
 #[async_trait]
 pub(crate) trait MempoolAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
@@ -479,7 +532,9 @@ pub(crate) trait MempoolAction: Send + Sync {
 		None
 	}
 
-	async fn mempool(&self, query: MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>>;
+	/// Answer `query` in the scope it asks for, [`Anchored`] to the tip the
+	/// answer was taken at when the adapter knows one.
+	async fn mempool(&self, query: &MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>>;
 }
 
 /// SCRIPT_HISTORY — the wide wallet scan, phrased on the wire type because
@@ -576,7 +631,10 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 		*self.last_answered.lock().unwrap_or_else(|e| e.into_inner())
 	}
 
-	#[allow(dead_code)] // read once every slot runs on a chain
+	/// Whether the slot has no adapter at all — legal, and always
+	/// `Unavailable`. Cheaper than running the chain to find out, for a
+	/// caller that must not log an exhausted chain every tick.
+	#[allow(dead_code)] // read by the serving path once it lands
 	pub(crate) fn is_empty(&self) -> bool {
 		self.adapters.is_empty()
 	}

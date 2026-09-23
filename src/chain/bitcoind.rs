@@ -307,9 +307,7 @@ impl BitcoindClient {
 	/// - `Ok(None)` when the node does not know the tx (RPC error code -5),
 	/// - `Err(..)` for any transport/other failure, so the caller fails closed.
 	#[cfg(feature = "swaps")]
-	pub(crate) async fn swap_tx_confirmations(
-		&self, txid: &Txid,
-	) -> std::io::Result<Option<u32>> {
+	pub(crate) async fn swap_tx_confirmations(&self, txid: &Txid) -> std::io::Result<Option<u32>> {
 		let rpc_client = match self {
 			BitcoindClient::Rpc { rpc_client, .. } => Arc::clone(rpc_client),
 			BitcoindClient::Rest { rpc_client, .. } => Arc::clone(rpc_client),
@@ -488,6 +486,73 @@ impl BitcoindClient {
 			self.get_mempool_transactions_and_timestamp_at_height(best_processed_height).await?;
 		let evicted_txids = self.get_evicted_mempool_txids_and_timestamp(unconfirmed_txids).await?;
 		Ok((mempool_txs, evicted_txids))
+	}
+
+	/// Every transaction in the mempool that `relevant` accepts, with its
+	/// first-seen unix timestamp, as of now — the whole mempool, not what
+	/// changed since the last poll.
+	///
+	/// Shares the two caches with [`Self::get_updated_mempool_transactions`]
+	/// but never touches that poll's emit-once watermark
+	/// (`latest_mempool_timestamp`). The two are asked by different parties —
+	/// the poll by this node's own wallet, this by another node through the
+	/// serving path — and a snapshot that advanced the watermark would make
+	/// the next poll skip, as already emitted, transactions the local wallet
+	/// was never told about. The entries cache is refreshed first, so the
+	/// answer is as current as a poll's; a transaction fetched here is cached
+	/// for the poll, and vice versa, so the cost above a poll's is only the
+	/// walk of the entries cache and the clone of the accepted transactions.
+	/// `relevant` runs before the clone, because on mainnet the whole mempool
+	/// is far too large to hand out.
+	pub(crate) async fn get_mempool_snapshot(
+		&self, relevant: impl Fn(&Transaction) -> bool + Send,
+	) -> std::io::Result<Vec<(Transaction, u64)>> {
+		let (mempool_entries_cache, mempool_txs_cache) = match self {
+			BitcoindClient::Rpc { mempool_entries_cache, mempool_txs_cache, .. }
+			| BitcoindClient::Rest { mempool_entries_cache, mempool_txs_cache, .. } => {
+				(mempool_entries_cache, mempool_txs_cache)
+			},
+		};
+
+		self.update_mempool_entries_cache().await?;
+
+		// Same lock order as the poll: entries, then transactions.
+		let mempool_entries_cache = mempool_entries_cache.lock().await;
+		let mut mempool_txs_cache = mempool_txs_cache.lock().await;
+		mempool_txs_cache.retain(|txid, _| mempool_entries_cache.contains_key(txid));
+
+		let mut accepted = Vec::new();
+		for (txid, entry) in mempool_entries_cache.iter() {
+			if let Some((cached_tx, cached_time)) = mempool_txs_cache.get(txid) {
+				if relevant(cached_tx) {
+					accepted.push((cached_tx.clone(), *cached_time));
+				}
+				continue;
+			}
+
+			match self.get_raw_transaction(&entry.txid).await? {
+				Some(tx) => {
+					if relevant(&tx) {
+						accepted.push((tx.clone(), entry.time));
+					}
+					mempool_txs_cache.insert(entry.txid, (tx, entry.time));
+				},
+				None => continue,
+			}
+		}
+		Ok(accepted)
+	}
+
+	/// Which of `txids` the mempool no longer holds, as of the entries
+	/// cache's last refresh — a refresh [`Self::get_mempool_snapshot`] has
+	/// just done when the two are called together.
+	pub(crate) async fn txids_missing_from_mempool(&self, txids: &[Txid]) -> Vec<Txid> {
+		let mempool_entries_cache = match self {
+			BitcoindClient::Rpc { mempool_entries_cache, .. }
+			| BitcoindClient::Rest { mempool_entries_cache, .. } => mempool_entries_cache,
+		};
+		let mempool_entries_cache = mempool_entries_cache.lock().await;
+		txids.iter().copied().filter(|txid| !mempool_entries_cache.contains_key(txid)).collect()
 	}
 
 	/// Get mempool transactions, alongside their first-seen unix timestamps.

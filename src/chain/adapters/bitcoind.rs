@@ -9,9 +9,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{FeeRate, Network, Transaction};
+
+use bdk_chain::BlockId;
 
 use lightning::chain::chaininterface::ConfirmationTarget as LdkConfirmationTarget;
 use lightning::util::ser::Writeable;
@@ -23,8 +25,9 @@ use lightning_block_sync::rpc::RpcError;
 use crate::chain::adapters::classify_sendrawtransaction;
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
 use crate::chain::seam::{
-	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
-	FeeUpdate, TxBroadcastOutcome, UtxoCapability, UtxoVerification, ADAPTER_BUDGET_MARGIN,
+	package_result, ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError,
+	FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, MempoolScope,
+	TxBroadcastOutcome, UtxoCapability, UtxoVerification, ADAPTER_BUDGET_MARGIN,
 	PER_TX_BROADCAST_BUDGET,
 };
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
@@ -36,11 +39,9 @@ use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
 
 #[cfg(feature = "swaps")]
-use crate::chain::seam::{Anchored, TxStatusAction};
+use crate::chain::seam::TxStatusAction;
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
-#[cfg(feature = "swaps")]
-use bdk_chain::BlockId;
 #[cfg(feature = "swaps")]
 use bitcoin::{ScriptBuf, Txid};
 #[cfg(feature = "swaps")]
@@ -51,21 +52,17 @@ use async_trait::async_trait;
 /// `lightning_block_sync::http`'s `TCP_STREAM_TIMEOUT`: the connect timeout,
 /// and the read/write timeout it sets on the socket. Mirrored here because the
 /// crate keeps it private (lightning-block-sync 0.1.0, `http.rs`).
-#[cfg(feature = "swaps")]
 const BITCOIND_TCP_STREAM_TIMEOUT_SECS: u64 = 5;
 /// `lightning_block_sync::http`'s `TCP_STREAM_RESPONSE_TIMEOUT`: how long the
 /// crate means to let Bitcoin Core sit on a request before answering its
 /// first byte (a UTXO cache flush on a slow device). It is applied as
 /// `RESPONSE / STREAM` extra read attempts on the status line, so the wait it
 /// grants is one stream timeout more than its face value.
-#[cfg(feature = "swaps")]
 const BITCOIND_TCP_STREAM_RESPONSE_TIMEOUT_SECS: u64 = 300;
 /// `HttpClient::send_request_with_retry` sends once and, on any error,
 /// reconnects and sends once more: two attempts per call.
-#[cfg(feature = "swaps")]
 const BITCOIND_HTTP_ATTEMPTS: u64 = 2;
 /// The pause the crate takes between those two attempts.
-#[cfg(feature = "swaps")]
 const BITCOIND_HTTP_RETRY_SLEEP_MILLIS: u64 = 100;
 
 /// What one bitcoind RPC/REST call is allowed to take, in the crate's own
@@ -81,7 +78,6 @@ const BITCOIND_HTTP_RETRY_SLEEP_MILLIS: u64 = 100;
 /// single retry are real. This budget is therefore the first bound the read
 /// has ever had, sized to the allowance the crate designed for a slow but
 /// alive Bitcoin Core so the seam never cuts one off.
-#[cfg(feature = "swaps")]
 const BITCOIND_HTTP_CALL_BOUND_MILLIS: u64 = BITCOIND_HTTP_ATTEMPTS
 	* 1_000
 	* (BITCOIND_TCP_STREAM_TIMEOUT_SECS
@@ -96,6 +92,23 @@ const BITCOIND_HTTP_CALL_BOUND_MILLIS: u64 = BITCOIND_HTTP_ATTEMPTS
 #[cfg(feature = "swaps")]
 const BITCOIND_TX_STATUS_BUDGET: Duration = Duration::from_millis(
 	2 * BITCOIND_HTTP_CALL_BOUND_MILLIS + ADAPTER_BUDGET_MARGIN.as_millis() as u64,
+);
+
+/// MEMPOOL budget. The poll is `1 + n + m` calls — one `getrawmempool`, one
+/// `getmempoolentry` per entry not yet in the client's entry cache, one
+/// `getrawtransaction` per transaction to emit that is not in its
+/// transaction cache — and pre-seam it ran unbounded, because `n` and `m` are
+/// the size of the mempool on the first poll after start and the arrivals
+/// since the last poll thereafter: there is no honest count to multiply the
+/// per-call bound by. The seam requires a bound, so the crate's own per-call
+/// allowance ([`BITCOIND_HTTP_CALL_BOUND_MILLIS`], ten and a half minutes) is
+/// granted to the poll as a whole, plus the margin. Against a local Core each
+/// call is milliseconds, so this covers a poll of many thousands of calls; a
+/// poll that still overruns it is resumed, not restarted, by the next tick,
+/// because both client caches keep everything fetched before the cut and the
+/// watermark that would have marked it emitted was never advanced.
+const BITCOIND_MEMPOOL_BUDGET: Duration = Duration::from_millis(
+	BITCOIND_HTTP_CALL_BOUND_MILLIS + ADAPTER_BUDGET_MARGIN.as_millis() as u64,
 );
 
 /// Whether an I/O error is the HTTP client's own timeout. A blocking socket
@@ -128,8 +141,9 @@ fn classify_broadcast_error(e: &std::io::Error) -> TxBroadcastOutcome {
 pub(crate) struct BitcoindChainAdapter {
 	api_client: Arc<BitcoindClient>,
 	/// Cached best-chain tip, shared with the block-polling engine that
-	/// maintains it. Used only as a fail-soft fallback for deriving a height.
-	#[cfg_attr(not(feature = "swaps"), allow(dead_code))] // read by TX_STATUS only
+	/// maintains it: the tip the engine has polled up to, which is what a
+	/// MEMPOOL answer is anchored to, and TX_STATUS's fail-soft fallback for
+	/// deriving a height.
 	latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
@@ -142,6 +156,16 @@ impl BitcoindChainAdapter {
 		logger: Arc<Logger>,
 	) -> Self {
 		Self { api_client, latest_chain_tip, config, logger }
+	}
+
+	/// The tip the block-polling engine has synced the listeners to, if it
+	/// has synced them at all yet.
+	fn cached_tip(&self) -> Option<BlockId> {
+		self.latest_chain_tip
+			.read()
+			.unwrap()
+			.as_ref()
+			.map(|tip| BlockId { height: tip.height, hash: tip.header.block_hash() })
 	}
 
 	/// The pre-chain fee fetch, unchanged: one RPC per target, each under its
@@ -299,16 +323,9 @@ impl TxStatusAction for BitcoindChainAdapter {
 				// side. Fail-soft on the HEIGHT ONLY: the depth is already
 				// authoritative, so on a tip-read error we fall back to the cached
 				// tip rather than failing the whole query closed.
-				let cached_tip = || {
-					self.latest_chain_tip
-						.read()
-						.unwrap()
-						.as_ref()
-						.map(|tip| BlockId { height: tip.height, hash: tip.header.block_hash() })
-				};
 				let tip = match self.api_client.get_best_block().await {
 					Ok((hash, Some(height))) => Some(BlockId { height, hash }),
-					Ok((_, None)) => cached_tip(),
+					Ok((_, None)) => self.cached_tip(),
 					Err(e) => {
 						log_error!(
 							self.logger,
@@ -316,7 +333,7 @@ impl TxStatusAction for BitcoindChainAdapter {
 							txid,
 							e
 						);
-						cached_tip()
+						self.cached_tip()
 					},
 				};
 				let height = tip.map(|t| t.height.saturating_sub(confirmations.saturating_sub(1)));
@@ -333,6 +350,76 @@ impl TxStatusAction for BitcoindChainAdapter {
 				})
 			},
 		}
+	}
+}
+
+/// bitcoind is the only backend with a mempool of its own to poll.
+#[async_trait]
+impl MempoolAction for BitcoindChainAdapter {
+	fn name(&self) -> &'static str {
+		"bitcoind"
+	}
+
+	fn budget(&self) -> Option<Duration> {
+		Some(BITCOIND_MEMPOOL_BUDGET)
+	}
+
+	/// `Incremental` is the pre-seam poll, unchanged: the client's emit-once
+	/// walk of its mempool caches, which over-answers — every relevant *and*
+	/// irrelevant new transaction, the query's scripts unread — because the
+	/// asking wallet keeps what is its own on apply, exactly as it did when
+	/// the engine called the client directly. `Complete` is the snapshot the
+	/// serving path asks for, filtered by the query and leaving the poll's
+	/// watermark alone.
+	///
+	/// Either answer is anchored to the tip the engine has synced up to: the
+	/// engine polls the tip immediately before it asks, so that is the tip
+	/// the mempool was read against. `None` only before the first sync.
+	async fn mempool(&self, query: &MempoolQuery) -> ActionResult<Anchored<MempoolAnswer>> {
+		let tip = self.cached_tip();
+		let value = match query.scope {
+			MempoolScope::Incremental { best_processed_height } => {
+				let (unconfirmed, evicted) = self
+					.api_client
+					.get_updated_mempool_transactions(
+						best_processed_height,
+						query.known_unconfirmed.clone(),
+					)
+					.await
+					.map_err(mempool_poll_error)?;
+				MempoolAnswer { unconfirmed, evicted }
+			},
+			MempoolScope::Complete => {
+				let unconfirmed = self
+					.api_client
+					.get_mempool_snapshot(|tx| query.is_relevant(tx))
+					.await
+					.map_err(mempool_poll_error)?;
+				let now =
+					SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+				let evicted = self
+					.api_client
+					.txids_missing_from_mempool(&query.known_unconfirmed)
+					.await
+					.into_iter()
+					.map(|txid| (txid, now))
+					.collect();
+				MempoolAnswer { unconfirmed, evicted }
+			},
+		};
+		Ok(Anchored { value, tip })
+	}
+}
+
+/// A failed mempool poll is never a verdict on anything: `Unavailable`,
+/// `timed_out` when the client's own timeout is why. The reason keeps the
+/// error's full `Debug` form, which is what the engine logged pre-seam.
+fn mempool_poll_error(e: std::io::Error) -> ChainActionError {
+	let reason = format!("{:?}", e);
+	if is_timeout(&e) {
+		ChainActionError::timed_out(reason)
+	} else {
+		ChainActionError::unavailable(reason)
 	}
 }
 
@@ -505,18 +592,28 @@ mod tests {
 		));
 	}
 
-	/// The HTTP client's own allowance the TX_STATUS budget rests on.
-	#[cfg(feature = "swaps")]
+	/// The HTTP client's own allowance the budgets rest on.
 	#[test]
-	fn tx_status_budget_covers_the_clients_two_attempts() {
+	fn call_bound_covers_the_clients_two_attempts() {
 		// Per attempt: 5 s connect + 5 s write + 61 reads × 5 s for the status
 		// line; two attempts; 100 ms between them.
 		assert_eq!(BITCOIND_HTTP_CALL_BOUND_MILLIS, 2 * (5_000 + 5_000 + 61 * 5_000) + 100);
 		assert_eq!(BITCOIND_HTTP_CALL_BOUND_MILLIS, 630_100);
-		// Two calls plus the 1 s margin.
-		assert_eq!(BITCOIND_TX_STATUS_BUDGET, Duration::from_millis(2 * 630_100 + 1_000));
+		// The whole poll gets one call's allowance plus the 1 s margin.
+		assert_eq!(BITCOIND_MEMPOOL_BUDGET, Duration::from_millis(630_100 + 1_000));
 		// Never below what the crate itself designed for a slow Bitcoin Core:
 		// twice the response timeout per call.
+		assert!(
+			BITCOIND_MEMPOOL_BUDGET
+				> Duration::from_secs(2 * BITCOIND_TCP_STREAM_RESPONSE_TIMEOUT_SECS)
+		);
+	}
+
+	#[cfg(feature = "swaps")]
+	#[test]
+	fn tx_status_budget_covers_two_calls() {
+		// Two calls plus the 1 s margin.
+		assert_eq!(BITCOIND_TX_STATUS_BUDGET, Duration::from_millis(2 * 630_100 + 1_000));
 		assert!(
 			BITCOIND_TX_STATUS_BUDGET
 				> Duration::from_secs(2 * 2 * BITCOIND_TCP_STREAM_RESPONSE_TIMEOUT_SECS)

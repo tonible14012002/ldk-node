@@ -151,9 +151,16 @@ pub(crate) trait SyncEngine: Send + Sync {
 	/// pre-seam implementation: transaction-based syncs the Lightning wallet
 	/// *before* the on-chain wallet. The caller refreshes fees first, in both
 	/// cases, before calling this.
+	///
+	/// Takes the layer for the same reason [`SyncEngine::run_background`]
+	/// does: the data a pass consumes from a slot — the block-polling engine's
+	/// mempool poll — goes through that slot's chain, so a swapped adapter
+	/// applies to a foreground pass exactly as to a background one. A
+	/// transaction-based engine carries unconfirmed transactions in its own
+	/// sync and asks nothing of the layer here.
 	async fn sync_once(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
+		&self, layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error>;
 
 	/// Run until `stop_sync_receiver` fires.

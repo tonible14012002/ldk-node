@@ -419,8 +419,8 @@ impl SyncEngine for EsploraSyncEngine {
 	}
 
 	async fn sync_once(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
+		&self, _layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
 		// ORDER IS LOAD-BEARING: Lightning wallet before on-chain wallet.
 		self.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper).await?;

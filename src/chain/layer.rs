@@ -8,10 +8,10 @@
 //! The chain ability seam.
 //!
 //! [`ChainLayer`] is the single entry point the rest of the crate uses to reach
-//! the Bitcoin chain. Each chain *ability* occupies a slot: FEE, BROADCAST and
-//! TX_STATUS are ordered adapter chains ([`ActionChain`]), and UTXO is a
-//! capability declared once at startup. The wallet sync engine is a separate
-//! explicit axis.
+//! the Bitcoin chain. Each chain *ability* occupies a slot: FEE, BROADCAST,
+//! TX_STATUS and MEMPOOL are ordered adapter chains ([`ActionChain`]), and
+//! UTXO is a capability declared once at startup. The wallet sync engine is a
+//! separate explicit axis.
 //!
 //! Nothing outside slot construction branches on which backend is configured.
 
@@ -42,8 +42,9 @@ use crate::chain::provider::{
 	WireLightningSyncResponse, WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{
-	ActionChain, Answered, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
-	FeeUpdate, UtxoCapability, UtxoVerification, BROADCAST_BUDGET, FEE_BUDGET,
+	ActionChain, ActionResult, Anchored, Answered, BroadcastAction, BroadcastRejection,
+	ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery,
+	UtxoCapability, UtxoVerification, BROADCAST_BUDGET, FEE_BUDGET, MEMPOOL_BUDGET,
 };
 use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
@@ -72,6 +73,9 @@ pub(crate) struct ChainSlotAdapters {
 	#[cfg(feature = "swaps")]
 	pub(crate) tx_status: Vec<&'static str>,
 	pub(crate) broadcast: Vec<&'static str>,
+	/// Empty for an engine that carries unconfirmed transactions in its own
+	/// sync and never asks the slot.
+	pub(crate) mempool: Vec<&'static str>,
 	/// The adapter verifying BOLT-7 channel announcements and how far it
 	/// checks them. `None` means the routing graph carries unverified
 	/// capacities.
@@ -85,6 +89,7 @@ impl fmt::Display for ChainSlotAdapters {
 		#[cfg(feature = "swaps")]
 		write!(f, " tx_status=[{}]", self.tx_status.join(","))?;
 		write!(f, " broadcast=[{}]", self.broadcast.join(","))?;
+		write!(f, " mempool=[{}]", self.mempool.join(","))?;
 		match self.utxo {
 			Some((name, verification)) => write!(f, " utxo={}({})", name, verification.as_str())?,
 			None => write!(f, " utxo=none")?,
@@ -102,6 +107,10 @@ pub(crate) struct ChainSlots {
 	pub(crate) tx_status: ActionChain<dyn TxStatusAction>,
 	/// BROADCAST — transaction broadcast.
 	pub(crate) broadcast: ActionChain<dyn BroadcastAction>,
+	/// MEMPOOL — unconfirmed transactions and evictions. Empty for an engine
+	/// whose own sync carries them; an empty chain is never run by such an
+	/// engine, so it costs nothing and logs nothing.
+	pub(crate) mempool: ActionChain<dyn MempoolAction>,
 	/// UTXO — verification of BOLT-7 channel announcements, if any adapter can.
 	pub(crate) utxo: Option<Arc<dyn UtxoCapability>>,
 }
@@ -151,8 +160,13 @@ impl ChainLayer {
 
 	/// Slots for a backend whose single adapter fills every action slot on
 	/// its own — the shape of every chain source today.
+	///
+	/// MEMPOOL is passed separately because only a block-polling backend
+	/// has one to fill; the others carry unconfirmed transactions in their
+	/// own sync and leave the chain empty.
 	fn slots_for_single_adapter<A>(
-		adapter: Arc<A>, utxo: Option<Arc<dyn UtxoCapability>>, logger: &Arc<Logger>,
+		adapter: Arc<A>, mempool: Vec<Arc<dyn MempoolAction>>,
+		utxo: Option<Arc<dyn UtxoCapability>>, logger: &Arc<Logger>,
 	) -> ChainSlots
 	where
 		A: SlotAdapters + 'static,
@@ -177,6 +191,7 @@ impl ChainLayer {
 				vec![adapter as Arc<dyn BroadcastAction>],
 				Arc::clone(logger),
 			),
+			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, mempool, Arc::clone(logger)),
 			utxo,
 		}
 	}
@@ -218,8 +233,8 @@ impl ChainLayer {
 		});
 
 		// Esplora exposes no UTXO-set lookup, so channel announcements cannot
-		// be verified against one.
-		let slots = Self::slots_for_single_adapter(adapter, None, &logger);
+		// be verified against one. Its sync carries the mempool itself.
+		let slots = Self::slots_for_single_adapter(adapter, Vec::new(), None, &logger);
 
 		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
@@ -250,8 +265,9 @@ impl ChainLayer {
 		));
 
 		// A Dependent node cannot verify BOLT-7 channel announcements; see the
-		// adapter module docs for why it does not ask its provider to.
-		let slots = Self::slots_for_single_adapter(adapter, None, &logger);
+		// adapter module docs for why it does not ask its provider to. Its
+		// sync carries the mempool itself, through the provider's wallet sync.
+		let slots = Self::slots_for_single_adapter(adapter, Vec::new(), None, &logger);
 
 		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
@@ -283,8 +299,8 @@ impl ChainLayer {
 		});
 
 		// Electrum exposes no UTXO-set lookup, so channel announcements cannot
-		// be verified against one.
-		let slots = Self::slots_for_single_adapter(adapter, None, &logger);
+		// be verified against one. Its sync carries the mempool itself.
+		let slots = Self::slots_for_single_adapter(adapter, Vec::new(), None, &logger);
 
 		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
@@ -364,8 +380,9 @@ impl ChainLayer {
 			node_metrics: Arc::clone(&node_metrics),
 		});
 
+		let mempool = vec![Arc::clone(&adapter) as Arc<dyn MempoolAction>];
 		let utxo = Some(Arc::clone(&adapter) as Arc<dyn UtxoCapability>);
-		let slots = Self::slots_for_single_adapter(adapter, utxo, &logger);
+		let slots = Self::slots_for_single_adapter(adapter, mempool, utxo, &logger);
 
 		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
@@ -378,6 +395,7 @@ impl ChainLayer {
 			#[cfg(feature = "swaps")]
 			tx_status: self.slots.tx_status.names(),
 			broadcast: self.slots.broadcast.names(),
+			mempool: self.slots.mempool.names(),
 			utxo: self
 				.slots
 				.utxo
@@ -627,7 +645,21 @@ impl ChainLayer {
 		output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
 		self.update_fee_rate_estimates().await?;
-		self.engine.sync_once(channel_manager, chain_monitor, output_sweeper).await
+		self.engine.sync_once(self, channel_manager, chain_monitor, output_sweeper).await
+	}
+
+	/// Ask the MEMPOOL chain.
+	///
+	/// The answer is handed back as the chain produced it — anchored to the
+	/// tip the answering adapter took it at, tagged with that adapter — for
+	/// the caller to apply: the block-polling engine applies it to the
+	/// on-chain wallet exactly where it applied its own poll pre-seam, and the
+	/// serving path projects it onto the wire. An empty chain is
+	/// `Unavailable`; no engine with an empty chain asks.
+	pub(crate) async fn mempool(
+		&self, query: &MempoolQuery,
+	) -> ActionResult<Answered<Anchored<MempoolAnswer>>> {
+		self.slots.mempool.run(|a| async move { a.mempool(query).await }).await
 	}
 
 	/// Ask the TX_STATUS chain about `txid`.
@@ -913,8 +945,8 @@ mod tests {
 		}
 
 		async fn sync_once(
-			&self, _channel_manager: Arc<ChannelManager>, _chain_monitor: Arc<ChainMonitor>,
-			_output_sweeper: Arc<Sweeper>,
+			&self, _layer: &ChainLayer, _channel_manager: Arc<ChannelManager>,
+			_chain_monitor: Arc<ChainMonitor>, _output_sweeper: Arc<Sweeper>,
 		) -> Result<(), Error> {
 			Ok(())
 		}
@@ -978,6 +1010,7 @@ mod tests {
 				adapters.iter().map(|a| Arc::clone(a) as Arc<dyn BroadcastAction>).collect(),
 				Arc::clone(&logger),
 			),
+			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, Vec::new(), Arc::clone(&logger)),
 			utxo: None,
 		};
 		let layer = ChainLayer::new(
@@ -1221,6 +1254,7 @@ mod tests {
 				adapters.iter().map(|a| Arc::clone(a) as Arc<dyn BroadcastAction>).collect(),
 				Arc::clone(&logger),
 			),
+			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, Vec::new(), Arc::clone(&logger)),
 			utxo: None,
 		};
 		let layer = ChainLayer::new(

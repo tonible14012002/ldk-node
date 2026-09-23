@@ -22,6 +22,7 @@ use lightning_block_sync::{BlockSourceErrorKind, SpvClient};
 
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache, ChainListener};
 use crate::chain::engine::SyncEngine;
+use crate::chain::seam::{MempoolAnswer, MempoolQuery, MempoolScope};
 use crate::chain::{ChainLayer, WalletSyncStatus, CHAIN_POLLING_INTERVAL_SECS};
 use crate::config::Config;
 use crate::io::utils::write_node_metrics;
@@ -53,9 +54,13 @@ impl SyncEngine for BitcoindSyncEngine {
 		Some(&self.onchain_wallet)
 	}
 
+	/// Poll the tip, then the mempool, then record the pass — in that order,
+	/// as pre-seam. The mempool comes through the layer's MEMPOOL chain now;
+	/// what it answers is applied exactly where, and how, the client's own
+	/// poll result was.
 	async fn sync_once(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
+		&self, layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
 		let Self {
 			api_client,
@@ -67,7 +72,6 @@ impl SyncEngine for BitcoindSyncEngine {
 			config,
 			logger,
 			node_metrics,
-			..
 		} = self;
 		let receiver_res = {
 			let mut status_lock = wallet_polling_status.lock().unwrap();
@@ -134,9 +138,18 @@ impl SyncEngine for BitcoindSyncEngine {
 		let cur_height = channel_manager.current_best_block().height;
 
 		let now = SystemTime::now();
-		let unconfirmed_txids = onchain_wallet.get_unconfirmed_txids();
-		match api_client.get_updated_mempool_transactions(cur_height, unconfirmed_txids).await {
-			Ok((unconfirmed_txs, evicted_txids)) => {
+		let query = MempoolQuery {
+			// A block-polling engine has no script list to send and needs
+			// none: its adapter answers the whole mempool and the wallet
+			// keeps what is its own on apply, as it always has.
+			scripts: Vec::new(),
+			known_unconfirmed: onchain_wallet.get_unconfirmed_txids(),
+			scope: MempoolScope::Incremental { best_processed_height: cur_height },
+		};
+		match layer.mempool(&query).await {
+			Ok(answered) => {
+				let MempoolAnswer { unconfirmed: unconfirmed_txs, evicted: evicted_txids } =
+					answered.value.value;
 				log_trace!(
 					logger,
 					"Finished polling mempool of size {} and {} evicted transactions in {}ms",
@@ -151,7 +164,7 @@ impl SyncEngine for BitcoindSyncEngine {
 				);
 			},
 			Err(e) => {
-				log_error!(logger, "Failed to poll for mempool transactions: {:?}", e);
+				log_error!(logger, "Failed to poll for mempool transactions: {}", e);
 				let res = Err(Error::TxSyncFailed);
 				wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
 				return res;
@@ -332,7 +345,7 @@ impl SyncEngine for BitcoindSyncEngine {
 					return;
 				}
 				_ = chain_polling_interval.tick() => {
-					let _ = self.sync_once(Arc::clone(&channel_manager), Arc::clone(&chain_monitor), Arc::clone(&output_sweeper)).await;
+					let _ = self.sync_once(&layer, Arc::clone(&channel_manager), Arc::clone(&chain_monitor), Arc::clone(&output_sweeper)).await;
 				}
 				_ = fee_rate_update_interval.tick() => {
 					let _ = layer.update_fee_rate_estimates().await;

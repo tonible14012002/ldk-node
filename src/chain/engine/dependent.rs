@@ -439,8 +439,8 @@ impl SyncEngine for DependentSyncEngine {
 	}
 
 	async fn sync_once(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
+		&self, _layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
 		// Transaction-based order: Lightning first, then on-chain. Matches
 		// the Esplora and Electrum engines.
