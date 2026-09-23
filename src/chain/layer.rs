@@ -8,18 +8,20 @@
 //! The chain ability seam.
 //!
 //! [`ChainLayer`] is the single entry point the rest of the crate uses to reach
-//! the Bitcoin chain. The three chain *abilities* — fee estimation, lookup and
-//! broadcast — each occupy a slot that one adapter fills, and the wallet sync
+//! the Bitcoin chain. Each chain *ability* occupies a slot: FEE and TX_STATUS
+//! are ordered adapter chains ([`ActionChain`]), BROADCAST is still a single
+//! adapter, and UTXO is a capability declared once at startup. The wallet sync
 //! engine is a separate explicit axis.
 //!
 //! Nothing outside slot construction branches on which backend is configured.
 
+use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use lightning::chain::{Filter, WatchedOutput};
 
-use bitcoin::{Script, ScriptBuf, Transaction, Txid};
+use bitcoin::{Script, Transaction, Txid};
 
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_transaction_sync::EsploraSyncClient;
@@ -38,31 +40,69 @@ use crate::chain::provider::{
 	ChainDataProvider, WireFeeEstimates, WireFeeTarget, WireLightningSyncRequest,
 	WireLightningSyncResponse, WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
 };
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
+use crate::chain::seam::{
+	ActionChain, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, UtxoCapability,
+	UtxoVerification, FEE_BUDGET,
+};
 use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
 use crate::fee_estimator::{
 	conf_target_wire_name, get_all_conf_targets, FeeEstimator, OnchainFeeEstimator,
 };
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_info, LdkLogger, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, Logger};
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusResponse;
 #[cfg(feature = "swaps")]
+use crate::chain::seam::{TxStatusAction, TX_STATUS_BUDGET};
+#[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
+#[cfg(feature = "swaps")]
+use bitcoin::ScriptBuf;
 
-/// Which adapter is serving each slot.
+/// Which adapters serve each slot, in chain order.
+///
+/// For logs and diagnostics; nothing may branch on it.
 pub(crate) struct ChainSlotAdapters {
-	pub(crate) fee: &'static str,
-	pub(crate) lookup: &'static str,
+	pub(crate) fee: Vec<&'static str>,
+	#[cfg(feature = "swaps")]
+	pub(crate) tx_status: Vec<&'static str>,
 	pub(crate) broadcast: &'static str,
+	/// The adapter verifying BOLT-7 channel announcements and how far it
+	/// checks them. `None` means the routing graph carries unverified
+	/// capacities.
+	pub(crate) utxo: Option<(&'static str, UtxoVerification)>,
 	pub(crate) engine: &'static str,
-	/// Whether the lookup slot can verify BOLT-7 channel announcements.
-	/// `false` means the routing graph carries unverified capacities.
-	pub(crate) verifies_announcements: bool,
+}
+
+impl fmt::Display for ChainSlotAdapters {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "fee=[{}]", self.fee.join(","))?;
+		#[cfg(feature = "swaps")]
+		write!(f, " tx_status=[{}]", self.tx_status.join(","))?;
+		write!(f, " broadcast={}", self.broadcast)?;
+		match self.utxo {
+			Some((name, verification)) => write!(f, " utxo={}({})", name, verification.as_str())?,
+			None => write!(f, " utxo=none")?,
+		}
+		write!(f, " (sync engine: {})", self.engine)
+	}
+}
+
+/// The per-ability slots of a [`ChainLayer`].
+pub(crate) struct ChainSlots {
+	/// FEE — fee-rate estimation.
+	pub(crate) fee: ActionChain<dyn FeeAction>,
+	/// TX_STATUS — reorg-aware status of an arbitrary transaction.
+	#[cfg(feature = "swaps")]
+	pub(crate) tx_status: ActionChain<dyn TxStatusAction>,
+	/// BROADCAST — transaction broadcast.
+	pub(crate) broadcast: Arc<dyn BroadcastAdapter>,
+	/// UTXO — verification of BOLT-7 channel announcements, if any adapter can.
+	pub(crate) utxo: Option<Arc<dyn UtxoCapability>>,
 }
 
 /// Everything a slot's shared tail needs once its adapter has answered.
@@ -76,12 +116,7 @@ pub(crate) struct SharedChainCtx {
 
 /// The chain layer: the crate's single seam onto Bitcoin.
 pub(crate) struct ChainLayer {
-	/// SLOT 1 — fee estimation.
-	fee: Arc<dyn FeeAdapter>,
-	/// SLOT 2 — chain lookup.
-	lookup: Arc<dyn LookupAdapter>,
-	/// SLOT 3 — transaction broadcast.
-	broadcast: Arc<dyn BroadcastAdapter>,
+	slots: ChainSlots,
 	/// Wallet synchronisation. A separate axis, not one of the slots.
 	engine: Arc<dyn SyncEngine>,
 	/// State shared by every slot's tail. Held once, rather than duplicated
@@ -91,15 +126,12 @@ pub(crate) struct ChainLayer {
 
 impl ChainLayer {
 	fn new(
-		fee: Arc<dyn FeeAdapter>, lookup: Arc<dyn LookupAdapter>,
-		broadcast: Arc<dyn BroadcastAdapter>, engine: Arc<dyn SyncEngine>,
-		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
-		kv_store: Arc<DynStore>, logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+		slots: ChainSlots, engine: Arc<dyn SyncEngine>, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
 		Self {
-			fee,
-			lookup,
-			broadcast,
+			slots,
 			engine,
 			shared: SharedChainCtx {
 				fee_estimator,
@@ -108,6 +140,33 @@ impl ChainLayer {
 				logger,
 				node_metrics,
 			},
+		}
+	}
+
+	/// Slots for a backend whose single adapter fills every action slot on
+	/// its own — the shape of every chain source today.
+	fn slots_for_single_adapter<A>(
+		adapter: Arc<A>, utxo: Option<Arc<dyn UtxoCapability>>, logger: &Arc<Logger>,
+	) -> ChainSlots
+	where
+		A: SlotAdapters + 'static,
+	{
+		ChainSlots {
+			fee: ActionChain::new(
+				"fee",
+				FEE_BUDGET,
+				vec![Arc::clone(&adapter) as Arc<dyn FeeAction>],
+				Arc::clone(logger),
+			),
+			#[cfg(feature = "swaps")]
+			tx_status: ActionChain::new(
+				"tx_status",
+				TX_STATUS_BUDGET,
+				vec![Arc::clone(&adapter) as Arc<dyn TxStatusAction>],
+				Arc::clone(logger),
+			),
+			broadcast: adapter as Arc<dyn BroadcastAdapter>,
+			utxo,
 		}
 	}
 
@@ -147,17 +206,11 @@ impl ChainLayer {
 			node_metrics: Arc::clone(&node_metrics),
 		});
 
-		Self::new(
-			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
-			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
-			adapter as Arc<dyn BroadcastAdapter>,
-			engine,
-			fee_estimator,
-			tx_broadcaster,
-			kv_store,
-			logger,
-			node_metrics,
-		)
+		// Esplora exposes no UTXO-set lookup, so channel announcements cannot
+		// be verified against one.
+		let slots = Self::slots_for_single_adapter(adapter, None, &logger);
+
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
 
 	/// A node with no chain source of its own: every slot is filled from one
@@ -185,17 +238,11 @@ impl ChainLayer {
 			Arc::clone(&node_metrics),
 		));
 
-		Self::new(
-			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
-			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
-			adapter as Arc<dyn BroadcastAdapter>,
-			engine,
-			fee_estimator,
-			tx_broadcaster,
-			kv_store,
-			logger,
-			node_metrics,
-		)
+		// A Dependent node cannot verify BOLT-7 channel announcements; see the
+		// adapter module docs for why it does not ask its provider to.
+		let slots = Self::slots_for_single_adapter(adapter, None, &logger);
+
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
 
 	pub(crate) fn new_electrum(
@@ -224,17 +271,11 @@ impl ChainLayer {
 			node_metrics: Arc::clone(&node_metrics),
 		});
 
-		Self::new(
-			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
-			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
-			adapter as Arc<dyn BroadcastAdapter>,
-			engine,
-			fee_estimator,
-			tx_broadcaster,
-			kv_store,
-			logger,
-			node_metrics,
-		)
+		// Electrum exposes no UTXO-set lookup, so channel announcements cannot
+		// be verified against one.
+		let slots = Self::slots_for_single_adapter(adapter, None, &logger);
+
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
 
 	pub(crate) fn new_bitcoind_rpc(
@@ -312,28 +353,26 @@ impl ChainLayer {
 			node_metrics: Arc::clone(&node_metrics),
 		});
 
-		Self::new(
-			Arc::clone(&adapter) as Arc<dyn FeeAdapter>,
-			Arc::clone(&adapter) as Arc<dyn LookupAdapter>,
-			adapter as Arc<dyn BroadcastAdapter>,
-			engine,
-			fee_estimator,
-			tx_broadcaster,
-			kv_store,
-			logger,
-			node_metrics,
-		)
+		let utxo = Some(Arc::clone(&adapter) as Arc<dyn UtxoCapability>);
+		let slots = Self::slots_for_single_adapter(adapter, utxo, &logger);
+
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
 
-	/// Which adapter currently occupies each slot. For logs and diagnostics;
+	/// Which adapters currently occupy each slot. For logs and diagnostics;
 	/// nothing may branch on it.
 	pub(crate) fn slot_adapters(&self) -> ChainSlotAdapters {
 		ChainSlotAdapters {
-			fee: self.fee.name(),
-			lookup: self.lookup.name(),
-			broadcast: self.broadcast.name(),
+			fee: self.slots.fee.names(),
+			#[cfg(feature = "swaps")]
+			tx_status: self.slots.tx_status.names(),
+			broadcast: self.slots.broadcast.name(),
+			utxo: self
+				.slots
+				.utxo
+				.as_ref()
+				.and_then(|u| u.utxo_source().map(|(_, verification)| (u.name(), verification))),
 			engine: self.engine.name(),
-			verifies_announcements: self.lookup.utxo_source().is_some(),
 		}
 	}
 
@@ -346,11 +385,11 @@ impl ChainLayer {
 		self.engine.stop()
 	}
 
-	/// The UTXO source used to verify BOLT-7 `channel_announcement`s, if the
-	/// configured lookup can serve one. `None` means announcements are accepted
+	/// The UTXO source used to verify BOLT-7 `channel_announcement`s, if any
+	/// adapter can serve one. `None` means announcements are accepted
 	/// unverified.
 	pub(crate) fn as_utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
-		self.lookup.utxo_source()
+		self.slots.utxo.as_ref().and_then(|u| u.utxo_source()).map(|(source, _)| source)
 	}
 
 	pub(crate) async fn continuously_sync_wallets(
@@ -370,17 +409,37 @@ impl ChainLayer {
 			.await
 	}
 
-	/// Refresh the fee-rate cache from SLOT 1.
+	/// Refresh the fee-rate cache from the FEE chain.
 	///
-	/// The adapter produces the cache; the seam installs it and records that it
-	/// happened. Both steps are skipped entirely when the adapter returns
-	/// [`FeeUpdate::Skip`], which preserves the pre-seam bitcoind behaviour of
-	/// leaving a stale-but-valid cache in place on a soft failure rather than
-	/// advancing the metrics timestamp as though an update had landed.
+	/// The chain produces the cache; the seam installs it and records that it
+	/// happened. Both steps are skipped entirely when the answering adapter
+	/// returns [`FeeUpdate::Skip`], which preserves the pre-seam bitcoind
+	/// behaviour of leaving a stale-but-valid cache in place on a soft failure
+	/// rather than advancing the metrics timestamp as though an update had
+	/// landed.
+	///
+	/// An exhausted chain is reported as the same two errors callers saw from
+	/// the single adapters: [`Error::FeerateEstimationUpdateTimeout`] when a
+	/// timeout is why, [`Error::FeerateEstimationUpdateFailed`] otherwise.
 	pub(crate) async fn update_fee_rate_estimates(&self) -> Result<(), Error> {
 		let now = Instant::now();
 
-		let (cache, log_unchanged) = match self.fee.fee_rate_update().await? {
+		let update = match self.slots.fee.run(|a| async move { a.fee_rate_update().await }).await {
+			Ok(answered) => answered.value,
+			Err(e @ ChainActionError::Unavailable(_)) => {
+				return Err(if e.is_timeout() {
+					Error::FeerateEstimationUpdateTimeout
+				} else {
+					Error::FeerateEstimationUpdateFailed
+				});
+			},
+			Err(ChainActionError::Rejected(reason)) => {
+				log_error!(self.shared.logger, "Fee rate estimates rejected: {}", reason);
+				return Err(Error::FeerateEstimationUpdateFailed);
+			},
+		};
+
+		let (cache, log_unchanged) = match update {
 			FeeUpdate::Skip => return Ok(()),
 			FeeUpdate::Apply { cache, log_unchanged } => (cache, log_unchanged),
 		};
@@ -409,20 +468,20 @@ impl ChainLayer {
 		Ok(())
 	}
 
-	/// Drain the broadcast queue through SLOT 3.
+	/// Drain the broadcast queue through the BROADCAST slot.
 	///
 	/// Called once a second. Failures are logged by the adapter and dropped —
 	/// the queue carries no retry semantics, so an error here must never
 	/// propagate.
 	pub(crate) async fn process_broadcast_queue(&self) {
-		if !self.broadcast.ready().await {
+		if !self.slots.broadcast.ready().await {
 			return;
 		}
 
 		let mut receiver = self.shared.tx_broadcaster.get_broadcast_queue().await;
 		while let Some(next_package) = receiver.recv().await {
 			for tx in &next_package {
-				self.broadcast.broadcast_tx(tx).await;
+				self.slots.broadcast.broadcast_tx(tx).await;
 			}
 		}
 	}
@@ -438,6 +497,26 @@ impl ChainLayer {
 	) -> Result<(), Error> {
 		self.update_fee_rate_estimates().await?;
 		self.engine.sync_once(channel_manager, chain_monitor, output_sweeper).await
+	}
+
+	/// Ask the TX_STATUS chain about `txid`.
+	///
+	/// FAIL-CLOSED (E6): an exhausted chain — no adapter could answer — is
+	/// [`RawTxObservation::Unreachable`], never an observation a caller could
+	/// fold into "confirmed". A rejection is treated the same way; no
+	/// TX_STATUS adapter rejects today, and "the network said no" is not a
+	/// confirmation either.
+	#[cfg(feature = "swaps")]
+	async fn observe_tx(&self, txid: Txid, script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
+		match self
+			.slots
+			.tx_status
+			.run(|a| async move { a.tx_status(txid, script_pubkey).await })
+			.await
+		{
+			Ok(answered) => answered.value.value,
+			Err(_) => RawTxObservation::Unreachable,
+		}
 	}
 
 	// ── SERVING ─────────────────────────────────────────────────────────────
@@ -471,25 +550,25 @@ impl ChainLayer {
 	/// lossy by contract, so this reports that the transaction was accepted
 	/// for broadcast, never that it reached a miner.
 	pub(crate) async fn serve_broadcast(&self, tx: &Transaction) -> Result<(), Error> {
-		if !self.broadcast.ready().await {
+		if !self.slots.broadcast.ready().await {
 			return Err(Error::ChainServeFailed);
 		}
-		self.broadcast.broadcast_tx(tx).await;
+		self.slots.broadcast.broadcast_tx(tx).await;
 		Ok(())
 	}
 
 	/// Answer another node's question about an arbitrary transaction.
 	///
-	/// An unreachable lookup slot is an **error**, never a response. The wire
-	/// type has no "unreachable" variant on purpose: if this node could not
-	/// look, the asking node must see a failed call and fail closed, not a
+	/// An exhausted TX_STATUS chain is an **error**, never a response. The
+	/// wire type has no "unreachable" variant on purpose: if this node could
+	/// not look, the asking node must see a failed call and fail closed, not a
 	/// well-formed answer that reads as "not found".
 	#[cfg(feature = "swaps")]
 	pub(crate) async fn serve_tx_status(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> Result<WireTxStatusResponse, Error> {
 		let (confirmed, in_mempool, confirmation_height, tip_height) =
-			match self.lookup.tx_status(txid, script_pubkey).await {
+			match self.observe_tx(txid, script_pubkey).await {
 				RawTxObservation::Confirmed { height, confirmations } => {
 					// Reconstruct the tip the adapter derived depth against,
 					// so the caller can recompute rather than trust a count
@@ -538,7 +617,7 @@ impl ChainLayer {
 	pub(crate) async fn swap_query_tx(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> RawTxObservation {
-		self.lookup.tx_status(txid, script_pubkey).await
+		self.observe_tx(txid, script_pubkey).await
 	}
 
 	/// The shared on-chain fee estimator (Peerswap native primitive B6).
@@ -547,6 +626,19 @@ impl ChainLayer {
 		&self.shared.fee_estimator
 	}
 }
+
+/// The action traits a single adapter must implement to fill every action
+/// slot by itself. Spelled as one trait so the bound does not change shape
+/// between feature sets.
+#[cfg(feature = "swaps")]
+trait SlotAdapters: FeeAction + BroadcastAdapter + TxStatusAction {}
+#[cfg(feature = "swaps")]
+impl<A: FeeAction + BroadcastAdapter + TxStatusAction> SlotAdapters for A {}
+
+#[cfg(not(feature = "swaps"))]
+trait SlotAdapters: FeeAction + BroadcastAdapter {}
+#[cfg(not(feature = "swaps"))]
+impl<A: FeeAction + BroadcastAdapter> SlotAdapters for A {}
 
 impl Filter for ChainLayer {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {

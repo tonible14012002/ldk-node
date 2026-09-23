@@ -17,9 +17,7 @@ use esplora_client::AsyncClient as EsploraAsyncClient;
 
 use lightning::util::ser::Writeable;
 
-use lightning_block_sync::gossip::UtxoSource;
-
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
+use crate::chain::seam::{ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate};
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
@@ -27,6 +25,8 @@ use crate::fee_estimator::{
 use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
 
+#[cfg(feature = "swaps")]
+use crate::chain::seam::{Anchored, TxStatusAction};
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 #[cfg(feature = "swaps")]
@@ -47,15 +47,10 @@ impl EsploraChainAdapter {
 	) -> Self {
 		Self { client, config, logger }
 	}
-}
 
-#[async_trait]
-impl FeeAdapter for EsploraChainAdapter {
-	fn name(&self) -> &'static str {
-		"esplora"
-	}
-
-	async fn fee_rate_update(&self) -> Result<FeeUpdate, Error> {
+	/// The pre-chain fee fetch, unchanged: its own wire timeout, its own
+	/// mainnet policy, its own per-target conversion.
+	async fn fetch_fee_rate_update(&self) -> Result<FeeUpdate, Error> {
 		let estimates = tokio::time::timeout(
 			Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS),
 			self.client.get_fee_estimates(),
@@ -113,18 +108,35 @@ impl FeeAdapter for EsploraChainAdapter {
 }
 
 #[async_trait]
-impl LookupAdapter for EsploraChainAdapter {
+impl FeeAction for EsploraChainAdapter {
 	fn name(&self) -> &'static str {
 		"esplora"
 	}
 
-	#[cfg(feature = "swaps")]
-	async fn tx_status(&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
+	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
+		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
+	}
+}
+
+/// Esplora reports the tip as a bare height, never as a height/hash pair, so
+/// no observation it produces can be anchored: `tip` is always `None`.
+#[cfg(feature = "swaps")]
+#[async_trait]
+impl TxStatusAction for EsploraChainAdapter {
+	fn name(&self) -> &'static str {
+		"esplora"
+	}
+
+	async fn tx_status(
+		&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>,
+	) -> ActionResult<Anchored<RawTxObservation>> {
+		let unanchored = |value| Ok(Anchored { value, tip: None });
+
 		let status = match self.client.get_tx_status(&txid).await {
 			Ok(status) => status,
 			Err(esplora_client::Error::HttpResponse { status: 404, .. }) => {
 				// Definitive "not in the chain or mempool" answer.
-				return RawTxObservation::NotFound;
+				return unanchored(RawTxObservation::NotFound);
 			},
 			Err(e) => {
 				log_error!(
@@ -133,11 +145,11 @@ impl LookupAdapter for EsploraChainAdapter {
 					txid,
 					e
 				);
-				return RawTxObservation::Unreachable;
+				return Err(ChainActionError::Unavailable(format!("status query failed: {}", e)));
 			},
 		};
 		if !status.confirmed {
-			return RawTxObservation::InMempool;
+			return unanchored(RawTxObservation::InMempool);
 		}
 		let height = match status.block_height {
 			Some(height) => height,
@@ -147,7 +159,9 @@ impl LookupAdapter for EsploraChainAdapter {
 					"swap_query_tx: Esplora reported a confirmed tx {} without a block height",
 					txid
 				);
-				return RawTxObservation::Unreachable;
+				return Err(ChainActionError::Unavailable(
+					"confirmed without a block height".to_string(),
+				));
 			},
 		};
 		// B5 LOW-2: the confirming-block height and the tip come from two
@@ -161,7 +175,7 @@ impl LookupAdapter for EsploraChainAdapter {
 		match self.client.get_height().await {
 			Ok(tip_height) if tip_height >= height => {
 				let confirmations = tip_height.saturating_sub(height).saturating_add(1);
-				RawTxObservation::Confirmed { height: Some(height), confirmations }
+				unanchored(RawTxObservation::Confirmed { height: Some(height), confirmations })
 			},
 			Ok(tip_height) => {
 				log_error!(
@@ -171,20 +185,16 @@ impl LookupAdapter for EsploraChainAdapter {
 					height,
 					txid
 				);
-				RawTxObservation::Unreachable
+				Err(ChainActionError::Unavailable(format!(
+					"tip {} below confirming-block height {}",
+					tip_height, height
+				)))
 			},
 			Err(e) => {
 				log_error!(self.logger, "swap_query_tx: Esplora tip query failed: {}", e);
-				RawTxObservation::Unreachable
+				Err(ChainActionError::Unavailable(format!("tip query failed: {}", e)))
 			},
 		}
-	}
-
-	/// Esplora exposes no UTXO-set lookup, so channel announcements cannot be
-	/// verified against one. Pre-seam this was the `_ => None` arm of
-	/// `as_utxo_source`; it is now an explicit declaration by the adapter.
-	fn utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
-		None
 	}
 }
 

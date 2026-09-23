@@ -20,7 +20,10 @@ use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::poll::ValidatedBlockHeader;
 
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
+use crate::chain::seam::{
+	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, UtxoCapability,
+	UtxoVerification,
+};
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
 	apply_post_estimation_adjustments, get_all_conf_targets, get_num_block_defaults_for_target,
@@ -30,7 +33,11 @@ use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
 
 #[cfg(feature = "swaps")]
+use crate::chain::seam::{Anchored, TxStatusAction};
+#[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
+#[cfg(feature = "swaps")]
+use bdk_chain::BlockId;
 #[cfg(feature = "swaps")]
 use bitcoin::{ScriptBuf, Txid};
 #[cfg(feature = "swaps")]
@@ -47,6 +54,7 @@ pub(crate) struct BitcoindChainAdapter {
 	api_client: Arc<BitcoindClient>,
 	/// Cached best-chain tip, shared with the block-polling engine that
 	/// maintains it. Used only as a fail-soft fallback for deriving a height.
+	#[cfg_attr(not(feature = "swaps"), allow(dead_code))] // read by TX_STATUS only
 	latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
@@ -60,15 +68,10 @@ impl BitcoindChainAdapter {
 	) -> Self {
 		Self { api_client, latest_chain_tip, config, logger }
 	}
-}
 
-#[async_trait]
-impl FeeAdapter for BitcoindChainAdapter {
-	fn name(&self) -> &'static str {
-		"bitcoind"
-	}
-
-	async fn fee_rate_update(&self) -> Result<FeeUpdate, Error> {
+	/// The pre-chain fee fetch, unchanged: one RPC per target, each under its
+	/// own wire timeout, with the per-network failure policy.
+	async fn fetch_fee_rate_update(&self) -> Result<FeeUpdate, Error> {
 		macro_rules! get_fee_rate_update {
 			($estimation_fut: expr) => {{
 				let update_res = tokio::time::timeout(
@@ -171,15 +174,32 @@ impl FeeAdapter for BitcoindChainAdapter {
 }
 
 #[async_trait]
-impl LookupAdapter for BitcoindChainAdapter {
+impl FeeAction for BitcoindChainAdapter {
 	fn name(&self) -> &'static str {
 		"bitcoind"
 	}
 
-	#[cfg(feature = "swaps")]
-	async fn tx_status(&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
+	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
+		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
+	}
+}
+
+#[cfg(feature = "swaps")]
+#[async_trait]
+impl TxStatusAction for BitcoindChainAdapter {
+	fn name(&self) -> &'static str {
+		"bitcoind"
+	}
+
+	/// A confirmed observation is anchored to the tip its height was derived
+	/// against — bitcoind is the one backend that reports the tip as a
+	/// height/hash pair. Mempool and not-found answers consult no tip and
+	/// carry none.
+	async fn tx_status(
+		&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>,
+	) -> ActionResult<Anchored<RawTxObservation>> {
 		match self.api_client.swap_tx_confirmations(&txid).await {
-			Ok(Some(0)) => RawTxObservation::InMempool,
+			Ok(Some(0)) => Ok(Anchored { value: RawTxObservation::InMempool, tip: None }),
 			Ok(Some(confirmations)) => {
 				// `getrawtransaction` returns the depth but not the height; derive
 				// it as `tip - (confs - 1)`. B5 LOW-2: read a FRESH best-chain tip
@@ -190,11 +210,16 @@ impl LookupAdapter for BitcoindChainAdapter {
 				// side. Fail-soft on the HEIGHT ONLY: the depth is already
 				// authoritative, so on a tip-read error we fall back to the cached
 				// tip rather than failing the whole query closed.
-				let tip_height = match self.api_client.get_best_block().await {
-					Ok((_, Some(h))) => Some(h),
-					Ok((_, None)) => {
-						self.latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
-					},
+				let cached_tip = || {
+					self.latest_chain_tip
+						.read()
+						.unwrap()
+						.as_ref()
+						.map(|tip| BlockId { height: tip.height, hash: tip.header.block_hash() })
+				};
+				let tip = match self.api_client.get_best_block().await {
+					Ok((hash, Some(height))) => Some(BlockId { height, hash }),
+					Ok((_, None)) => cached_tip(),
 					Err(e) => {
 						log_error!(
 							self.logger,
@@ -202,24 +227,31 @@ impl LookupAdapter for BitcoindChainAdapter {
 							txid,
 							e
 						);
-						self.latest_chain_tip.read().unwrap().as_ref().map(|tip| tip.height)
+						cached_tip()
 					},
 				};
-				let height = tip_height.map(|t| t.saturating_sub(confirmations.saturating_sub(1)));
-				RawTxObservation::Confirmed { height, confirmations }
+				let height = tip.map(|t| t.height.saturating_sub(confirmations.saturating_sub(1)));
+				Ok(Anchored { value: RawTxObservation::Confirmed { height, confirmations }, tip })
 			},
-			Ok(None) => RawTxObservation::NotFound,
+			Ok(None) => Ok(Anchored { value: RawTxObservation::NotFound, tip: None }),
 			Err(e) => {
 				log_error!(self.logger, "swap_query_tx: Bitcoind query failed for {}: {}", txid, e);
-				RawTxObservation::Unreachable
+				Err(ChainActionError::Unavailable(format!("query failed: {}", e)))
 			},
 		}
 	}
+}
 
-	/// bitcoind is the only backend that can answer `gettxout`, so it is the
-	/// only one that can verify BOLT-7 channel announcements.
-	fn utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
-		Some(self.api_client.utxo_source())
+/// bitcoind is the only backend that can answer `gettxout`, so it is the only
+/// one that can verify BOLT-7 channel announcements — and it fetches the
+/// output, so the verification is [`UtxoVerification::Full`].
+impl UtxoCapability for BitcoindChainAdapter {
+	fn name(&self) -> &'static str {
+		"bitcoind"
+	}
+
+	fn utxo_source(&self) -> Option<(Arc<dyn UtxoSource>, UtxoVerification)> {
+		Some((self.api_client.utxo_source(), UtxoVerification::Full))
 	}
 }
 

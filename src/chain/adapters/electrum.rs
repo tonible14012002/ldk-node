@@ -11,14 +11,14 @@ use std::sync::{Arc, RwLock};
 
 use bitcoin::Transaction;
 
-use lightning_block_sync::gossip::UtxoSource;
-
 use crate::chain::electrum::ElectrumRuntimeClient;
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
+use crate::chain::seam::{ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate};
 use crate::chain::ElectrumRuntimeStatus;
 use crate::logger::Logger;
 use crate::Error;
 
+#[cfg(feature = "swaps")]
+use crate::chain::seam::{Anchored, TxStatusAction};
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 #[cfg(feature = "swaps")]
@@ -35,6 +35,7 @@ use async_trait::async_trait;
 /// it rather than a per-target loop.
 pub(crate) struct ElectrumChainAdapter {
 	runtime_status: Arc<RwLock<ElectrumRuntimeStatus>>,
+	#[cfg_attr(not(feature = "swaps"), allow(dead_code))] // read by TX_STATUS only
 	logger: Arc<Logger>,
 }
 
@@ -49,15 +50,10 @@ impl ElectrumChainAdapter {
 	fn client(&self) -> Option<Arc<ElectrumRuntimeClient>> {
 		self.runtime_status.read().unwrap().client().as_ref().map(Arc::clone)
 	}
-}
 
-#[async_trait]
-impl FeeAdapter for ElectrumChainAdapter {
-	fn name(&self) -> &'static str {
-		"electrum"
-	}
-
-	async fn fee_rate_update(&self) -> Result<FeeUpdate, Error> {
+	/// The pre-chain fee fetch, unchanged: the client's own batched call,
+	/// timeout and completeness policy.
+	async fn fetch_fee_rate_update(&self) -> Result<FeeUpdate, Error> {
 		let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
 			self.runtime_status.read().unwrap().client().as_ref()
 		{
@@ -74,13 +70,29 @@ impl FeeAdapter for ElectrumChainAdapter {
 }
 
 #[async_trait]
-impl LookupAdapter for ElectrumChainAdapter {
+impl FeeAction for ElectrumChainAdapter {
 	fn name(&self) -> &'static str {
 		"electrum"
 	}
 
-	#[cfg(feature = "swaps")]
-	async fn tx_status(&self, txid: Txid, script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
+	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
+		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
+	}
+}
+
+/// The Electrum client answers from a script-hash history and reports the tip
+/// as a bare height, so no observation it produces can be anchored: `tip` is
+/// always `None`.
+#[cfg(feature = "swaps")]
+#[async_trait]
+impl TxStatusAction for ElectrumChainAdapter {
+	fn name(&self) -> &'static str {
+		"electrum"
+	}
+
+	async fn tx_status(
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
+	) -> ActionResult<Anchored<RawTxObservation>> {
 		let script_pubkey = match script_pubkey {
 			Some(script_pubkey) => script_pubkey.clone(),
 			None => {
@@ -89,23 +101,25 @@ impl LookupAdapter for ElectrumChainAdapter {
 					"swap_query_tx: Electrum backend requires a watched scriptPubKey for {} (register via watch_txid)",
 					txid
 				);
-				return RawTxObservation::Unreachable;
+				return Err(ChainActionError::Unavailable(
+					"no watched scriptPubKey for the txid".to_string(),
+				));
 			},
 		};
 		let client = match self.client() {
 			Some(client) => client,
 			None => {
 				log_error!(self.logger, "swap_query_tx: Electrum chain source not started");
-				return RawTxObservation::Unreachable;
+				return Err(ChainActionError::Unavailable("chain source not started".to_string()));
 			},
 		};
-		client.swap_query_tx(txid, script_pubkey).await
-	}
-
-	/// Electrum exposes no UTXO-set lookup, so channel announcements cannot be
-	/// verified against one.
-	fn utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
-		None
+		match client.swap_query_tx(txid, script_pubkey).await {
+			// The client has already logged why.
+			RawTxObservation::Unreachable => {
+				Err(ChainActionError::Unavailable("Electrum query failed".to_string()))
+			},
+			value => Ok(Anchored { value, tip: None }),
+		}
 	}
 }
 

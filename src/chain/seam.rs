@@ -63,9 +63,9 @@
 //! * **A chain of length one is legal.** That is how "no fallback" is spelled.
 //!   An empty chain is legal to construct and always `Unavailable`.
 //!
-//! The pre-chain single-adapter traits ([`FeeAdapter`], [`BroadcastAdapter`],
-//! [`LookupAdapter`]) still fill the slots today; they are replaced slot by
-//! slot as each is moved onto its chain.
+//! FEE and TX_STATUS run on chains. The pre-chain single-adapter
+//! [`BroadcastAdapter`] still fills the BROADCAST slot and is replaced when
+//! that slot moves onto its chain; MEMPOOL and SCRIPT_HISTORY follow.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -88,7 +88,7 @@ use crate::chain::RawTxObservation;
 
 use async_trait::async_trait;
 
-/// The outcome of asking a [`FeeAdapter`] for a fee-rate update.
+/// The outcome of asking a [`FeeAction`] for a fee-rate update.
 ///
 /// Richer than a plain map because the pre-seam implementations had two
 /// non-obvious outcomes that must be preserved exactly:
@@ -107,20 +107,6 @@ pub(crate) enum FeeUpdate {
 		/// Log the completion line even when the cache is unchanged.
 		log_unchanged: bool,
 	},
-}
-
-/// Produces fee-rate estimates.
-///
-/// The adapter owns its own per-target strategy, its own network policy and its
-/// own wire timeout — these differ materially between sources and cannot be
-/// hoisted without changing behaviour. The seam owns only installing the result
-/// and recording that it happened.
-#[async_trait]
-pub(crate) trait FeeAdapter: Send + Sync {
-	/// Stable identifier, for logs and for answering "which adapter served this".
-	fn name(&self) -> &'static str;
-
-	async fn fee_rate_update(&self) -> Result<FeeUpdate, Error>;
 }
 
 /// Sends transactions to the Bitcoin network.
@@ -150,54 +136,21 @@ pub(crate) trait BroadcastAdapter: Send + Sync {
 	async fn broadcast_tx(&self, tx: &Transaction);
 }
 
-/// Answers questions about the chain that the wallet's own sync does not cover.
-///
-/// This is deliberately a **narrow query** ability, not a sync engine. The two
-/// sync architectures (transaction-based and block-polling) share no interface
-/// and are selected as an explicit separate axis; what belongs here are the
-/// point lookups their consumers need — the status of an arbitrary transaction,
-/// and whether channel announcements can be verified against the UTXO set.
-#[async_trait]
-pub(crate) trait LookupAdapter: Send + Sync {
-	/// Stable identifier, for logs and for answering "which adapter served this".
-	fn name(&self) -> &'static str;
-
-	/// Reorg-aware status of an ARBITRARY transaction — one the local wallet
-	/// need not own, such as a counterparty's swap opening tx.
-	///
-	/// FAIL-CLOSED (E6): an adapter that cannot answer — unstarted client,
-	/// transport error, missing scriptPubKey, or an inconsistent
-	/// tip/confirming-height pair — MUST return
-	/// [`RawTxObservation::Unreachable`]. It must never report a result that
-	/// could be folded into "confirmed", because callers arm CSV and claim
-	/// deadlines off this answer.
-	#[cfg(feature = "swaps")]
-	async fn tx_status(&self, txid: Txid, script_pubkey: Option<&ScriptBuf>) -> RawTxObservation;
-
-	/// The UTXO source used to verify BOLT-7 `channel_announcement`s.
-	///
-	/// `None` declares that this adapter **cannot** verify announcements, in
-	/// which case they are accepted unverified and the routing graph carries
-	/// capacities nobody checked.
-	fn utxo_source(&self) -> Option<Arc<dyn UtxoSource>>;
-}
-
 // ── PER-ACTION SEAM ──────────────────────────────────────────────────────────
 //
 // Everything below is the per-action shape of the seam: one result type, one
 // trait per action, and the combinator that runs an ordered adapter chain
-// under a budget. Nothing here is wired into `ChainLayer` yet — each slot is
-// moved onto its chain in its own change — so the items carry `dead_code`
-// allowances that are removed as each slot lands.
+// under a budget. FEE and TX_STATUS are wired into `ChainLayer`; the items
+// belonging to slots not yet moved carry `dead_code` allowances that are
+// removed as each slot lands.
 
 /// Per-slot budget the seam imposes on every FEE adapter call.
-#[allow(dead_code)] // consumed once the FEE slot runs on an `ActionChain`
 pub(crate) const FEE_BUDGET: Duration = Duration::from_secs(5);
 /// Per-slot budget the seam imposes on every BROADCAST adapter call.
 #[allow(dead_code)] // consumed once the BROADCAST slot runs on an `ActionChain`
 pub(crate) const BROADCAST_BUDGET: Duration = Duration::from_secs(15);
 /// Per-slot budget the seam imposes on every TX_STATUS adapter call.
-#[allow(dead_code)] // consumed once the TX_STATUS slot runs on an `ActionChain`
+#[cfg(feature = "swaps")]
 pub(crate) const TX_STATUS_BUDGET: Duration = Duration::from_secs(10);
 /// Per-slot budget the seam imposes on every MEMPOOL adapter call.
 #[allow(dead_code)] // consumed once the MEMPOOL slot runs on an `ActionChain`
@@ -211,14 +164,39 @@ pub(crate) const SCRIPT_HISTORY_BUDGET: Duration = Duration::from_secs(90);
 /// See the module docs for the taxonomy. `R` is the slot's rejection payload:
 /// a plain reason for most slots, a per-transaction list for BROADCAST
 /// ([`BroadcastRejection`]).
-#[allow(dead_code)] // `Rejected` is built by adapters and `ActionChain::run`, both unwired until T2/T3
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChainActionError<R = String> {
 	/// The adapter could not answer: unstarted, unreachable, timed out, or
 	/// handed back something it could not parse. The chain advances.
 	Unavailable(String),
 	/// The adapter answered, and the answer is no. Terminal for the chain.
+	#[allow(dead_code)] // built by the BROADCAST adapters once that slot runs on an `ActionChain`
 	Rejected(R),
+}
+
+/// The words every timeout reason carries, whether the seam's budget or an
+/// adapter's own wire timeout produced it. [`ChainActionError::is_timeout`]
+/// keys off this so a slot can report "timed out" and "failed" as the
+/// distinct errors its callers already distinguish.
+const TIMEOUT_MARKER: &str = "timed out";
+
+impl<R> ChainActionError<R> {
+	/// An `Unavailable` whose reason is that the call overran a budget.
+	fn timed_out(budget: Duration) -> Self {
+		Self::Unavailable(format!("{} after {}ms", TIMEOUT_MARKER, budget.as_millis()))
+	}
+
+	/// Whether this reason records a timeout — the seam's budget, an adapter's
+	/// own wire timeout, or, for an exhausted chain, any adapter that timed
+	/// out. A chain of one reports exactly what its adapter did; a longer
+	/// chain reports a timeout when a timeout is part of why it failed,
+	/// because a reachable-but-slow source is the thing an operator can act on.
+	pub(crate) fn is_timeout(&self) -> bool {
+		match self {
+			Self::Unavailable(reason) => reason.contains(TIMEOUT_MARKER),
+			Self::Rejected(_) => false,
+		}
+	}
 }
 
 impl<R: std::fmt::Debug> std::fmt::Display for ChainActionError<R> {
@@ -241,6 +219,18 @@ impl<R> From<ChainProviderError> for ChainActionError<R> {
 	}
 }
 
+/// A backend's own [`Error`] is never a rejection either: the pre-chain
+/// adapters reported every failure to answer as an `Error`, and none of those
+/// is the network saying no. The variant's `Display` text is the reason, which
+/// is what lets [`ChainActionError::is_timeout`] tell
+/// [`Error::FeerateEstimationUpdateTimeout`] from
+/// [`Error::FeerateEstimationUpdateFailed`] after the chain has run.
+impl<R> From<Error> for ChainActionError<R> {
+	fn from(e: Error) -> Self {
+		Self::Unavailable(e.to_string())
+	}
+}
+
 /// What a BROADCAST adapter says no to: each refused txid with its reason.
 #[allow(dead_code)] // consumed once the BROADCAST slot runs on an `ActionChain`
 pub(crate) type BroadcastRejection = Vec<(Txid, String)>;
@@ -254,7 +244,9 @@ pub(crate) type ActionResult<T, R = String> = Result<T, ChainActionError<R>>;
 /// not consider best: a provider's `tip` that is not on our chain makes the
 /// answer `Unavailable` and the chain advances. `None` means the adapter has
 /// no notion of a tip to report (a fee cache, for instance).
-#[allow(dead_code)] // consumed once TX_STATUS/MEMPOOL/SCRIPT_HISTORY run on chains
+// Without `swaps` only MEMPOOL and SCRIPT_HISTORY carry a tip, and neither
+// runs on a chain yet.
+#[cfg_attr(not(feature = "swaps"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Anchored<T> {
 	pub value: T,
@@ -270,7 +262,6 @@ pub(crate) struct Answered<T> {
 }
 
 /// FEE — produces a fee-rate cache update.
-#[allow(dead_code)] // consumed once the FEE slot runs on an `ActionChain`
 #[async_trait]
 pub(crate) trait FeeAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
@@ -309,7 +300,6 @@ pub(crate) trait BroadcastAction: Send + Sync {
 /// never an observation it could fold into "confirmed". The observation is
 /// [`Anchored`] to the tip it was derived against.
 #[cfg(feature = "swaps")]
-#[allow(dead_code)] // consumed once the TX_STATUS slot runs on an `ActionChain`
 #[async_trait]
 pub(crate) trait TxStatusAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
@@ -368,21 +358,30 @@ pub(crate) trait ScriptHistoryAction: Send + Sync {
 }
 
 /// How far a [`UtxoSource`] actually checks a `channel_announcement`.
-#[allow(dead_code)] // consumed once the UTXO slot is filled through `UtxoCapability`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UtxoVerification {
 	/// The output is fetched and its value and script are checked.
 	Full,
 	/// Only that the output exists unspent is checked; value and script are
 	/// taken on trust.
+	#[allow(dead_code)] // declared by the CBF UTXO source once it exists
 	ExistenceOnly,
+}
+
+impl UtxoVerification {
+	/// For the startup log.
+	pub(crate) fn as_str(self) -> &'static str {
+		match self {
+			Self::Full => "full",
+			Self::ExistenceOnly => "existence-only",
+		}
+	}
 }
 
 /// UTXO — the source used to verify BOLT-7 `channel_announcement`s.
 ///
 /// Not an action: it is a capability the layer asks for once at startup. `None`
 /// declares that announcements are accepted unverified.
-#[allow(dead_code)] // consumed once the UTXO slot is filled through `UtxoCapability`
 pub(crate) trait UtxoCapability: Send + Sync {
 	/// Stable identifier, for logs.
 	fn name(&self) -> &'static str;
@@ -405,7 +404,6 @@ pub(crate) struct ActionChain<A: ?Sized> {
 
 impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 	/// A chain for `slot`, trying `adapters` in order, each under `budget`.
-	#[allow(dead_code)] // constructed once the first slot runs on an `ActionChain`
 	pub(crate) fn new(
 		slot: &'static str, budget: Duration, adapters: Vec<Arc<A>>, logger: Arc<Logger>,
 	) -> Self {
@@ -413,18 +411,27 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 	}
 
 	/// The adapter names in chain order, for the startup log.
-	#[allow(dead_code)] // read by `ChainSlotAdapters` once the slots run on chains
 	pub(crate) fn names(&self) -> Vec<&'static str> {
 		self.adapters.iter().map(|a| Self::adapter_name(a)).collect()
 	}
 
-	/// Which adapter answered most recently, if any has.
-	#[allow(dead_code)] // read by diagnostics once the slots run on chains
-	pub(crate) fn last_answered(&self) -> Option<&'static str> {
-		*self.last_answered.lock().unwrap()
+	/// The adapters in chain order, for a slot whose tail needs to address
+	/// them individually (the BROADCAST own-package echo).
+	#[allow(dead_code)] // read by the BROADCAST tail once that slot runs on an `ActionChain`
+	pub(crate) fn adapters(&self) -> &[Arc<A>] {
+		&self.adapters
 	}
 
-	#[allow(dead_code)] // read once the slots run on chains
+	/// Which adapter answered most recently, if any has.
+	///
+	/// A poisoned lock holds a plain `Option<&'static str>` that no panic can
+	/// leave half-written, so the value is taken as is.
+	#[allow(dead_code)] // read by diagnostics once every slot runs on a chain
+	pub(crate) fn last_answered(&self) -> Option<&'static str> {
+		*self.last_answered.lock().unwrap_or_else(|e| e.into_inner())
+	}
+
+	#[allow(dead_code)] // read once every slot runs on a chain
 	pub(crate) fn is_empty(&self) -> bool {
 		self.adapters.is_empty()
 	}
@@ -434,18 +441,18 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 	/// `Unavailable` (including a budget timeout) advances to the next adapter;
 	/// `Rejected` returns at once and no later adapter is tried; `Ok` stops the
 	/// chain, records the answerer and returns it. An empty or exhausted chain
-	/// is `Unavailable` — never a stale or invented value.
+	/// is `Unavailable` — never a stale or invented value — and an exhausted
+	/// one reports every adapter's reason, in order.
 	///
 	/// `action` receives an owned `Arc` so the future it builds borrows nothing
 	/// from the chain: that is what lets a single `Fut` type serve every
 	/// adapter without a higher-ranked lifetime on the closure.
-	#[allow(dead_code)] // called once the slots run on chains
 	pub(crate) async fn run<T, R, F, Fut>(&self, action: F) -> ActionResult<Answered<T>, R>
 	where
 		F: Fn(Arc<A>) -> Fut,
 		Fut: Future<Output = ActionResult<T, R>>,
 	{
-		let mut last_reason = String::from("no adapters configured");
+		let mut reasons: Vec<String> = Vec::with_capacity(self.adapters.len());
 
 		for (idx, adapter) in self.adapters.iter().enumerate() {
 			let name = Self::adapter_name(adapter);
@@ -454,15 +461,12 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 			let outcome = match tokio::time::timeout(self.budget, action(Arc::clone(adapter))).await
 			{
 				Ok(outcome) => outcome,
-				Err(_elapsed) => Err(ChainActionError::Unavailable(format!(
-					"timed out after {}ms",
-					self.budget.as_millis()
-				))),
+				Err(_elapsed) => Err(ChainActionError::timed_out(self.budget)),
 			};
 
 			match outcome {
 				Ok(value) => {
-					*self.last_answered.lock().unwrap() = Some(name);
+					*self.last_answered.lock().unwrap_or_else(|e| e.into_inner()) = Some(name);
 					log_debug!(self.logger, "slot={} answered_by={}", self.slot, name);
 					return Ok(Answered { value, by: name });
 				},
@@ -477,7 +481,7 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 				},
 				Err(ChainActionError::Unavailable(reason)) => {
 					match next {
-						Some(next) => log_info!(
+						Some(next) => log_debug!(
 							self.logger,
 							"slot={} adapter={} unavailable ({}); falling through to adapter={}",
 							self.slot,
@@ -493,12 +497,17 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 							reason
 						),
 					}
-					last_reason = format!("{}: {}", name, reason);
+					reasons.push(format!("{}: {}", name, reason));
 				},
 			}
 		}
 
-		Err(ChainActionError::Unavailable(format!("{}: exhausted: {}", self.slot, last_reason)))
+		let reason = if reasons.is_empty() {
+			String::from("no adapters configured")
+		} else {
+			reasons.join("; ")
+		};
+		Err(ChainActionError::Unavailable(format!("{}: exhausted: {}", self.slot, reason)))
 	}
 
 	fn adapter_name(adapter: &Arc<A>) -> &'static str {
@@ -698,12 +707,46 @@ mod tests {
 
 		match err {
 			ChainActionError::Unavailable(reason) => {
-				assert!(reason.starts_with("fee: exhausted: "), "{}", reason);
-				assert!(reason.contains("down-b is down"), "last reason is reported: {}", reason);
+				assert_eq!(
+					reason, "fee: exhausted: down-a: down-a is down; down-b: down-b is down",
+					"every adapter's reason is reported, in order"
+				);
 			},
 			other => panic!("exhaustion must be Unavailable, got {:?}", other),
 		}
 		assert_eq!(chain.last_answered(), Some("first"), "history is kept, but never served");
+	}
+
+	#[tokio::test]
+	async fn exhaustion_by_budget_reads_as_timeout() {
+		let hung = FakeFee::new("hung", Behaviour::Hang);
+		let chain = chain(Duration::from_millis(20), &[Arc::clone(&hung)]);
+
+		let err = run(&chain).await.unwrap_err();
+
+		assert!(err.is_timeout(), "{}", err);
+
+		let down = FakeFee::new("down", Behaviour::Unavailable);
+		let chain = self::chain(Duration::from_millis(20), &[down]);
+		let err = run(&chain).await.unwrap_err();
+		assert!(!err.is_timeout(), "{}", err);
+	}
+
+	/// The FEE slot maps exhaustion back onto the two `Error` variants its
+	/// callers already distinguish, so a backend's own timeout must survive
+	/// the round trip through the reason text.
+	#[test]
+	fn backend_errors_keep_their_timeout_identity() {
+		let timeout: ChainActionError = Error::FeerateEstimationUpdateTimeout.into();
+		assert!(matches!(timeout, ChainActionError::Unavailable(_)));
+		assert!(timeout.is_timeout());
+
+		let failed: ChainActionError = Error::FeerateEstimationUpdateFailed.into();
+		assert!(matches!(failed, ChainActionError::Unavailable(_)));
+		assert!(!failed.is_timeout());
+
+		let rejected: ChainActionError = ChainActionError::Rejected("no".to_string());
+		assert!(!rejected.is_timeout());
 	}
 
 	/// A new chain over `adapters` that carries `previous`'s answer history —

@@ -7,10 +7,18 @@
 
 //! Chain ability adapters for a node with no chain source of its own.
 //!
-//! All three slots are filled from a single [`ChainDataProvider`]: the node
-//! asks another node and believes the answer. There is no verification step
-//! here and that is the design — a Dependent node that could check the answer
+//! Every slot is filled from a single [`ChainDataProvider`]: the node asks
+//! another node and believes the answer. There is no verification step here
+//! and that is the design — a Dependent node that could check the answer
 //! would not need to ask.
+//!
+//! What it does not offer is a UTXO source. It could ask its provider to check
+//! the UTXO set, but an announcement "verified" by asking the same node that
+//! supplied it is not verified; not implementing [`UtxoCapability`] makes the
+//! node log, at startup, that its routing graph carries unchecked capacities —
+//! which is the honest position.
+//!
+//! [`UtxoCapability`]: crate::chain::seam::UtxoCapability
 //!
 //! What it does *not* do is pretend. Every path below distinguishes "the
 //! provider said no" from "I could not ask", because the second is not
@@ -21,12 +29,10 @@ use std::sync::Arc;
 
 use bitcoin::{FeeRate, Transaction};
 
-use lightning_block_sync::gossip::UtxoSource;
-
 use crate::chain::provider::{
 	ChainDataProvider, ChainProviderError, WireBroadcastRequest, CHAIN_WIRE_VERSION,
 };
-use crate::chain::seam::{BroadcastAdapter, FeeAdapter, FeeUpdate, LookupAdapter};
+use crate::chain::seam::{ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate};
 use crate::chain::wire_convert::{check_version, tx_to_wire};
 use crate::fee_estimator::{apply_post_estimation_adjustments, conf_target_from_wire_name};
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
@@ -34,6 +40,8 @@ use crate::Error;
 
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusRequest;
+#[cfg(feature = "swaps")]
+use crate::chain::seam::{Anchored, TxStatusAction};
 #[cfg(feature = "swaps")]
 use crate::chain::wire_convert::{script_to_wire, txid_to_wire};
 #[cfg(feature = "swaps")]
@@ -43,7 +51,7 @@ use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
-/// Fills the FEE, LOOKUP and BROADCAST slots from a remote node.
+/// Fills the FEE, TX_STATUS and BROADCAST slots from a remote node.
 pub(crate) struct DependentChainAdapter {
 	provider: Arc<dyn ChainDataProvider>,
 	logger: Arc<Logger>,
@@ -53,15 +61,10 @@ impl DependentChainAdapter {
 	pub(crate) fn new(provider: Arc<dyn ChainDataProvider>, logger: Arc<Logger>) -> Self {
 		Self { provider, logger }
 	}
-}
 
-#[async_trait]
-impl FeeAdapter for DependentChainAdapter {
-	fn name(&self) -> &'static str {
-		"dependent"
-	}
-
-	async fn fee_rate_update(&self) -> Result<FeeUpdate, Error> {
+	/// The pre-chain fee fetch, unchanged: the provider's answer, checked and
+	/// re-floored locally.
+	async fn fetch_fee_rate_update(&self) -> Result<FeeUpdate, Error> {
 		let estimates = self.provider.fee_estimates().await.map_err(|e| {
 			log_error!(self.logger, "Failed to retrieve fee rate estimates from provider: {}", e);
 			match e {
@@ -111,6 +114,17 @@ impl FeeAdapter for DependentChainAdapter {
 }
 
 #[async_trait]
+impl FeeAction for DependentChainAdapter {
+	fn name(&self) -> &'static str {
+		"dependent"
+	}
+
+	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
+		self.fetch_fee_rate_update().await.map_err(ChainActionError::from)
+	}
+}
+
+#[async_trait]
 impl BroadcastAdapter for DependentChainAdapter {
 	fn name(&self) -> &'static str {
 		"dependent"
@@ -142,14 +156,20 @@ impl BroadcastAdapter for DependentChainAdapter {
 	}
 }
 
+/// The wire answer carries the tip as a bare height, so no observation can be
+/// anchored: `tip` is always `None`.
+#[cfg(feature = "swaps")]
 #[async_trait]
-impl LookupAdapter for DependentChainAdapter {
+impl TxStatusAction for DependentChainAdapter {
 	fn name(&self) -> &'static str {
 		"dependent"
 	}
 
-	#[cfg(feature = "swaps")]
-	async fn tx_status(&self, txid: Txid, script_pubkey: Option<&ScriptBuf>) -> RawTxObservation {
+	async fn tx_status(
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
+	) -> ActionResult<Anchored<RawTxObservation>> {
+		let unanchored = |value| Ok(Anchored { value, tip: None });
+
 		let req = WireTxStatusRequest {
 			version: CHAIN_WIRE_VERSION,
 			txid: txid_to_wire(&txid),
@@ -167,7 +187,7 @@ impl LookupAdapter for DependentChainAdapter {
 					txid,
 					e
 				);
-				return RawTxObservation::Unreachable;
+				return Err(e.into());
 			},
 		};
 
@@ -179,15 +199,18 @@ impl LookupAdapter for DependentChainAdapter {
 				resp.version,
 				CHAIN_WIRE_VERSION
 			);
-			return RawTxObservation::Unreachable;
+			return Err(ChainActionError::Unavailable(format!(
+				"wire version {} (expected {})",
+				resp.version, CHAIN_WIRE_VERSION
+			)));
 		}
 
 		if !resp.confirmed {
-			return if resp.in_mempool {
+			return unanchored(if resp.in_mempool {
 				RawTxObservation::InMempool
 			} else {
 				RawTxObservation::NotFound
-			};
+			});
 		}
 
 		// Confirmed, so the answer must carry a height and a tip to derive
@@ -199,7 +222,9 @@ impl LookupAdapter for DependentChainAdapter {
 				"swap_query_tx: chain provider reported {} confirmed without a height/tip pair; failing closed",
 				txid
 			);
-			return RawTxObservation::Unreachable;
+			return Err(ChainActionError::Unavailable(
+				"confirmed without a height/tip pair".to_string(),
+			));
 		};
 
 		if tip_height < height {
@@ -213,20 +238,13 @@ impl LookupAdapter for DependentChainAdapter {
 				height,
 				txid
 			);
-			return RawTxObservation::Unreachable;
+			return Err(ChainActionError::Unavailable(format!(
+				"tip {} below confirming-block height {}",
+				tip_height, height
+			)));
 		}
 
 		let confirmations = tip_height.saturating_sub(height).saturating_add(1);
-		RawTxObservation::Confirmed { height: Some(height), confirmations }
-	}
-
-	/// A Dependent node cannot verify BOLT-7 channel announcements.
-	///
-	/// It could ask its provider to check the UTXO set, but an announcement
-	/// "verified" by asking the same node that supplied it is not verified.
-	/// Declaring `None` makes the node log, at startup, that its routing graph
-	/// carries unchecked capacities — which is the honest position.
-	fn utxo_source(&self) -> Option<Arc<dyn UtxoSource>> {
-		None
+		unanchored(RawTxObservation::Confirmed { height: Some(height), confirmations })
 	}
 }

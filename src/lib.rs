@@ -294,26 +294,18 @@ impl Node {
 			e
 		})?;
 
-		// Record which adapter occupies each chain ability slot, so a support
-		// question about a fee or broadcast answer can be traced to the thing
-		// that produced it without guessing from config.
+		// Record which adapters occupy each chain ability slot, in chain order,
+		// so a support question about a fee or broadcast answer can be traced
+		// to the thing that produced it without guessing from config.
 		let slots = self.chain_source.slot_adapters();
-		log_info!(
-			self.logger,
-			"Chain ability slots: fee={} lookup={} broadcast={} (sync engine: {})",
-			slots.fee,
-			slots.lookup,
-			slots.broadcast,
-			slots.engine
-		);
-		if !slots.verifies_announcements {
+		log_info!(self.logger, "Chain ability slots: {}", slots);
+		if slots.utxo.is_none() {
 			// Say this out loud. Without a UTXO source the routing graph accepts
 			// every peer's channel_announcement without checking that the funding
 			// output exists, and nothing else reports it.
 			log_info!(
 				self.logger,
-				"Chain lookup adapter '{}' cannot verify BOLT-7 channel announcements; the routing graph will carry unverified channel capacities.",
-				slots.lookup
+				"No chain adapter can verify BOLT-7 channel announcements; the routing graph will carry unverified channel capacities."
 			);
 		}
 
