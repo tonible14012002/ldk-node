@@ -48,7 +48,7 @@ use crate::chain::provider::{
 use crate::chain::ChainLayer;
 use crate::config::{BackgroundSyncConfig, WALLET_SYNC_INTERVAL_MINIMUM_SECS};
 use crate::logger::{log_trace, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, Sweeper};
+use crate::types::{ChainMonitor, ChannelManager, Sweeper, Wallet};
 use crate::Error;
 
 use async_trait::async_trait;
@@ -166,6 +166,26 @@ pub(crate) trait SyncEngine: Send + Sync {
 		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,
 	);
+
+	/// Whether this engine has no mempool view of its own, so the on-chain
+	/// wallet only learns of the node's own broadcasts if the BROADCAST tail
+	/// tells it.
+	///
+	/// An engine that syncs against a mempool — every engine today — sees its
+	/// own transactions come back and must answer `false`, or the tail would
+	/// stamp a fresh `last_seen` on every rebroadcast for nothing. A
+	/// block-filter engine answers `true`, because for it the tail is the
+	/// only way the wallet ever hears that the coins a just-sent transaction
+	/// spent are gone.
+	fn tracks_own_broadcasts(&self) -> bool {
+		false
+	}
+
+	/// The on-chain wallet this engine keeps in step, for the BROADCAST tail
+	/// to record what left the node. `None` for an engine that has none.
+	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
+		None
+	}
 
 	/// `Filter` registration. Transaction-based engines must watch these;
 	/// block-polling engines see every block anyway and ignore them.

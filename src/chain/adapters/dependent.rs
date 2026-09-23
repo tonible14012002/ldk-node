@@ -32,9 +32,11 @@ use bitcoin::{FeeRate, Transaction};
 
 use crate::chain::provider::{ChainDataProvider, WireBroadcastRequest, CHAIN_WIRE_VERSION};
 use crate::chain::seam::{
-	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, FEE_BUDGET,
+	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
+	FeeUpdate, TxBroadcastOutcome, FEE_BUDGET, MAX_BROADCAST_PACKAGE_TXS,
 };
 use crate::chain::wire_convert::{check_version, tx_to_wire};
+use crate::config::TX_BROADCAST_TIMEOUT_SECS;
 use crate::fee_estimator::{apply_post_estimation_adjustments, conf_target_from_wire_name};
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
 
@@ -67,6 +69,15 @@ const DEPENDENT_TRANSPORT_MARGIN: Duration = Duration::from_secs(5);
 /// slot default plus the transport margin covers it.
 const DEPENDENT_FEE_BUDGET: Duration =
 	Duration::from_secs(FEE_BUDGET.as_secs() + DEPENDENT_TRANSPORT_MARGIN.as_secs());
+
+/// BROADCAST budget: the wire carries one transaction per request, so a
+/// package is as many round trips as it has transactions. Each one is the
+/// serving node's own per-transaction send — bounded by its backend's
+/// `TX_BROADCAST_TIMEOUT_SECS`, whichever backend it has — plus transport.
+/// Sized for the largest package, like the backends' own budgets.
+const DEPENDENT_BROADCAST_BUDGET: Duration = Duration::from_secs(
+	MAX_BROADCAST_PACKAGE_TXS * (TX_BROADCAST_TIMEOUT_SECS + DEPENDENT_TRANSPORT_MARGIN.as_secs()),
+);
 
 /// TX_STATUS budget: the serving node runs its own TX_STATUS chain, through
 /// whichever adapter it has, and this node cannot know which — so it must
@@ -166,17 +177,41 @@ impl FeeAction for DependentChainAdapter {
 }
 
 #[async_trait]
-impl BroadcastAdapter for DependentChainAdapter {
+impl BroadcastAction for DependentChainAdapter {
 	fn name(&self) -> &'static str {
 		"dependent"
 	}
 
-	async fn broadcast_tx(&self, tx: &Transaction) {
+	fn budget(&self) -> Option<Duration> {
+		Some(DEPENDENT_BROADCAST_BUDGET)
+	}
+
+	/// One request per transaction, since the wire carries one.
+	///
+	/// This adapter never answers `Rejected`. The wire (frozen at
+	/// `CHAIN_WIRE_VERSION` 1) cannot express a rejection: the serving node
+	/// fails the call whether its own chain could not broadcast or the network
+	/// refused the transaction, and both reach this node as the same
+	/// [`ChainProviderError::Refused`]. `Refused` means only that the provider
+	/// would not serve, so it is `Unavailable` like every other provider
+	/// error, and the chain advances.
+	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+		let mut outcomes = Vec::with_capacity(txs.len());
+		for tx in txs {
+			outcomes.push((tx.compute_txid(), self.broadcast_tx(tx).await));
+		}
+		package_result(outcomes)
+	}
+}
+
+impl DependentChainAdapter {
+	/// The pre-seam per-transaction send and its log levels. A provider error
+	/// maps straight onto the seam's error — `Unreachable` is the timeout, as
+	/// it was pre-chain — and from there onto the per-transaction outcome.
+	async fn broadcast_tx(&self, tx: &Transaction) -> TxBroadcastOutcome {
 		let txid = tx.compute_txid();
 		let req = WireBroadcastRequest { version: CHAIN_WIRE_VERSION, tx_hex: tx_to_wire(tx) };
 
-		// Broadcast is lossy by contract: a failure here is logged and
-		// dropped, never propagated. See `BroadcastAdapter`.
 		match self.provider.broadcast(req).await {
 			Ok(()) => {
 				log_trace!(
@@ -184,6 +219,7 @@ impl BroadcastAdapter for DependentChainAdapter {
 					"Chain provider accepted transaction {} for broadcast",
 					txid
 				);
+				TxBroadcastOutcome::Accepted
 			},
 			Err(e) => {
 				log_error!(
@@ -192,6 +228,7 @@ impl BroadcastAdapter for DependentChainAdapter {
 					txid,
 					e
 				);
+				ChainActionError::from(e).into()
 			},
 		}
 	}

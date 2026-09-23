@@ -1687,8 +1687,10 @@ impl Node {
 
 	/// Broadcast another node's transaction through this node's chain source.
 	///
-	/// Returns once the transaction has been accepted for broadcast — not
-	/// once it has reached a miner, which no node can promise.
+	/// Returns once the transaction has been handed to the network — not
+	/// once it has reached a miner, which no node can promise. Errors when
+	/// this node's own chain source could not put it on the network, or when
+	/// the network rejected it; the wire does not distinguish the two.
 	pub fn chain_serve_broadcast(
 		&self, req: &chain_provider::WireBroadcastRequest,
 	) -> Result<(), Error> {

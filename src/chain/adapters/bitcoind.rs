@@ -18,11 +18,13 @@ use lightning::util::ser::Writeable;
 
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::poll::ValidatedBlockHeader;
+use lightning_block_sync::rpc::RpcError;
 
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
 use crate::chain::seam::{
-	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, UtxoCapability,
-	UtxoVerification, ADAPTER_BUDGET_MARGIN,
+	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
+	FeeUpdate, TxBroadcastOutcome, UtxoCapability, UtxoVerification, ADAPTER_BUDGET_MARGIN,
+	PER_TX_BROADCAST_BUDGET,
 };
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
@@ -60,6 +62,47 @@ const BITCOIND_HTTP_CALL_BOUND_SECS: u64 = 5 + 5 + 300;
 #[cfg(feature = "swaps")]
 pub(crate) const BITCOIND_TX_STATUS_BUDGET: Duration =
 	Duration::from_secs(2 * BITCOIND_HTTP_CALL_BOUND_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
+
+/// `sendrawtransaction` error codes that are a verdict on the transaction
+/// itself, from Bitcoin Core's `RPCErrorCode`.
+///
+/// `RPC_TRANSACTION_ERROR` (-25) is missing or already-spent inputs;
+/// `RPC_TRANSACTION_REJECTED` (-26) is a mempool policy or consensus verdict
+/// (`insufficient fee, rejecting replacement`, `txn-mempool-conflict`, ...).
+/// Both are the network refusing this transaction as it stands, and resending
+/// it elsewhere would only buy the same verdict.
+const RPC_TRANSACTION_ERROR: i64 = -25;
+const RPC_TRANSACTION_REJECTED: i64 = -26;
+/// `RPC_TRANSACTION_ALREADY_IN_CHAIN` (-27): the transaction is confirmed, so
+/// the network has it. As good as accepted.
+const RPC_TRANSACTION_ALREADY_IN_CHAIN: i64 = -27;
+/// The one -26 reason that is not a refusal: bitcoind already has this
+/// transaction in its mempool. A stable Core reject string.
+const REJECT_TXN_ALREADY_KNOWN: &str = "txn-already-known";
+
+/// Classify a failed `sendrawtransaction`.
+///
+/// Only an RPC error whose code is one of the verdict codes above is
+/// `Rejected`; a transport failure, a timeout, or any other RPC error is
+/// `Unavailable`, because nothing is known about the transaction from it.
+fn classify_broadcast_error(e: &std::io::Error) -> TxBroadcastOutcome {
+	if e.kind() == std::io::ErrorKind::TimedOut {
+		return TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true };
+	}
+	let Some(rpc_error) = e.get_ref().and_then(|inner| inner.downcast_ref::<RpcError>()) else {
+		return TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: false };
+	};
+	match rpc_error.code {
+		RPC_TRANSACTION_ALREADY_IN_CHAIN => TxBroadcastOutcome::AlreadyKnown,
+		RPC_TRANSACTION_REJECTED if rpc_error.message.contains(REJECT_TXN_ALREADY_KNOWN) => {
+			TxBroadcastOutcome::AlreadyKnown
+		},
+		RPC_TRANSACTION_ERROR | RPC_TRANSACTION_REJECTED => {
+			TxBroadcastOutcome::Rejected(format!("{} ({})", rpc_error.message, rpc_error.code))
+		},
+		_ => TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: false },
+	}
+}
 
 /// Fee estimates from a bitcoind RPC/REST endpoint.
 ///
@@ -291,16 +334,37 @@ impl UtxoCapability for BitcoindChainAdapter {
 }
 
 #[async_trait]
-impl BroadcastAdapter for BitcoindChainAdapter {
+impl BroadcastAction for BitcoindChainAdapter {
 	fn name(&self) -> &'static str {
 		"bitcoind"
+	}
+
+	/// Pre-seam timing preserved: each transaction is sent under its own
+	/// `TX_BROADCAST_TIMEOUT_SECS`, so that timeout and its error log fire
+	/// before the seam's.
+	fn budget(&self) -> Option<Duration> {
+		Some(PER_TX_BROADCAST_BUDGET)
 	}
 
 	// While it's a bit unclear when we'd be able to lean on Bitcoin Core >v28
 	// features, we should eventually switch to use `submitpackage` via the
 	// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
 	// transactions.
-	async fn broadcast_tx(&self, tx: &Transaction) {
+	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+		let mut outcomes = Vec::with_capacity(txs.len());
+		for tx in txs {
+			outcomes.push((tx.compute_txid(), self.broadcast_tx(tx).await));
+		}
+		package_result(outcomes)
+	}
+}
+
+impl BitcoindChainAdapter {
+	/// The pre-seam per-transaction send and its log levels, with the RPC
+	/// error classified by [`classify_broadcast_error`]. A verdict is logged
+	/// at trace here, not error: the layer's tail logs each rejection with
+	/// its reason once it has decided what to do about it.
+	async fn broadcast_tx(&self, tx: &Transaction) -> TxBroadcastOutcome {
 		let txid = tx.compute_txid();
 		let timeout_fut = tokio::time::timeout(
 			Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
@@ -311,14 +375,42 @@ impl BroadcastAdapter for BitcoindChainAdapter {
 				Ok(id) => {
 					debug_assert_eq!(id, txid);
 					log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
+					TxBroadcastOutcome::Accepted
 				},
 				Err(e) => {
-					log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
+					let outcome = classify_broadcast_error(&e);
+					match &outcome {
+						TxBroadcastOutcome::AlreadyKnown => {
+							log_trace!(
+								self.logger,
+								"Transaction {} is already known to bitcoind: {}",
+								txid,
+								e
+							);
+						},
+						TxBroadcastOutcome::Rejected(reason) => {
+							log_trace!(
+								self.logger,
+								"bitcoind rejected transaction {}: {}",
+								txid,
+								reason
+							);
+						},
+						_ => {
+							log_error!(
+								self.logger,
+								"Failed to broadcast transaction {}: {}",
+								txid,
+								e
+							);
+						},
+					}
 					log_trace!(
 						self.logger,
 						"Failed broadcast transaction bytes: {}",
 						log_bytes!(tx.encode())
 					);
+					outcome
 				},
 			},
 			Err(e) => {
@@ -333,6 +425,7 @@ impl BroadcastAdapter for BitcoindChainAdapter {
 					"Failed broadcast transaction bytes: {}",
 					log_bytes!(tx.encode())
 				);
+				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true }
 			},
 		}
 	}

@@ -8,7 +8,7 @@
 //! Logging-related objects.
 
 pub(crate) use lightning::util::logger::{Logger as LdkLogger, Record as LdkRecord};
-pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace};
+pub(crate) use lightning::{log_bytes, log_debug, log_error, log_info, log_trace, log_warn};
 
 pub use lightning::util::logger::Level as LogLevel;
 

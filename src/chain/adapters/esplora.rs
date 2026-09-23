@@ -18,7 +18,8 @@ use esplora_client::AsyncClient as EsploraAsyncClient;
 use lightning::util::ser::Writeable;
 
 use crate::chain::seam::{
-	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, ADAPTER_BUDGET_MARGIN,
+	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
+	FeeUpdate, TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, PER_TX_BROADCAST_BUDGET,
 };
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
@@ -233,12 +234,37 @@ impl TxStatusAction for EsploraChainAdapter {
 }
 
 #[async_trait]
-impl BroadcastAdapter for EsploraChainAdapter {
+impl BroadcastAction for EsploraChainAdapter {
 	fn name(&self) -> &'static str {
 		"esplora"
 	}
 
-	async fn broadcast_tx(&self, tx: &Transaction) {
+	/// Pre-seam timing preserved: each transaction is sent under its own
+	/// `TX_BROADCAST_TIMEOUT_SECS`, so the HTTP client's timeout and its error
+	/// log fire before the seam's.
+	fn budget(&self) -> Option<Duration> {
+		Some(PER_TX_BROADCAST_BUDGET)
+	}
+
+	/// One send per transaction, exactly as pre-seam — a later transaction is
+	/// still sent after an earlier one failed — then the package is answered
+	/// for as a whole.
+	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+		let mut outcomes = Vec::with_capacity(txs.len());
+		for tx in txs {
+			outcomes.push((tx.compute_txid(), self.broadcast_tx(tx).await));
+		}
+		package_result(outcomes)
+	}
+}
+
+impl EsploraChainAdapter {
+	/// The pre-seam per-transaction send, with its classification and log
+	/// levels: an HTTP 400 usually just means bitcoind already knows the
+	/// transaction, so it is logged at trace and counts as already known;
+	/// every other failure is logged at error and is `Unavailable`, timed out
+	/// when the client's own timeout or ours is what failed it.
+	async fn broadcast_tx(&self, tx: &Transaction) -> TxBroadcastOutcome {
 		let txid = tx.compute_txid();
 		let timeout_fut = tokio::time::timeout(
 			Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
@@ -248,6 +274,7 @@ impl BroadcastAdapter for EsploraChainAdapter {
 			Ok(res) => match res {
 				Ok(()) => {
 					log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
+					TxBroadcastOutcome::Accepted
 				},
 				Err(e) => match e {
 					esplora_client::Error::HttpResponse { status, message } => {
@@ -262,6 +289,12 @@ impl BroadcastAdapter for EsploraChainAdapter {
 								"Failed to broadcast due to HTTP connection error: {}",
 								message
 							);
+							log_trace!(
+								self.logger,
+								"Failed broadcast transaction bytes: {}",
+								log_bytes!(tx.encode())
+							);
+							TxBroadcastOutcome::AlreadyKnown
 						} else {
 							log_error!(
 								self.logger,
@@ -269,12 +302,16 @@ impl BroadcastAdapter for EsploraChainAdapter {
 								status,
 								message
 							);
+							log_trace!(
+								self.logger,
+								"Failed broadcast transaction bytes: {}",
+								log_bytes!(tx.encode())
+							);
+							TxBroadcastOutcome::Unavailable {
+								reason: format!("HTTP {}: {}", status, message),
+								timed_out: false,
+							}
 						}
-						log_trace!(
-							self.logger,
-							"Failed broadcast transaction bytes: {}",
-							log_bytes!(tx.encode())
-						);
 					},
 					_ => {
 						log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
@@ -283,6 +320,11 @@ impl BroadcastAdapter for EsploraChainAdapter {
 							"Failed broadcast transaction bytes: {}",
 							log_bytes!(tx.encode())
 						);
+						let timed_out = matches!(
+							&e,
+							esplora_client::Error::Reqwest(inner) if inner.is_timeout()
+						);
+						TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out }
 					},
 				},
 			},
@@ -298,6 +340,7 @@ impl BroadcastAdapter for EsploraChainAdapter {
 					"Failed broadcast transaction bytes: {}",
 					log_bytes!(tx.encode())
 				);
+				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true }
 			},
 		}
 	}

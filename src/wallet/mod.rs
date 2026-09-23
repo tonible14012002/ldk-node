@@ -55,9 +55,9 @@ use bitcoin::bip32::{ChildNumber, Xpriv};
 #[cfg(feature = "swaps")]
 use bitcoin::secp256k1::Keypair;
 
+use std::collections::HashMap;
 use std::ops::Deref;
 use std::str::FromStr;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub(crate) enum OnchainSendAmount {
@@ -946,9 +946,7 @@ where
 /// method adds error logging on top of this pure derivation. Secret material is
 /// never logged here.
 #[cfg(feature = "swaps")]
-fn swap_keypair_from_master(
-	master: &Xpriv, index: u32,
-) -> Result<Keypair, bitcoin::bip32::Error> {
+fn swap_keypair_from_master(master: &Xpriv, index: u32) -> Result<Keypair, bitcoin::bip32::Error> {
 	let secp = Secp256k1::new();
 	let child = master.derive_priv(&secp, &[ChildNumber::Hardened { index }])?;
 	Ok(Keypair::from_secret_key(&secp, &child.private_key))
@@ -1165,5 +1163,95 @@ mod swap_b7_tests {
 				"swap pubkey at index {index} must never equal the node identity pubkey"
 			);
 		}
+	}
+}
+
+#[cfg(test)]
+mod broadcast_eviction_tests {
+	//! The BDK behaviour the BROADCAST tail relies on when it evicts a
+	//! rejected transaction, pinned down on a bare `bdk_wallet::Wallet` so it
+	//! needs no chain source: an own unconfirmed spend takes the coins it
+	//! spent out of `list_unspent`, and evicting it hands them back.
+	use bdk_wallet::{KeychainKind, SignOptions, Wallet as BdkWallet};
+	use bitcoin::hashes::Hash;
+	use bitcoin::{
+		absolute, transaction, Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence,
+		Transaction, TxIn, TxOut, Txid, WPubkeyHash, Witness,
+	};
+
+	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
+	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
+	const FUNDING_SATS: u64 = 100_000;
+
+	fn new_wallet() -> BdkWallet {
+		BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+			.network(Network::Regtest)
+			.create_wallet_no_persist()
+			.expect("valid test descriptors")
+	}
+
+	fn someone_elses_script() -> ScriptBuf {
+		ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&[0x42u8; 33]))
+	}
+
+	/// An unconfirmed deposit into the wallet, spending an outpoint nobody checks.
+	fn fund(wallet: &mut BdkWallet, last_seen: u64) -> OutPoint {
+		let address = wallet.reveal_next_address(KeychainKind::External).address;
+		let funding = Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint { txid: Txid::from_byte_array([7u8; 32]), vout: 0 },
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(FUNDING_SATS),
+				script_pubkey: address.script_pubkey(),
+			}],
+		};
+		let outpoint = OutPoint { txid: funding.compute_txid(), vout: 0 };
+		wallet.apply_unconfirmed_txs(vec![(funding, last_seen)]);
+		outpoint
+	}
+
+	/// Builds, signs and returns a send of `sats` to a foreign script — exactly what
+	/// `Wallet::send_to_address` does before it queues the result.
+	fn build_send(wallet: &mut BdkWallet, sats: u64) -> Transaction {
+		let mut builder = wallet.build_tx();
+		builder
+			.add_recipient(someone_elses_script(), Amount::from_sat(sats))
+			.fee_rate(FeeRate::from_sat_per_vb_u32(1));
+		let mut psbt = builder.finish().expect("the wallet can fund this send");
+		assert!(wallet.sign(&mut psbt, SignOptions::default()).expect("signing works"));
+		psbt.extract_tx().expect("finalized psbt extracts")
+	}
+
+	fn unspent_outpoints(wallet: &BdkWallet) -> Vec<OutPoint> {
+		wallet.list_unspent().map(|u| u.outpoint).collect()
+	}
+
+	#[test]
+	fn evicting_an_unconfirmed_spend_hands_its_inputs_back() {
+		let mut wallet = new_wallet();
+		let deposit = fund(&mut wallet, 1);
+		let first = build_send(&mut wallet, 30_000);
+		let first_txid = first.compute_txid();
+		wallet.apply_unconfirmed_txs(vec![(first, 2)]);
+		assert!(!unspent_outpoints(&wallet).contains(&deposit));
+
+		// An eviction stamped no earlier than the last sighting wins (BDK: a transaction whose
+		// `last_evicted >= last_seen` is no longer canonical).
+		wallet.apply_evicted_txs(vec![(first_txid, 2)]);
+		assert_eq!(unspent_outpoints(&wallet), vec![deposit], "the deposit is spendable again");
+
+		// The eviction also hides the spend from the canonical view (`get_tx`)...
+		assert!(wallet.get_tx(first_txid).is_none());
+		// ...but the transaction itself is kept, and seeing it again later (a rebroadcast, or
+		// the mempool) makes the spend canonical once more.
+		let again = wallet.tx_graph().get_tx(first_txid).expect("evicted, not forgotten");
+		wallet.apply_unconfirmed_txs(vec![((*again).clone(), 3)]);
+		assert!(!unspent_outpoints(&wallet).contains(&deposit));
 	}
 }

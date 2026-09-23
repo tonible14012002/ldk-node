@@ -49,6 +49,10 @@ impl SyncEngine for BitcoindSyncEngine {
 		"bitcoind-block-poll"
 	}
 
+	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
+		Some(&self.onchain_wallet)
+	}
+
 	async fn sync_once(
 		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
 		output_sweeper: Arc<Sweeper>,

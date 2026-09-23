@@ -243,6 +243,10 @@ impl SyncEngine for ElectrumSyncEngine {
 		"electrum-tx-sync"
 	}
 
+	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
+		Some(&self.onchain_wallet)
+	}
+
 	fn start(&self, runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
 		self.electrum_runtime_status.write().unwrap().start(
 			self.server_url.clone(),

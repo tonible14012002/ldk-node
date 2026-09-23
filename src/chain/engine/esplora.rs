@@ -290,6 +290,10 @@ impl SyncEngine for EsploraSyncEngine {
 		"esplora-tx-sync"
 	}
 
+	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
+		Some(&self.onchain_wallet)
+	}
+
 	/// Run a Dependent node's scan against this node's own Esplora server.
 	///
 	/// The request is rebuilt into a real `SyncRequest` and handed to the same

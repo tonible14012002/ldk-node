@@ -14,7 +14,8 @@ use bitcoin::Transaction;
 
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::chain::seam::{
-	ActionResult, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, ADAPTER_BUDGET_MARGIN,
+	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
+	FeeUpdate, ADAPTER_BUDGET_MARGIN, PER_TX_BROADCAST_BUDGET,
 };
 use crate::chain::ElectrumRuntimeStatus;
 use crate::config::FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS;
@@ -153,13 +154,21 @@ impl TxStatusAction for ElectrumChainAdapter {
 }
 
 #[async_trait]
-impl BroadcastAdapter for ElectrumChainAdapter {
+impl BroadcastAction for ElectrumChainAdapter {
 	fn name(&self) -> &'static str {
 		"electrum"
 	}
 
+	/// Pre-seam timing preserved: the client sends each transaction under its
+	/// own `TX_BROADCAST_TIMEOUT_SECS`, so that timeout and its error log fire
+	/// before the seam's.
+	fn budget(&self) -> Option<Duration> {
+		Some(PER_TX_BROADCAST_BUDGET)
+	}
+
 	/// Pre-seam this check sat before the drain loop and returned early from
-	/// the whole pass. `process_broadcast_queue` runs once a second, so this is
+	/// the whole pass. The layer still abandons the pass when no adapter is
+	/// ready, and `process_broadcast_queue` runs once a second, so this is
 	/// the same behaviour: skip this pass, try again on the next tick.
 	async fn ready(&self) -> bool {
 		if self.client().is_some() {
@@ -169,12 +178,20 @@ impl BroadcastAdapter for ElectrumChainAdapter {
 		false
 	}
 
-	async fn broadcast_tx(&self, tx: &Transaction) {
-		// The Electrum client owns its own timeout and logging, and takes the
-		// transaction by value; the clone is the one cost of the shared
-		// by-reference slot contract.
-		if let Some(client) = self.client() {
-			client.broadcast(tx.clone()).await;
+	/// One send per transaction, exactly as pre-seam. The Electrum client owns
+	/// its own timeout, logging and classification, and takes the transaction
+	/// by value; the clone is the one cost of the shared by-reference slot
+	/// contract. Electrum reports a server-side refusal as an opaque protocol
+	/// error whose text this adapter cannot classify reliably, so it never
+	/// answers `Rejected`: every failure is `Unavailable`.
+	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+		let Some(client) = self.client() else {
+			return Err(ChainActionError::unavailable("chain source not started"));
+		};
+		let mut outcomes = Vec::with_capacity(txs.len());
+		for tx in txs {
+			outcomes.push((tx.compute_txid(), client.broadcast(tx.clone()).await));
 		}
+		package_result(outcomes)
 	}
 }

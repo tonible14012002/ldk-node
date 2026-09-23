@@ -8,13 +8,14 @@
 //! The chain ability seam.
 //!
 //! [`ChainLayer`] is the single entry point the rest of the crate uses to reach
-//! the Bitcoin chain. Each chain *ability* occupies a slot: FEE and TX_STATUS
-//! are ordered adapter chains ([`ActionChain`]), BROADCAST is still a single
-//! adapter, and UTXO is a capability declared once at startup. The wallet sync
-//! engine is a separate explicit axis.
+//! the Bitcoin chain. Each chain *ability* occupies a slot: FEE, BROADCAST and
+//! TX_STATUS are ordered adapter chains ([`ActionChain`]), and UTXO is a
+//! capability declared once at startup. The wallet sync engine is a separate
+//! explicit axis.
 //!
 //! Nothing outside slot construction branches on which backend is configured.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -41,8 +42,8 @@ use crate::chain::provider::{
 	WireLightningSyncResponse, WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{
-	ActionChain, BroadcastAdapter, ChainActionError, FeeAction, FeeUpdate, UtxoCapability,
-	UtxoVerification, FEE_BUDGET,
+	ActionChain, Answered, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
+	FeeUpdate, UtxoCapability, UtxoVerification, BROADCAST_BUDGET, FEE_BUDGET,
 };
 use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
@@ -50,7 +51,7 @@ use crate::fee_estimator::{
 	conf_target_wire_name, get_all_conf_targets, FeeEstimator, OnchainFeeEstimator,
 };
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_error, log_info, LdkLogger, Logger};
+use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogger, Logger};
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
@@ -70,7 +71,7 @@ pub(crate) struct ChainSlotAdapters {
 	pub(crate) fee: Vec<&'static str>,
 	#[cfg(feature = "swaps")]
 	pub(crate) tx_status: Vec<&'static str>,
-	pub(crate) broadcast: &'static str,
+	pub(crate) broadcast: Vec<&'static str>,
 	/// The adapter verifying BOLT-7 channel announcements and how far it
 	/// checks them. `None` means the routing graph carries unverified
 	/// capacities.
@@ -83,7 +84,7 @@ impl fmt::Display for ChainSlotAdapters {
 		write!(f, "fee=[{}]", self.fee.join(","))?;
 		#[cfg(feature = "swaps")]
 		write!(f, " tx_status=[{}]", self.tx_status.join(","))?;
-		write!(f, " broadcast={}", self.broadcast)?;
+		write!(f, " broadcast=[{}]", self.broadcast.join(","))?;
 		match self.utxo {
 			Some((name, verification)) => write!(f, " utxo={}({})", name, verification.as_str())?,
 			None => write!(f, " utxo=none")?,
@@ -100,10 +101,15 @@ pub(crate) struct ChainSlots {
 	#[cfg(feature = "swaps")]
 	pub(crate) tx_status: ActionChain<dyn TxStatusAction>,
 	/// BROADCAST — transaction broadcast.
-	pub(crate) broadcast: Arc<dyn BroadcastAdapter>,
+	pub(crate) broadcast: ActionChain<dyn BroadcastAction>,
 	/// UTXO — verification of BOLT-7 channel announcements, if any adapter can.
 	pub(crate) utxo: Option<Arc<dyn UtxoCapability>>,
 }
+
+/// What the BROADCAST tail tells the on-chain wallet: transactions now on the
+/// network, and transactions the network refused, each with the time.
+type Unconfirmed = Vec<(Transaction, u64)>;
+type Evicted = Vec<(Txid, u64)>;
 
 /// Everything a slot's shared tail needs once its adapter has answered.
 pub(crate) struct SharedChainCtx {
@@ -165,7 +171,12 @@ impl ChainLayer {
 				vec![Arc::clone(&adapter) as Arc<dyn TxStatusAction>],
 				Arc::clone(logger),
 			),
-			broadcast: adapter as Arc<dyn BroadcastAdapter>,
+			broadcast: ActionChain::new(
+				"broadcast",
+				BROADCAST_BUDGET,
+				vec![adapter as Arc<dyn BroadcastAction>],
+				Arc::clone(logger),
+			),
 			utxo,
 		}
 	}
@@ -366,7 +377,7 @@ impl ChainLayer {
 			fee: self.slots.fee.names(),
 			#[cfg(feature = "swaps")]
 			tx_status: self.slots.tx_status.names(),
-			broadcast: self.slots.broadcast.name(),
+			broadcast: self.slots.broadcast.names(),
 			utxo: self
 				.slots
 				.utxo
@@ -468,21 +479,141 @@ impl ChainLayer {
 		Ok(())
 	}
 
-	/// Drain the broadcast queue through the BROADCAST slot.
+	/// Drain the broadcast queue through the BROADCAST chain.
 	///
-	/// Called once a second. Failures are logged by the adapter and dropped —
-	/// the queue carries no retry semantics, so an error here must never
-	/// propagate.
+	/// Called once a second. When no adapter in the chain is ready the pass is
+	/// abandoned before anything is pulled from the queue, so the packages
+	/// wait for the next tick rather than being lost to a chain that could
+	/// not have answered — the pre-seam Electrum skip-and-retry, now for every
+	/// backend. Otherwise each package runs the chain and then the shared
+	/// tail ([`ChainLayer::broadcast_package`]). Nothing here propagates: the
+	/// queue carries no retry semantics, so a package the chain cannot place
+	/// is logged and dropped, exactly as lossy as pre-seam.
 	pub(crate) async fn process_broadcast_queue(&self) {
-		if !self.slots.broadcast.ready().await {
+		if !self.any_broadcast_adapter_ready().await {
 			return;
 		}
 
 		let mut receiver = self.shared.tx_broadcaster.get_broadcast_queue().await;
 		while let Some(next_package) = receiver.recv().await {
-			for tx in &next_package {
-				self.slots.broadcast.broadcast_tx(tx).await;
+			self.broadcast_package(next_package).await;
+		}
+	}
+
+	async fn any_broadcast_adapter_ready(&self) -> bool {
+		for adapter in self.slots.broadcast.adapters() {
+			if adapter.ready().await {
+				return true;
 			}
+		}
+		false
+	}
+
+	/// Run `txs` through the BROADCAST chain. An adapter that is not ready is
+	/// `Unavailable` without the round trip.
+	async fn run_broadcast(
+		&self, txs: &[Transaction],
+	) -> Result<Answered<()>, ChainActionError<BroadcastRejection>> {
+		self.slots
+			.broadcast
+			.run(|a| async move {
+				if !a.ready().await {
+					return Err(ChainActionError::unavailable("not ready"));
+				}
+				a.broadcast_package(txs).await
+			})
+			.await
+	}
+
+	/// One package through the BROADCAST chain, then the shared tail.
+	///
+	/// The tail is what every backend used to lack: it tells the on-chain
+	/// wallet what the chain's answer means for the node's own coins.
+	///
+	/// * `Rejected` — each refused transaction is logged with its reason and
+	///   evicted from the wallet, so the inputs it tried to spend are offered
+	///   again. Relaying it elsewhere would only buy the same verdict.
+	///   Transactions of the package that were not listed were accepted.
+	/// * `Ok` — the package is on the network. If the engine
+	///   [`SyncEngine::tracks_own_broadcasts`], the wallet is told the
+	///   package is unconfirmed now, because nothing else ever will; an
+	///   engine with a mempool view sees its own transactions come back and
+	///   is left alone.
+	/// * exhausted — logged at error and dropped, as lossy as pre-seam.
+	async fn broadcast_package(&self, package: Vec<Transaction>) {
+		let outcome = self.run_broadcast(&package).await;
+
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let echo_own = self.engine.tracks_own_broadcasts();
+
+		let (unconfirmed, evicted): (Unconfirmed, Evicted) = match outcome {
+			Ok(answered) => {
+				log_trace!(
+					self.shared.logger,
+					"Broadcast a package of {} transaction(s) via {}",
+					package.len(),
+					answered.by
+				);
+				if !echo_own {
+					return;
+				}
+				(package.into_iter().map(|tx| (tx, now)).collect(), Vec::new())
+			},
+			Err(ChainActionError::Unavailable { reason, .. }) => {
+				log_error!(
+					self.shared.logger,
+					"Failed to broadcast a package of {} transaction(s); dropping it: {}",
+					package.len(),
+					reason
+				);
+				for tx in &package {
+					log_trace!(
+						self.shared.logger,
+						"Dropped broadcast transaction {}",
+						tx.compute_txid()
+					);
+				}
+				return;
+			},
+			Err(ChainActionError::Rejected(rejected)) => {
+				for (txid, reason) in &rejected {
+					log_warn!(
+						self.shared.logger,
+						"The network rejected transaction {}; giving it up and releasing its inputs in the on-chain wallet: {}",
+						txid,
+						reason
+					);
+				}
+				let rejected_txids: HashSet<Txid> =
+					rejected.iter().map(|(txid, _)| *txid).collect();
+				let accepted = if echo_own {
+					package
+						.into_iter()
+						.filter(|tx| !rejected_txids.contains(&tx.compute_txid()))
+						.map(|tx| (tx, now))
+						.collect()
+				} else {
+					Vec::new()
+				};
+				(accepted, rejected.into_iter().map(|(txid, _)| (txid, now)).collect())
+			},
+		};
+
+		let Some(wallet) = self.engine.onchain_wallet() else {
+			log_debug!(
+				self.shared.logger,
+				"No on-chain wallet to record a broadcast package in ({} unconfirmed, {} evicted)",
+				unconfirmed.len(),
+				evicted.len()
+			);
+			return;
+		};
+		if let Err(e) = wallet.apply_mempool_txs(unconfirmed, evicted) {
+			log_error!(
+				self.shared.logger,
+				"Failed to record a broadcast package in the on-chain wallet: {}",
+				e
+			);
 		}
 	}
 
@@ -544,17 +675,39 @@ impl ChainLayer {
 	}
 
 	/// Put another node's transaction on the network through this node's
-	/// BROADCAST slot.
+	/// BROADCAST chain.
 	///
-	/// Returns once the transaction has been handed to the slot. Broadcast is
-	/// lossy by contract, so this reports that the transaction was accepted
-	/// for broadcast, never that it reached a miner.
+	/// Returns once the transaction has been handed to the network — accepted
+	/// or already known — never once it has reached a miner. Errors when the
+	/// chain is exhausted (no adapter could send it) **or** when the network
+	/// rejected it: the asking node must see a failed call either way, and the
+	/// wire has no way to say which. The rejection is logged here so this
+	/// node's operator can tell the two apart. The transaction is not this
+	/// node's own, so the shared tail does not run for it.
 	pub(crate) async fn serve_broadcast(&self, tx: &Transaction) -> Result<(), Error> {
-		if !self.slots.broadcast.ready().await {
-			return Err(Error::ChainServeFailed);
+		match self.run_broadcast(std::slice::from_ref(tx)).await {
+			Ok(_) => Ok(()),
+			Err(ChainActionError::Unavailable { reason, .. }) => {
+				log_error!(
+					self.shared.logger,
+					"Could not broadcast another node's transaction {}: {}",
+					tx.compute_txid(),
+					reason
+				);
+				Err(Error::ChainServeFailed)
+			},
+			Err(ChainActionError::Rejected(rejected)) => {
+				for (txid, reason) in &rejected {
+					log_warn!(
+						self.shared.logger,
+						"The network rejected another node's transaction {}: {}",
+						txid,
+						reason
+					);
+				}
+				Err(Error::ChainServeFailed)
+			},
 		}
-		self.slots.broadcast.broadcast_tx(tx).await;
-		Ok(())
 	}
 
 	/// Answer another node's question about an arbitrary transaction.
@@ -631,14 +784,14 @@ impl ChainLayer {
 /// slot by itself. Spelled as one trait so the bound does not change shape
 /// between feature sets.
 #[cfg(feature = "swaps")]
-trait SlotAdapters: FeeAction + BroadcastAdapter + TxStatusAction {}
+trait SlotAdapters: FeeAction + BroadcastAction + TxStatusAction {}
 #[cfg(feature = "swaps")]
-impl<A: FeeAction + BroadcastAdapter + TxStatusAction> SlotAdapters for A {}
+impl<A: FeeAction + BroadcastAction + TxStatusAction> SlotAdapters for A {}
 
 #[cfg(not(feature = "swaps"))]
-trait SlotAdapters: FeeAction + BroadcastAdapter {}
+trait SlotAdapters: FeeAction + BroadcastAction {}
 #[cfg(not(feature = "swaps"))]
-impl<A: FeeAction + BroadcastAdapter> SlotAdapters for A {}
+impl<A: FeeAction + BroadcastAction> SlotAdapters for A {}
 
 impl Filter for ChainLayer {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
@@ -647,5 +800,438 @@ impl Filter for ChainLayer {
 
 	fn register_output(&self, output: WatchedOutput) {
 		self.engine.register_output(output)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	//! N2: the BROADCAST drain and its shared tail, run against fake adapters,
+	//! a fake engine and a real on-chain wallet — the tail's effect is what
+	//! the wallet then offers to spend, so nothing narrower would prove it.
+	use super::*;
+
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::time::Duration;
+
+	use bdk_wallet::Wallet as BdkWallet;
+	use bitcoin::hashes::Hash;
+	use bitcoin::{
+		absolute, transaction, Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut,
+		WPubkeyHash, Witness,
+	};
+	use lightning::chain::chaininterface::BroadcasterInterface;
+	use lightning::util::test_utils::TestStore;
+
+	use crate::chain::seam::ActionResult;
+	use crate::io::{
+		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	};
+	use crate::tx_broadcaster::TransactionBroadcaster;
+	use crate::types::PaymentStore;
+	use crate::wallet::persist::KVStoreWalletPersister;
+
+	use async_trait::async_trait;
+
+	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
+	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
+	const FUNDING_SATS: u64 = 100_000;
+
+	/// What one fake adapter does with a package.
+	enum Behaviour {
+		Ok,
+		Unavailable,
+		NotReady,
+		/// Rejects exactly these txids and accepts the rest of the package.
+		Reject(Vec<Txid>),
+	}
+
+	struct FakeBroadcast {
+		name: &'static str,
+		behaviour: Behaviour,
+		calls: AtomicUsize,
+	}
+
+	impl FakeBroadcast {
+		fn new(name: &'static str, behaviour: Behaviour) -> Arc<Self> {
+			Arc::new(Self { name, behaviour, calls: AtomicUsize::new(0) })
+		}
+
+		fn calls(&self) -> usize {
+			self.calls.load(Ordering::SeqCst)
+		}
+	}
+
+	#[async_trait]
+	impl BroadcastAction for FakeBroadcast {
+		fn name(&self) -> &'static str {
+			self.name
+		}
+
+		async fn ready(&self) -> bool {
+			!matches!(self.behaviour, Behaviour::NotReady)
+		}
+
+		async fn broadcast_package(
+			&self, txs: &[Transaction],
+		) -> ActionResult<(), BroadcastRejection> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			match &self.behaviour {
+				Behaviour::Ok => Ok(()),
+				Behaviour::Unavailable | Behaviour::NotReady => {
+					Err(ChainActionError::unavailable(format!("{} is down", self.name)))
+				},
+				Behaviour::Reject(txids) => Err(ChainActionError::Rejected(
+					txs.iter()
+						.map(|tx| tx.compute_txid())
+						.filter(|txid| txids.contains(txid))
+						.map(|txid| (txid, "policy".to_string()))
+						.collect(),
+				)),
+			}
+		}
+	}
+
+	/// An engine that syncs nothing and only answers the two questions the
+	/// BROADCAST tail asks it.
+	struct FakeEngine {
+		wallet: Arc<Wallet>,
+		tracks_own_broadcasts: bool,
+	}
+
+	#[async_trait]
+	impl SyncEngine for FakeEngine {
+		fn name(&self) -> &'static str {
+			"fake"
+		}
+
+		fn tracks_own_broadcasts(&self) -> bool {
+			self.tracks_own_broadcasts
+		}
+
+		fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
+			Some(&self.wallet)
+		}
+
+		async fn sync_once(
+			&self, _channel_manager: Arc<ChannelManager>, _chain_monitor: Arc<ChainMonitor>,
+			_output_sweeper: Arc<Sweeper>,
+		) -> Result<(), Error> {
+			Ok(())
+		}
+
+		async fn run_background(
+			&self, _layer: Arc<ChainLayer>, _stop_sync_receiver: tokio::sync::watch::Receiver<()>,
+			_channel_manager: Arc<ChannelManager>, _chain_monitor: Arc<ChainMonitor>,
+			_output_sweeper: Arc<Sweeper>,
+		) {
+		}
+	}
+
+	struct Harness {
+		layer: ChainLayer,
+		wallet: Arc<Wallet>,
+		broadcaster: Arc<Broadcaster>,
+	}
+
+	fn harness(adapters: &[Arc<FakeBroadcast>], tracks_own_broadcasts: bool) -> Harness {
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
+
+		let mut persister = KVStoreWalletPersister::new(Arc::clone(&kv_store), Arc::clone(&logger));
+		let bdk_wallet = BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+			.network(Network::Regtest)
+			.create_wallet(&mut persister)
+			.expect("valid test descriptors");
+		let payment_store = Arc::new(PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(&kv_store),
+			Arc::clone(&logger),
+		));
+		let wallet = Arc::new(Wallet::new(
+			bdk_wallet,
+			persister,
+			Arc::clone(&broadcaster),
+			Arc::clone(&fee_estimator),
+			payment_store,
+			config,
+			Arc::clone(&logger),
+		));
+
+		let engine = Arc::new(FakeEngine { wallet: Arc::clone(&wallet), tracks_own_broadcasts });
+		let slots = ChainSlots {
+			fee: ActionChain::new("fee", FEE_BUDGET, Vec::new(), Arc::clone(&logger)),
+			#[cfg(feature = "swaps")]
+			tx_status: ActionChain::new(
+				"tx_status",
+				TX_STATUS_BUDGET,
+				Vec::new(),
+				Arc::clone(&logger),
+			),
+			broadcast: ActionChain::new(
+				"broadcast",
+				BROADCAST_BUDGET,
+				adapters.iter().map(|a| Arc::clone(a) as Arc<dyn BroadcastAction>).collect(),
+				Arc::clone(&logger),
+			),
+			utxo: None,
+		};
+		let layer = ChainLayer::new(
+			slots,
+			engine,
+			fee_estimator,
+			Arc::clone(&broadcaster),
+			kv_store,
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+
+		Harness { layer, wallet, broadcaster }
+	}
+
+	fn someone_elses_script() -> ScriptBuf {
+		ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&[0x42u8; 33]))
+	}
+
+	fn tx_paying(previous_output: OutPoint, value: u64, script_pubkey: ScriptBuf) -> Transaction {
+		Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output,
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut { value: Amount::from_sat(value), script_pubkey }],
+		}
+	}
+
+	/// A deposit into the wallet, spending an outpoint nobody checks.
+	fn deposit(wallet: &Wallet, seed: u8) -> Transaction {
+		let address = wallet.get_new_address().expect("an address");
+		tx_paying(
+			OutPoint { txid: Txid::from_byte_array([seed; 32]), vout: 0 },
+			FUNDING_SATS,
+			address.script_pubkey(),
+		)
+	}
+
+	/// Spends `deposit` whole to a foreign script — no change, so the wallet's
+	/// total drops to nothing while the spend is canonical. Unsigned: BDK does
+	/// not check signatures when told a transaction is unconfirmed.
+	fn spend_of(deposit: &Transaction) -> Transaction {
+		tx_paying(
+			OutPoint { txid: deposit.compute_txid(), vout: 0 },
+			FUNDING_SATS - 1_000,
+			someone_elses_script(),
+		)
+	}
+
+	/// A transaction the wallet has no stake in.
+	fn unrelated(seed: u8) -> Transaction {
+		tx_paying(
+			OutPoint { txid: Txid::from_byte_array([seed; 32]), vout: 1 },
+			5_000,
+			someone_elses_script(),
+		)
+	}
+
+	fn unconfirmed(wallet: &Wallet, txs: &[&Transaction]) {
+		wallet
+			.apply_mempool_txs(txs.iter().map(|tx| ((*tx).clone(), 1)).collect(), Vec::new())
+			.expect("applying unconfirmed transactions");
+	}
+
+	fn unconfirmed_txids(wallet: &Wallet) -> Vec<Txid> {
+		let mut txids = wallet.get_unconfirmed_txids();
+		txids.sort();
+		txids
+	}
+
+	fn total_sats(wallet: &Wallet) -> u64 {
+		wallet.get_balances(0).expect("balances").0
+	}
+
+	#[tokio::test]
+	async fn all_unready_abandons_pass_leaving_queue_intact() {
+		let first = FakeBroadcast::new("first", Behaviour::NotReady);
+		let second = FakeBroadcast::new("second", Behaviour::NotReady);
+		let h = harness(&[Arc::clone(&first), Arc::clone(&second)], false);
+		let tx = unrelated(1);
+		h.broadcaster.broadcast_transactions(&[&tx]);
+
+		h.layer.process_broadcast_queue().await;
+
+		assert_eq!(first.calls(), 0);
+		assert_eq!(second.calls(), 0, "nothing is asked to send when nobody is ready");
+		let queued = h.broadcaster.get_broadcast_queue().await.try_recv();
+		assert_eq!(queued, Ok(vec![tx.clone()]), "the package waits for the next tick");
+
+		// One ready adapter is enough for the pass to run, and it runs the
+		// chain — the unready adapter is skipped, not asked.
+		let ready = FakeBroadcast::new("ready", Behaviour::Ok);
+		let h = harness(&[Arc::clone(&first), Arc::clone(&ready)], false);
+		h.broadcaster.broadcast_transactions(&[&tx]);
+
+		let drained =
+			tokio::time::timeout(Duration::from_millis(200), h.layer.process_broadcast_queue())
+				.await;
+
+		assert!(
+			drained.is_err(),
+			"the drain keeps waiting for more packages once the queue is empty"
+		);
+		assert_eq!(first.calls(), 0, "an unready adapter is `Unavailable` without a round trip");
+		assert_eq!(ready.calls(), 1);
+		assert!(h.broadcaster.get_broadcast_queue().await.try_recv().is_err(), "queue drained");
+	}
+
+	#[tokio::test]
+	async fn rejected_package_evicts_listed_txids_only() {
+		let h = harness(&[], false);
+		let deposit_a = deposit(&h.wallet, 1);
+		let deposit_b = deposit(&h.wallet, 2);
+		let spend_a = spend_of(&deposit_a);
+		let spend_b = spend_of(&deposit_b);
+		unconfirmed(&h.wallet, &[&deposit_a, &deposit_b, &spend_a, &spend_b]);
+		assert_eq!(
+			total_sats(&h.wallet),
+			0,
+			"both deposits are spent while the spends are canonical"
+		);
+
+		let verdict =
+			FakeBroadcast::new("verdict", Behaviour::Reject(vec![spend_a.compute_txid()]));
+		let h = harness_with_wallet(&[verdict], false, h.wallet);
+
+		h.layer.broadcast_package(vec![spend_a.clone(), spend_b.clone(), unrelated(3)]).await;
+
+		let mut expected =
+			vec![deposit_a.compute_txid(), deposit_b.compute_txid(), spend_b.compute_txid()];
+		expected.sort();
+		assert_eq!(unconfirmed_txids(&h.wallet), expected, "only the rejected spend is evicted");
+		assert_eq!(
+			total_sats(&h.wallet),
+			FUNDING_SATS,
+			"the rejected spend's input is offered again; the accepted spend's is not"
+		);
+	}
+
+	#[tokio::test]
+	async fn own_package_echo_only_when_engine_tracks_own_broadcasts() {
+		// An engine with a mempool view: the wallet is left to learn of its
+		// own transactions from the mempool, as pre-seam.
+		let adapter = FakeBroadcast::new("ok", Behaviour::Ok);
+		let h = harness(&[Arc::clone(&adapter)], false);
+		let deposit_tx = deposit(&h.wallet, 1);
+		unconfirmed(&h.wallet, &[&deposit_tx]);
+		let spend = spend_of(&deposit_tx);
+
+		h.layer.broadcast_package(vec![spend.clone()]).await;
+
+		assert_eq!(adapter.calls(), 1);
+		assert_eq!(unconfirmed_txids(&h.wallet), vec![deposit_tx.compute_txid()]);
+		assert_eq!(total_sats(&h.wallet), FUNDING_SATS, "the wallet was not told about the spend");
+
+		// An engine with no mempool view: the tail is the only way the wallet
+		// hears that the deposit is spent.
+		let h = harness(&[Arc::clone(&adapter)], true);
+		let deposit_tx = deposit(&h.wallet, 1);
+		unconfirmed(&h.wallet, &[&deposit_tx]);
+		let spend = spend_of(&deposit_tx);
+
+		h.layer.broadcast_package(vec![spend.clone()]).await;
+
+		let mut expected = vec![deposit_tx.compute_txid(), spend.compute_txid()];
+		expected.sort();
+		assert_eq!(unconfirmed_txids(&h.wallet), expected, "the spend is applied as unconfirmed");
+		assert_eq!(total_sats(&h.wallet), 0, "and its input is no longer offered");
+
+		// With a rejection, an engine that tracks its own broadcasts still
+		// echoes the transactions that were NOT listed: they were accepted.
+		let deposit_a = deposit(&h.wallet, 2);
+		let deposit_b = deposit(&h.wallet, 3);
+		unconfirmed(&h.wallet, &[&deposit_a, &deposit_b]);
+		let spend_a = spend_of(&deposit_a);
+		let spend_b = spend_of(&deposit_b);
+		let verdict =
+			FakeBroadcast::new("verdict", Behaviour::Reject(vec![spend_a.compute_txid()]));
+		let h = harness_with_wallet(&[verdict], true, h.wallet);
+
+		h.layer.broadcast_package(vec![spend_a.clone(), spend_b.clone()]).await;
+
+		let txids = unconfirmed_txids(&h.wallet);
+		assert!(txids.contains(&spend_b.compute_txid()), "the accepted spend is echoed");
+		assert!(!txids.contains(&spend_a.compute_txid()), "the rejected spend is not");
+		assert_eq!(total_sats(&h.wallet), FUNDING_SATS, "exactly one deposit is spendable again");
+	}
+
+	#[tokio::test]
+	async fn serve_broadcast_rejected_is_err() {
+		let tx = unrelated(1);
+
+		let verdict = FakeBroadcast::new("verdict", Behaviour::Reject(vec![tx.compute_txid()]));
+		let h = harness(&[verdict], true);
+		assert!(matches!(h.layer.serve_broadcast(&tx).await, Err(Error::ChainServeFailed)));
+
+		let down = FakeBroadcast::new("down", Behaviour::Unavailable);
+		let h = harness(&[down], true);
+		assert!(matches!(h.layer.serve_broadcast(&tx).await, Err(Error::ChainServeFailed)));
+
+		let not_ready = FakeBroadcast::new("not-ready", Behaviour::NotReady);
+		let h = harness(&[not_ready], true);
+		assert!(matches!(h.layer.serve_broadcast(&tx).await, Err(Error::ChainServeFailed)));
+
+		let ok = FakeBroadcast::new("ok", Behaviour::Ok);
+		let h = harness(&[ok], true);
+		assert!(h.layer.serve_broadcast(&tx).await.is_ok());
+		assert!(
+			unconfirmed_txids(&h.wallet).is_empty(),
+			"another node's transaction is not this node's own: the tail does not run"
+		);
+	}
+
+	/// A harness over an existing wallet, so a test can fund a wallet once and
+	/// then run different chains against it.
+	fn harness_with_wallet(
+		adapters: &[Arc<FakeBroadcast>], tracks_own_broadcasts: bool, wallet: Arc<Wallet>,
+	) -> Harness {
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let engine = Arc::new(FakeEngine { wallet: Arc::clone(&wallet), tracks_own_broadcasts });
+		let slots = ChainSlots {
+			fee: ActionChain::new("fee", FEE_BUDGET, Vec::new(), Arc::clone(&logger)),
+			#[cfg(feature = "swaps")]
+			tx_status: ActionChain::new(
+				"tx_status",
+				TX_STATUS_BUDGET,
+				Vec::new(),
+				Arc::clone(&logger),
+			),
+			broadcast: ActionChain::new(
+				"broadcast",
+				BROADCAST_BUDGET,
+				adapters.iter().map(|a| Arc::clone(a) as Arc<dyn BroadcastAction>).collect(),
+				Arc::clone(&logger),
+			),
+			utxo: None,
+		};
+		let layer = ChainLayer::new(
+			slots,
+			engine,
+			fee_estimator,
+			Arc::clone(&broadcaster),
+			kv_store,
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+		Harness { layer, wallet, broadcaster }
 	}
 }

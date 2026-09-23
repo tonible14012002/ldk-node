@@ -69,9 +69,20 @@
 //! * **A chain of length one is legal.** That is how "no fallback" is spelled.
 //!   An empty chain is legal to construct and always `Unavailable`.
 //!
-//! FEE and TX_STATUS run on chains. The pre-chain single-adapter
-//! [`BroadcastAdapter`] still fills the BROADCAST slot and is replaced when
-//! that slot moves onto its chain; MEMPOOL and SCRIPT_HISTORY follow.
+//! FEE, BROADCAST and TX_STATUS run on chains; MEMPOOL and SCRIPT_HISTORY
+//! follow.
+//!
+//! # BROADCAST is package-shaped
+//!
+//! The queue hands the slot every transaction LDK asked to broadcast together
+//! (a commitment tx and its anchor CPFP, say), and the adapter answers for the
+//! package. Each backend still sends one transaction at a time and keeps its
+//! own error classification and log levels; it folds each send into a
+//! [`TxBroadcastOutcome`] and [`package_result`] turns the package's worth of
+//! those into the slot's answer. `Ok` means every transaction was handed to
+//! the network — accepted, or already known to it. `Rejected` lists the
+//! transactions the network refused, and the layer's shared tail evicts them
+//! from the on-chain wallet so their inputs are spendable again.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -85,6 +96,7 @@ use bdk_chain::BlockId;
 use lightning_block_sync::gossip::UtxoSource;
 
 use crate::chain::provider::{ChainProviderError, WireSyncRequest};
+use crate::config::TX_BROADCAST_TIMEOUT_SECS;
 use crate::fee_estimator::ConfirmationTarget;
 use crate::logger::{log_debug, log_info, LdkLogger, Logger};
 use crate::Error;
@@ -115,45 +127,17 @@ pub(crate) enum FeeUpdate {
 	},
 }
 
-/// Sends transactions to the Bitcoin network.
-///
-/// Broadcast is deliberately **lossy**: a failure is logged and dropped, never
-/// returned to the caller. That is the pre-seam contract and the queue has no
-/// retry semantics to build on, so adapters must not propagate errors. An
-/// ordered fallback across several adapters is a later change, not this one.
-#[async_trait]
-pub(crate) trait BroadcastAdapter: Send + Sync {
-	/// Stable identifier, for logs and for answering "which adapter served this".
-	fn name(&self) -> &'static str;
-
-	/// Whether the backend can broadcast right now.
-	///
-	/// `false` abandons this drain pass entirely; the queue is drained again on
-	/// the next tick (once per second), so this is a skip, not a shutdown.
-	async fn ready(&self) -> bool {
-		true
-	}
-
-	/// Broadcast one transaction, logging its own outcome.
-	///
-	/// Each backend classifies its own errors — an Esplora HTTP 400 usually
-	/// just means bitcoind already knows the transaction and is logged far more
-	/// quietly than a genuine failure — so log level belongs to the adapter.
-	async fn broadcast_tx(&self, tx: &Transaction);
-}
-
 // ── PER-ACTION SEAM ──────────────────────────────────────────────────────────
 //
 // Everything below is the per-action shape of the seam: one result type, one
 // trait per action, and the combinator that runs an ordered adapter chain
-// under a budget. FEE and TX_STATUS are wired into `ChainLayer`; the items
-// belonging to slots not yet moved carry `dead_code` allowances that are
-// removed as each slot lands.
+// under a budget. FEE, BROADCAST and TX_STATUS are wired into `ChainLayer`;
+// the items belonging to slots not yet moved carry `dead_code` allowances
+// that are removed as each slot lands.
 
 /// Default budget for a FEE adapter that declares none of its own.
 pub(crate) const FEE_BUDGET: Duration = Duration::from_secs(5);
 /// Default budget for a BROADCAST adapter that declares none of its own.
-#[allow(dead_code)] // consumed once the BROADCAST slot runs on an `ActionChain`
 pub(crate) const BROADCAST_BUDGET: Duration = Duration::from_secs(15);
 /// Default budget for a TX_STATUS adapter that declares none of its own.
 #[cfg(feature = "swaps")]
@@ -169,6 +153,21 @@ pub(crate) const SCRIPT_HISTORY_BUDGET: Duration = Duration::from_secs(90);
 /// when declaring its budget, so the backend's own timeout fires first and the
 /// error it logs — not a bare seam timeout — is what an operator sees.
 pub(crate) const ADAPTER_BUDGET_MARGIN: Duration = Duration::from_secs(1);
+
+/// The most transactions one broadcast package is sized for when an adapter
+/// that sends them one at a time declares its budget: Bitcoin Core's own
+/// package limit (`MAX_PACKAGE_COUNT`), which nothing LDK hands the
+/// broadcaster exceeds.
+pub(crate) const MAX_BROADCAST_PACKAGE_TXS: u64 = 25;
+
+/// BROADCAST budget for an adapter that sends a package one transaction at a
+/// time, each under its backend's own [`TX_BROADCAST_TIMEOUT_SECS`] — the
+/// pre-seam per-transaction bound, which nothing here shortens. The largest
+/// package worth of those, plus the margin, so the backend's per-transaction
+/// timeout and its log line always fire before the seam's.
+pub(crate) const PER_TX_BROADCAST_BUDGET: Duration = Duration::from_secs(
+	TX_BROADCAST_TIMEOUT_SECS * MAX_BROADCAST_PACKAGE_TXS + ADAPTER_BUDGET_MARGIN.as_secs(),
+);
 
 /// Why an adapter did not produce an accepted answer.
 ///
@@ -191,7 +190,6 @@ pub(crate) enum ChainActionError<R = String> {
 		timed_out: bool,
 	},
 	/// The adapter answered, and the answer is no. Terminal for the chain.
-	#[allow(dead_code)] // built by the BROADCAST adapters once that slot runs on an `ActionChain`
 	Rejected(R),
 }
 
@@ -256,8 +254,84 @@ impl<R> From<Error> for ChainActionError<R> {
 }
 
 /// What a BROADCAST adapter says no to: each refused txid with its reason.
-#[allow(dead_code)] // consumed once the BROADCAST slot runs on an `ActionChain`
 pub(crate) type BroadcastRejection = Vec<(Txid, String)>;
+
+/// What one backend said about one transaction of a package.
+///
+/// The shared vocabulary every BROADCAST adapter folds its own error
+/// classification into, one transaction at a time; [`package_result`] turns a
+/// package's worth into the slot's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxBroadcastOutcome {
+	/// The backend took it.
+	Accepted,
+	/// The backend already had it, in its mempool or in a block. As good as
+	/// accepted: the network has the transaction.
+	AlreadyKnown,
+	/// The backend gave a verdict against the transaction itself — a mempool
+	/// policy or verification failure — with the reason it gave.
+	Rejected(String),
+	/// The backend could not be asked, or did not answer.
+	Unavailable { reason: String, timed_out: bool },
+}
+
+/// A failure to *answer* is `Unavailable`; a verdict is `Rejected`. Lets an
+/// adapter reuse the [`Error`] and [`ChainProviderError`] rules above for a
+/// single transaction.
+impl From<ChainActionError> for TxBroadcastOutcome {
+	fn from(e: ChainActionError) -> Self {
+		match e {
+			ChainActionError::Unavailable { reason, timed_out } => {
+				Self::Unavailable { reason, timed_out }
+			},
+			ChainActionError::Rejected(reason) => Self::Rejected(reason),
+		}
+	}
+}
+
+/// Fold a package's per-transaction outcomes into the slot's answer.
+///
+/// `Ok` only when every transaction was handed to the network — accepted, or
+/// already known to it. Otherwise, in order of precedence:
+///
+/// * any `Unavailable` makes the package `Unavailable` (`timed_out` if any
+///   send was), even if another transaction was rejected. A package with one
+///   unsent transaction was not handed to the network; the chain advances and
+///   the next adapter resends the whole package — already-known sends are
+///   `Ok`, and the rejection surfaces again there, or on the next drain pass,
+///   from whichever adapter is up. Reporting `Rejected` here would claim the
+///   unsent transactions were accepted, a claim the shared tail acts on.
+/// * else any `Rejected` makes the package `Rejected`, listing every refused
+///   transaction with its reason. Transactions not listed were accepted.
+pub(crate) fn package_result(
+	outcomes: impl IntoIterator<Item = (Txid, TxBroadcastOutcome)>,
+) -> ActionResult<(), BroadcastRejection> {
+	let mut rejected: BroadcastRejection = Vec::new();
+	let mut unavailable: Vec<String> = Vec::new();
+	let mut any_timed_out = false;
+
+	for (txid, outcome) in outcomes {
+		match outcome {
+			TxBroadcastOutcome::Accepted | TxBroadcastOutcome::AlreadyKnown => {},
+			TxBroadcastOutcome::Rejected(reason) => rejected.push((txid, reason)),
+			TxBroadcastOutcome::Unavailable { reason, timed_out } => {
+				any_timed_out |= timed_out;
+				unavailable.push(format!("{}: {}", txid, reason));
+			},
+		}
+	}
+
+	if !unavailable.is_empty() {
+		return Err(ChainActionError::Unavailable {
+			reason: unavailable.join("; "),
+			timed_out: any_timed_out,
+		});
+	}
+	if !rejected.is_empty() {
+		return Err(ChainActionError::Rejected(rejected));
+	}
+	Ok(())
+}
 
 /// The result of one adapter answering one action.
 pub(crate) type ActionResult<T, R = String> = Result<T, ChainActionError<R>>;
@@ -308,7 +382,6 @@ pub(crate) trait FeeAction: Send + Sync {
 /// for the package. `Rejected` lists the txids the network refused; a
 /// rejected package is never retried on the next adapter, because the network
 /// that refused it is the same network.
-#[allow(dead_code)] // consumed once the BROADCAST slot runs on an `ActionChain`
 #[async_trait]
 pub(crate) trait BroadcastAction: Send + Sync {
 	/// Stable identifier, for logs and for [`Answered::by`].
@@ -321,12 +394,18 @@ pub(crate) trait BroadcastAction: Send + Sync {
 		None
 	}
 
-	/// Whether the backend can broadcast right now. `false` is `Unavailable`
-	/// without the round trip.
+	/// Whether the backend can broadcast right now.
+	///
+	/// `false` is `Unavailable` without the round trip. A drain pass in which
+	/// no adapter of the chain is ready is abandoned before anything is
+	/// pulled from the queue, so the packages wait for the next tick rather
+	/// than being lost to an exhausted chain.
 	async fn ready(&self) -> bool {
 		true
 	}
 
+	/// Send `txs` and answer for the package; see [`package_result`] for what
+	/// the answer means.
 	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection>;
 }
 
@@ -475,9 +554,8 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 		self.adapters.iter().map(|a| Self::adapter_name(a)).collect()
 	}
 
-	/// The adapters in chain order, for a slot whose tail needs to address
-	/// them individually (the BROADCAST own-package echo).
-	#[allow(dead_code)] // read by the BROADCAST tail once that slot runs on an `ActionChain`
+	/// The adapters in chain order, for a slot whose drain needs to ask them
+	/// something before running the chain (BROADCAST asks who is ready).
 	pub(crate) fn adapters(&self) -> &[Arc<A>] {
 		&self.adapters
 	}
@@ -642,6 +720,8 @@ mod tests {
 
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::Instant;
+
+	use bitcoin::hashes::Hash;
 
 	/// What one fake adapter does when asked.
 	enum Behaviour {
@@ -946,6 +1026,58 @@ mod tests {
 			}
 		);
 		assert_eq!(chain.last_answered(), None);
+	}
+
+	/// A package is `Ok` only when every transaction reached the network;
+	/// one unsent transaction outranks another's rejection, because the
+	/// chain must resend the whole package, and a rejection lists exactly
+	/// the refused transactions.
+	#[test]
+	fn package_result_precedence() {
+		let a = Txid::from_slice(&[1u8; 32]).unwrap();
+		let b = Txid::from_slice(&[2u8; 32]).unwrap();
+		let c = Txid::from_slice(&[3u8; 32]).unwrap();
+
+		assert_eq!(
+			package_result([
+				(a, TxBroadcastOutcome::Accepted),
+				(b, TxBroadcastOutcome::AlreadyKnown)
+			]),
+			Ok(()),
+			"already known is as good as accepted"
+		);
+		assert_eq!(package_result(Vec::new()), Ok(()), "an empty package has nothing to refuse");
+
+		assert_eq!(
+			package_result([
+				(a, TxBroadcastOutcome::Accepted),
+				(b, TxBroadcastOutcome::Rejected("insufficient fee".into())),
+				(c, TxBroadcastOutcome::Rejected("missing inputs".into())),
+			]),
+			Err(ChainActionError::Rejected(vec![
+				(b, "insufficient fee".to_string()),
+				(c, "missing inputs".to_string()),
+			])),
+			"every refused transaction is listed; the accepted one is not"
+		);
+
+		let err = package_result([
+			(a, TxBroadcastOutcome::Rejected("insufficient fee".into())),
+			(
+				b,
+				TxBroadcastOutcome::Unavailable {
+					reason: "connection reset".into(),
+					timed_out: false,
+				},
+			),
+			(c, TxBroadcastOutcome::Unavailable { reason: "5s".into(), timed_out: true }),
+		])
+		.unwrap_err();
+		assert!(
+			matches!(err, ChainActionError::Unavailable { timed_out: true, .. }),
+			"an unsent transaction outranks a rejection, and any timeout marks it: {}",
+			err
+		);
 	}
 
 	/// Every provider failure is `Unavailable`; only `Unreachable` — no route

@@ -38,6 +38,7 @@ use crate::chain::provider::{
 	WireBlockId, WireConfirmedTx, WireLightningSyncRequest, WireLightningSyncResponse,
 	WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
 };
+use crate::chain::seam::TxBroadcastOutcome;
 use crate::chain::wire_convert::{
 	block_hash_from_wire, header_to_wire, outpoint_from_wire, script_from_wire,
 	sync_response_to_wire, tx_to_wire, txid_from_wire, wire_to_sync_request,
@@ -208,7 +209,12 @@ impl ElectrumRuntimeClient {
 			})
 	}
 
-	pub(crate) async fn broadcast(&self, tx: Transaction) {
+	/// Send one transaction, logging its own outcome.
+	///
+	/// A server-side refusal arrives as an opaque protocol error whose text
+	/// cannot be classified reliably, so it is reported as `Unavailable`, never
+	/// as a rejection; so is a failed or timed-out call.
+	pub(crate) async fn broadcast(&self, tx: Transaction) -> TxBroadcastOutcome {
 		let electrum_client = Arc::clone(&self.electrum_client);
 
 		let txid = tx.compute_txid();
@@ -221,18 +227,27 @@ impl ElectrumRuntimeClient {
 			tokio::time::timeout(Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS), spawn_fut);
 
 		match timeout_fut.await {
-			Ok(res) => match res {
-				Ok(_) => {
-					log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
-				},
-				Err(e) => {
-					log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
-					log_trace!(
-						self.logger,
-						"Failed broadcast transaction bytes: {}",
-						log_bytes!(tx_bytes)
-					);
-				},
+			Ok(Ok(Ok(_))) => {
+				log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
+				TxBroadcastOutcome::Accepted
+			},
+			Ok(Ok(Err(e))) => {
+				log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
+				log_trace!(
+					self.logger,
+					"Failed broadcast transaction bytes: {}",
+					log_bytes!(tx_bytes)
+				);
+				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: false }
+			},
+			Ok(Err(e)) => {
+				log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
+				log_trace!(
+					self.logger,
+					"Failed broadcast transaction bytes: {}",
+					log_bytes!(tx_bytes)
+				);
+				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: false }
 			},
 			Err(e) => {
 				log_error!(
@@ -246,6 +261,7 @@ impl ElectrumRuntimeClient {
 					"Failed broadcast transaction bytes: {}",
 					log_bytes!(tx_bytes)
 				);
+				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true }
 			},
 		}
 	}
@@ -274,12 +290,7 @@ impl ElectrumRuntimeClient {
 		let (history, tip_height) = match spawn_fut.await {
 			Ok(Ok(result)) => result,
 			Ok(Err(e)) => {
-				log_error!(
-					self.logger,
-					"swap_query_tx: Electrum query failed for {}: {}",
-					txid,
-					e
-				);
+				log_error!(self.logger, "swap_query_tx: Electrum query failed for {}: {}", txid, e);
 				return RawTxObservation::Unreachable;
 			},
 			Err(e) => {
