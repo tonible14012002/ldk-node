@@ -33,19 +33,12 @@ use bitcoin::{FeeRate, Transaction};
 use crate::chain::provider::{ChainDataProvider, WireBroadcastRequest, CHAIN_WIRE_VERSION};
 use crate::chain::seam::{
 	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
-	FeeUpdate, TxBroadcastOutcome, FEE_BUDGET, MAX_BROADCAST_PACKAGE_TXS,
+	FeeUpdate, TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, MAX_BROADCAST_PACKAGE_TXS,
 };
 use crate::chain::wire_convert::{check_version, tx_to_wire};
-use crate::config::TX_BROADCAST_TIMEOUT_SECS;
 use crate::fee_estimator::{apply_post_estimation_adjustments, conf_target_from_wire_name};
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
 
-#[cfg(feature = "swaps")]
-use crate::chain::adapters::bitcoind::BITCOIND_TX_STATUS_BUDGET;
-#[cfg(feature = "swaps")]
-use crate::chain::adapters::electrum::ELECTRUM_TX_STATUS_BUDGET;
-#[cfg(feature = "swaps")]
-use crate::chain::adapters::esplora::ESPLORA_TX_STATUS_BUDGET;
 #[cfg(feature = "swaps")]
 use crate::chain::provider::WireTxStatusRequest;
 #[cfg(feature = "swaps")]
@@ -59,46 +52,36 @@ use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
-/// Headroom a Dependent adds to the serving node's own budget for the round
-/// trip, so it never times out while its provider is still legitimately
-/// working. Pre-seam the Dependent paths had no bound of their own at all.
-const DEPENDENT_TRANSPORT_MARGIN: Duration = Duration::from_secs(5);
+/// The ceiling the embedding app puts on one [`ChainDataProvider`] call:
+/// `CHAIN_CALL_TIMEOUT_SECS` in node-app-ldk-node's `src/chain_provider.rs`
+/// (1.6.0), "deliberately shorter than ldk-node's own wallet-sync timeout, so
+/// a slow provider surfaces as a provider problem there rather than as a
+/// sync timeout two layers up". Mirrored here because it is the app's
+/// constant: every provider call this adapter makes has either answered or
+/// failed within it, whatever the serving node's own backend takes, so the
+/// seam's budgets are that ceiling plus the margin — never shorter, or the
+/// seam would fire first and the app's own timeout, and its attribution of
+/// where the time went, would never be seen.
+const PROVIDER_CALL_TIMEOUT_SECS: u64 = 20;
 
-/// FEE budget: the serving node answers from its fee cache without running
-/// its own FEE chain, so the only time in the round trip is transport; the
-/// slot default plus the transport margin covers it.
-const DEPENDENT_FEE_BUDGET: Duration =
-	Duration::from_secs(FEE_BUDGET.as_secs() + DEPENDENT_TRANSPORT_MARGIN.as_secs());
+/// One provider call plus the margin.
+const DEPENDENT_CALL_BUDGET: Duration =
+	Duration::from_secs(PROVIDER_CALL_TIMEOUT_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
+
+/// FEE budget: one provider call.
+const DEPENDENT_FEE_BUDGET: Duration = DEPENDENT_CALL_BUDGET;
 
 /// BROADCAST budget: the wire carries one transaction per request, so a
-/// package is as many round trips as it has transactions. Each one is the
-/// serving node's own per-transaction send — bounded by its backend's
-/// `TX_BROADCAST_TIMEOUT_SECS`, whichever backend it has — plus transport.
-/// Sized for the largest package, like the backends' own budgets.
-const DEPENDENT_BROADCAST_BUDGET: Duration = Duration::from_secs(
-	MAX_BROADCAST_PACKAGE_TXS * (TX_BROADCAST_TIMEOUT_SECS + DEPENDENT_TRANSPORT_MARGIN.as_secs()),
-);
+/// package is as many provider calls as it has transactions. Sized for the
+/// largest package, like the backends' own budgets.
+const DEPENDENT_BROADCAST_BUDGET: Duration =
+	Duration::from_secs(MAX_BROADCAST_PACKAGE_TXS * DEPENDENT_CALL_BUDGET.as_secs());
 
-/// TX_STATUS budget: the serving node runs its own TX_STATUS chain, through
-/// whichever adapter it has, and this node cannot know which — so it must
-/// outlast the slowest of them plus transport, or it times out while the
-/// provider is still legitimately looking.
+/// TX_STATUS budget: one provider call. The serving node runs its own
+/// TX_STATUS chain behind it, through whichever adapter it has, but the app
+/// bounds the call regardless of how long that chain may take.
 #[cfg(feature = "swaps")]
-const DEPENDENT_TX_STATUS_BUDGET: Duration = Duration::from_secs(
-	max_secs(
-		max_secs(BITCOIND_TX_STATUS_BUDGET.as_secs(), ESPLORA_TX_STATUS_BUDGET.as_secs()),
-		ELECTRUM_TX_STATUS_BUDGET.as_secs(),
-	) + DEPENDENT_TRANSPORT_MARGIN.as_secs(),
-);
-
-#[cfg(feature = "swaps")]
-const fn max_secs(a: u64, b: u64) -> u64 {
-	if a > b {
-		a
-	} else {
-		b
-	}
-}
+const DEPENDENT_TX_STATUS_BUDGET: Duration = DEPENDENT_CALL_BUDGET;
 
 /// Fills the FEE, TX_STATUS and BROADCAST slots from a remote node.
 pub(crate) struct DependentChainAdapter {
@@ -326,5 +309,26 @@ impl TxStatusAction for DependentChainAdapter {
 
 		let confirmations = tip_height.saturating_sub(height).saturating_add(1);
 		unanchored(RawTxObservation::Confirmed { height: Some(height), confirmations })
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// The budgets are the app's per-call ceiling plus the margin, so the
+	/// app's own timeout always fires first.
+	#[test]
+	fn budgets_outlast_the_apps_provider_call_timeout() {
+		let app_ceiling = Duration::from_secs(PROVIDER_CALL_TIMEOUT_SECS);
+		assert!(DEPENDENT_FEE_BUDGET > app_ceiling);
+		assert_eq!(DEPENDENT_FEE_BUDGET, Duration::from_secs(21));
+		assert_eq!(DEPENDENT_BROADCAST_BUDGET, Duration::from_secs(21 * MAX_BROADCAST_PACKAGE_TXS));
+		assert_eq!(DEPENDENT_BROADCAST_BUDGET, Duration::from_secs(525));
+		#[cfg(feature = "swaps")]
+		{
+			assert!(DEPENDENT_TX_STATUS_BUDGET > app_ceiling);
+			assert_eq!(DEPENDENT_TX_STATUS_BUDGET, Duration::from_secs(21));
+		}
 	}
 }

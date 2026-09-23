@@ -20,6 +20,7 @@ use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::poll::ValidatedBlockHeader;
 use lightning_block_sync::rpc::RpcError;
 
+use crate::chain::adapters::classify_sendrawtransaction;
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
 use crate::chain::seam::{
 	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
@@ -47,61 +48,76 @@ use lightning_block_sync::BlockSource;
 
 use async_trait::async_trait;
 
-/// The longest one bitcoind RPC/REST call can take before the HTTP client
-/// gives up on its own: `lightning_block_sync::http`'s 5s connect + 5s write
-/// + 300s response wait (`TCP_STREAM_TIMEOUT` and `TCP_STREAM_RESPONSE_TIMEOUT`).
-/// Mirrored here because the crate keeps them private.
+/// `lightning_block_sync::http`'s `TCP_STREAM_TIMEOUT`: the connect timeout,
+/// and the read/write timeout it sets on the socket. Mirrored here because the
+/// crate keeps it private (lightning-block-sync 0.1.0, `http.rs`).
 #[cfg(feature = "swaps")]
-const BITCOIND_HTTP_CALL_BOUND_SECS: u64 = 5 + 5 + 300;
-
-/// TX_STATUS budget: pre-seam `swap_query_tx` had no bound of its own, only
-/// the HTTP client's per-call one, and makes two calls (`getrawtransaction`,
-/// then a fresh best-block read). Twice that bound plus the margin is
-/// strictly above anything the path could take before, so the client's own
-/// I/O error — never a seam timeout — is what gets reported.
+const BITCOIND_TCP_STREAM_TIMEOUT_SECS: u64 = 5;
+/// `lightning_block_sync::http`'s `TCP_STREAM_RESPONSE_TIMEOUT`: how long the
+/// crate means to let Bitcoin Core sit on a request before answering its
+/// first byte (a UTXO cache flush on a slow device). It is applied as
+/// `RESPONSE / STREAM` extra read attempts on the status line, so the wait it
+/// grants is one stream timeout more than its face value.
 #[cfg(feature = "swaps")]
-pub(crate) const BITCOIND_TX_STATUS_BUDGET: Duration =
-	Duration::from_secs(2 * BITCOIND_HTTP_CALL_BOUND_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
+const BITCOIND_TCP_STREAM_RESPONSE_TIMEOUT_SECS: u64 = 300;
+/// `HttpClient::send_request_with_retry` sends once and, on any error,
+/// reconnects and sends once more: two attempts per call.
+#[cfg(feature = "swaps")]
+const BITCOIND_HTTP_ATTEMPTS: u64 = 2;
+/// The pause the crate takes between those two attempts.
+#[cfg(feature = "swaps")]
+const BITCOIND_HTTP_RETRY_SLEEP_MILLIS: u64 = 100;
 
-/// `sendrawtransaction` error codes that are a verdict on the transaction
-/// itself, from Bitcoin Core's `RPCErrorCode`.
+/// What one bitcoind RPC/REST call is allowed to take, in the crate's own
+/// terms: per attempt a connect, a request write and the wait for the status
+/// line (`RESPONSE / STREAM + 1` reads of one stream timeout each), for two
+/// attempts, plus the retry pause. 2 × (5 + 5 + 305) s + 0.1 s.
 ///
-/// `RPC_TRANSACTION_ERROR` (-25) is missing or already-spent inputs;
-/// `RPC_TRANSACTION_REJECTED` (-26) is a mempool policy or consensus verdict
-/// (`insufficient fee, rejecting replacement`, `txn-mempool-conflict`, ...).
-/// Both are the network refusing this transaction as it stands, and resending
-/// it elsewhere would only buy the same verdict.
-const RPC_TRANSACTION_ERROR: i64 = -25;
-const RPC_TRANSACTION_REJECTED: i64 = -26;
-/// `RPC_TRANSACTION_ALREADY_IN_CHAIN` (-27): the transaction is confirmed, so
-/// the network has it. As good as accepted.
-const RPC_TRANSACTION_ALREADY_IN_CHAIN: i64 = -27;
-/// The one -26 reason that is not a refusal: bitcoind already has this
-/// transaction in its mempool. A stable Core reject string.
-const REJECT_TXN_ALREADY_KNOWN: &str = "txn-already-known";
+/// What it does not cover, stated so nobody reads it as a hard ceiling: the
+/// header and body reads after the status line are each one stream timeout
+/// but the crate does not bound their number; and on the `tokio` path this
+/// crate runs, the socket is handed to tokio non-blocking, so the crate's
+/// read/write timeouts never fire at all — only the connect timeout and the
+/// single retry are real. This budget is therefore the first bound the read
+/// has ever had, sized to the allowance the crate designed for a slow but
+/// alive Bitcoin Core so the seam never cuts one off.
+#[cfg(feature = "swaps")]
+const BITCOIND_HTTP_CALL_BOUND_MILLIS: u64 = BITCOIND_HTTP_ATTEMPTS
+	* 1_000
+	* (BITCOIND_TCP_STREAM_TIMEOUT_SECS
+		+ BITCOIND_TCP_STREAM_TIMEOUT_SECS
+		+ (BITCOIND_TCP_STREAM_RESPONSE_TIMEOUT_SECS / BITCOIND_TCP_STREAM_TIMEOUT_SECS + 1)
+			* BITCOIND_TCP_STREAM_TIMEOUT_SECS)
+	+ BITCOIND_HTTP_RETRY_SLEEP_MILLIS;
+
+/// TX_STATUS budget: pre-seam `swap_query_tx` had no bound of its own and
+/// makes two calls (`getrawtransaction`, then a fresh best-block read), so
+/// twice [`BITCOIND_HTTP_CALL_BOUND_MILLIS`] plus the margin.
+#[cfg(feature = "swaps")]
+const BITCOIND_TX_STATUS_BUDGET: Duration = Duration::from_millis(
+	2 * BITCOIND_HTTP_CALL_BOUND_MILLIS + ADAPTER_BUDGET_MARGIN.as_millis() as u64,
+);
+
+/// Whether an I/O error is the HTTP client's own timeout. A blocking socket
+/// with a read timeout reports it as `TimedOut` on some platforms and as
+/// `WouldBlock` on others (Unix); `lightning_block_sync` surfaces both.
+fn is_timeout(e: &std::io::Error) -> bool {
+	matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+}
 
 /// Classify a failed `sendrawtransaction`.
 ///
-/// Only an RPC error whose code is one of the verdict codes above is
-/// `Rejected`; a transport failure, a timeout, or any other RPC error is
-/// `Unavailable`, because nothing is known about the transaction from it.
+/// A transport failure or a timeout is `Unavailable`, because nothing is
+/// known about the transaction from it; an RPC error goes through the shared
+/// [`classify_sendrawtransaction`] verdict table.
 fn classify_broadcast_error(e: &std::io::Error) -> TxBroadcastOutcome {
-	if e.kind() == std::io::ErrorKind::TimedOut {
+	if is_timeout(e) {
 		return TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true };
 	}
 	let Some(rpc_error) = e.get_ref().and_then(|inner| inner.downcast_ref::<RpcError>()) else {
 		return TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: false };
 	};
-	match rpc_error.code {
-		RPC_TRANSACTION_ALREADY_IN_CHAIN => TxBroadcastOutcome::AlreadyKnown,
-		RPC_TRANSACTION_REJECTED if rpc_error.message.contains(REJECT_TXN_ALREADY_KNOWN) => {
-			TxBroadcastOutcome::AlreadyKnown
-		},
-		RPC_TRANSACTION_ERROR | RPC_TRANSACTION_REJECTED => {
-			TxBroadcastOutcome::Rejected(format!("{} ({})", rpc_error.message, rpc_error.code))
-		},
-		_ => TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: false },
-	}
+	classify_sendrawtransaction(rpc_error.code, &rpc_error.message)
 }
 
 /// Fee estimates from a bitcoind RPC/REST endpoint.
@@ -310,7 +326,7 @@ impl TxStatusAction for BitcoindChainAdapter {
 			Err(e) => {
 				log_error!(self.logger, "swap_query_tx: Bitcoind query failed for {}: {}", txid, e);
 				let reason = format!("query failed: {}", e);
-				Err(if e.kind() == std::io::ErrorKind::TimedOut {
+				Err(if is_timeout(&e) {
 					ChainActionError::timed_out(reason)
 				} else {
 					ChainActionError::unavailable(reason)
@@ -428,5 +444,82 @@ impl BitcoindChainAdapter {
 				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true }
 			},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use std::io::{Error as IoError, ErrorKind};
+
+	/// Both spellings of a socket read timeout are the client's own timeout.
+	#[test]
+	fn read_timeouts_of_either_kind_are_timed_out() {
+		for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock] {
+			let e = IoError::new(kind, "read timed out");
+			assert!(is_timeout(&e), "{:?}", kind);
+			assert_eq!(
+				classify_broadcast_error(&e),
+				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true }
+			);
+		}
+		let e = IoError::new(ErrorKind::ConnectionRefused, "refused");
+		assert!(!is_timeout(&e));
+		assert_eq!(
+			classify_broadcast_error(&e),
+			TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: false }
+		);
+	}
+
+	/// An RPC error reaches the shared verdict table through the `io::Error`
+	/// wrapper `lightning_block_sync` puts around it.
+	#[test]
+	fn rpc_errors_go_through_the_shared_verdict_table() {
+		let wrap = |code: i64, message: &str| {
+			IoError::new(ErrorKind::Other, RpcError { code, message: message.to_string() })
+		};
+		assert_eq!(
+			classify_broadcast_error(&wrap(-27, "Transaction already in block chain")),
+			TxBroadcastOutcome::AlreadyKnown
+		);
+		assert_eq!(
+			classify_broadcast_error(&wrap(-26, "txn-already-known")),
+			TxBroadcastOutcome::AlreadyKnown
+		);
+		assert_eq!(
+			classify_broadcast_error(&wrap(-26, "txn-mempool-conflict")),
+			TxBroadcastOutcome::Rejected("txn-mempool-conflict (-26)".into())
+		);
+		assert_eq!(
+			classify_broadcast_error(&wrap(-25, "Missing inputs")),
+			TxBroadcastOutcome::Rejected("Missing inputs (-25)".into())
+		);
+		assert!(matches!(
+			classify_broadcast_error(&wrap(-25, "Fee exceeds maximum configured by user")),
+			TxBroadcastOutcome::Unavailable { timed_out: false, .. }
+		));
+		assert!(matches!(
+			classify_broadcast_error(&wrap(-8, "Invalid parameter")),
+			TxBroadcastOutcome::Unavailable { timed_out: false, .. }
+		));
+	}
+
+	/// The HTTP client's own allowance the TX_STATUS budget rests on.
+	#[cfg(feature = "swaps")]
+	#[test]
+	fn tx_status_budget_covers_the_clients_two_attempts() {
+		// Per attempt: 5 s connect + 5 s write + 61 reads × 5 s for the status
+		// line; two attempts; 100 ms between them.
+		assert_eq!(BITCOIND_HTTP_CALL_BOUND_MILLIS, 2 * (5_000 + 5_000 + 61 * 5_000) + 100);
+		assert_eq!(BITCOIND_HTTP_CALL_BOUND_MILLIS, 630_100);
+		// Two calls plus the 1 s margin.
+		assert_eq!(BITCOIND_TX_STATUS_BUDGET, Duration::from_millis(2 * 630_100 + 1_000));
+		// Never below what the crate itself designed for a slow Bitcoin Core:
+		// twice the response timeout per call.
+		assert!(
+			BITCOIND_TX_STATUS_BUDGET
+				> Duration::from_secs(2 * 2 * BITCOIND_TCP_STREAM_RESPONSE_TIMEOUT_SECS)
+		);
 	}
 }

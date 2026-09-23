@@ -35,17 +35,61 @@ use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
-/// TX_STATUS budget: pre-seam `swap_query_tx` had no bound of its own — two
-/// socket calls (script history, then headers subscribe), each bounded only by
-/// the Electrum client's `ELECTRUM_CLIENT_TIMEOUT_SECS` per attempt across
-/// `ELECTRUM_CLIENT_NUM_RETRIES` reconnects. The worst case of that plus the
-/// margin is strictly above anything the path could take before, so the
-/// client's own error — never a seam timeout — is what gets reported.
+/// How many times electrum-client (0.23.1, `client.rs` `impl_inner_call!`)
+/// sends one call: the first attempt plus one per configured retry, a
+/// protocol error excepted (it is returned at once, never retried).
 #[cfg(feature = "swaps")]
-pub(crate) const ELECTRUM_TX_STATUS_BUDGET: Duration = Duration::from_secs(
-	2 * (ELECTRUM_CLIENT_TIMEOUT_SECS as u64) * (ELECTRUM_CLIENT_NUM_RETRIES as u64 + 1)
-		+ ADAPTER_BUDGET_MARGIN.as_secs(),
-);
+const ELECTRUM_CLIENT_ATTEMPTS: u64 = ELECTRUM_CLIENT_NUM_RETRIES as u64 + 1;
+/// The socket operations one attempt is made of, each under its own
+/// `ELECTRUM_CLIENT_TIMEOUT_SECS`: the client sets it as the connect timeout
+/// (`connect_with_total_timeout`, shared across the resolved addresses), the
+/// write timeout and the read timeout, separately. Connect, request write,
+/// response read.
+#[cfg(feature = "swaps")]
+const ELECTRUM_SOCKET_OPS_PER_ATTEMPT: u64 = 3;
+/// electrum-client's reconnect sleep: before rebuilding the connection for
+/// retry `n` it sleeps `min(2^n, 30)` seconds, n counted from 1.
+#[cfg(feature = "swaps")]
+const ELECTRUM_RECONNECT_SLEEP_CAP_SECS: u64 = 30;
+
+/// The reconnect sleeps of one call that uses every retry: 2 + 4 + 8 s for
+/// the three the client is built with.
+#[cfg(feature = "swaps")]
+const fn electrum_reconnect_sleeps_secs(retries: u64) -> u64 {
+	let mut total = 0;
+	let mut n = 1;
+	while n <= retries {
+		let sleep = 1u64 << n;
+		total += if sleep < ELECTRUM_RECONNECT_SLEEP_CAP_SECS {
+			sleep
+		} else {
+			ELECTRUM_RECONNECT_SLEEP_CAP_SECS
+		};
+		n += 1;
+	}
+	total
+}
+
+/// What one Electrum call is allowed to take, in the client's own terms:
+/// `ATTEMPTS × OPS × TIMEOUT` plus the reconnect sleeps. 4 × 3 × 20 s + 14 s.
+///
+/// What it covers, so nobody reads it as a hard ceiling: one connect, one
+/// write and one read per attempt. A response that arrives across several
+/// reads, or a TLS handshake's own reads and writes on reconnect, each get
+/// the same per-operation timeout and are not counted here.
+#[cfg(feature = "swaps")]
+const ELECTRUM_CALL_BOUND_SECS: u64 = ELECTRUM_CLIENT_ATTEMPTS
+	* ELECTRUM_SOCKET_OPS_PER_ATTEMPT
+	* (ELECTRUM_CLIENT_TIMEOUT_SECS as u64)
+	+ electrum_reconnect_sleeps_secs(ELECTRUM_CLIENT_NUM_RETRIES as u64);
+
+/// TX_STATUS budget: pre-seam `swap_query_tx` had no bound of its own and
+/// makes two socket calls (script history, then headers subscribe), so twice
+/// [`ELECTRUM_CALL_BOUND_SECS`] plus the margin lets the client's own error
+/// fire first for anything the bound covers.
+#[cfg(feature = "swaps")]
+const ELECTRUM_TX_STATUS_BUDGET: Duration =
+	Duration::from_secs(2 * ELECTRUM_CALL_BOUND_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
 
 /// Fee estimates from an Electrum server.
 ///
@@ -71,14 +115,11 @@ impl ElectrumChainAdapter {
 	}
 
 	/// The pre-chain fee fetch, unchanged: the client's own batched call,
-	/// timeout and completeness policy.
+	/// timeout and completeness policy. A chain source that is not started is
+	/// a state every chain checks for, not a bug: the fetch fails and the
+	/// chain moves on.
 	async fn fetch_fee_rate_update(&self) -> Result<FeeUpdate, Error> {
-		let electrum_client: Arc<ElectrumRuntimeClient> = if let Some(client) =
-			self.runtime_status.read().unwrap().client().as_ref()
-		{
-			Arc::clone(client)
-		} else {
-			debug_assert!(false, "We should have started the chain source before updating fees");
+		let Some(electrum_client) = self.client() else {
 			return Err(Error::FeerateEstimationUpdateFailed);
 		};
 
@@ -171,19 +212,15 @@ impl BroadcastAction for ElectrumChainAdapter {
 	/// ready, and `process_broadcast_queue` runs once a second, so this is
 	/// the same behaviour: skip this pass, try again on the next tick.
 	async fn ready(&self) -> bool {
-		if self.client().is_some() {
-			return true;
-		}
-		debug_assert!(false, "We should have started the chain source before broadcasting");
-		false
+		self.client().is_some()
 	}
 
 	/// One send per transaction, exactly as pre-seam. The Electrum client owns
 	/// its own timeout, logging and classification, and takes the transaction
 	/// by value; the clone is the one cost of the shared by-reference slot
-	/// contract. Electrum reports a server-side refusal as an opaque protocol
-	/// error whose text this adapter cannot classify reliably, so it never
-	/// answers `Rejected`: every failure is `Unavailable`.
+	/// contract. A server-side refusal arrives as a protocol error the client
+	/// classifies best-effort: a relayed `sendrawtransaction` verdict it can
+	/// read is answered as such, anything else is `Unavailable`.
 	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
 		let Some(client) = self.client() else {
 			return Err(ChainActionError::unavailable("chain source not started"));
@@ -193,5 +230,24 @@ impl BroadcastAction for ElectrumChainAdapter {
 			outcomes.push((tx.compute_txid(), client.broadcast(tx.clone()).await));
 		}
 		package_result(outcomes)
+	}
+}
+
+#[cfg(all(test, feature = "swaps"))]
+mod tests {
+	use super::*;
+
+	/// The retry arithmetic the TX_STATUS budget rests on, spelled out.
+	#[test]
+	fn tx_status_budget_covers_the_clients_retry_and_reconnect_path() {
+		// Sleeps of 2, 4 and 8 s before each of the three reconnects.
+		assert_eq!(electrum_reconnect_sleeps_secs(3), 2 + 4 + 8);
+		// The per-reconnect sleep caps at 30 s: 2 + 4 + 8 + 16 + 30 + 30.
+		assert_eq!(electrum_reconnect_sleeps_secs(6), 2 + 4 + 8 + 16 + 30 + 30);
+		assert_eq!(electrum_reconnect_sleeps_secs(0), 0);
+		// 4 attempts × (connect + write + read) × 20 s + the sleeps.
+		assert_eq!(ELECTRUM_CALL_BOUND_SECS, 4 * 3 * 20 + 14);
+		// Two calls plus the 1 s margin.
+		assert_eq!(ELECTRUM_TX_STATUS_BUDGET, Duration::from_secs(2 * 254 + 1));
 	}
 }

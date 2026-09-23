@@ -303,6 +303,13 @@ impl From<ChainActionError> for TxBroadcastOutcome {
 ///   unsent transactions were accepted, a claim the shared tail acts on.
 /// * else any `Rejected` makes the package `Rejected`, listing every refused
 ///   transaction with its reason. Transactions not listed were accepted.
+///
+/// An `Unavailable` package says nothing about which of its transactions the
+/// backend did take before the send that failed: the accepted subset is not
+/// carried in the answer, so once the chain is exhausted, an engine that
+/// tracks its own broadcasts (to recognise the echo of its own transaction
+/// in a later observation) has no list of what to expect. T8 must handle
+/// that when such an engine lands.
 pub(crate) fn package_result(
 	outcomes: impl IntoIterator<Item = (Txid, TxBroadcastOutcome)>,
 ) -> ActionResult<(), BroadcastRejection> {

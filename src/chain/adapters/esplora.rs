@@ -17,6 +17,7 @@ use esplora_client::AsyncClient as EsploraAsyncClient;
 
 use lightning::util::ser::Writeable;
 
+use crate::chain::adapters::classify_relayed_sendrawtransaction;
 use crate::chain::seam::{
 	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
 	FeeUpdate, TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, PER_TX_BROADCAST_BUDGET,
@@ -39,13 +40,42 @@ use bitcoin::{ScriptBuf, Txid};
 
 use async_trait::async_trait;
 
-/// TX_STATUS budget: pre-seam `swap_query_tx` made two HTTP calls (status,
-/// then tip height), each bounded only by the client's own
-/// `DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS`; twice that plus the margin lets the
-/// client's timeout, and its log line, fire first.
+/// esplora-client's `DEFAULT_MAX_RETRIES` (0.12.3, `lib.rs`): every GET goes
+/// through `AsyncClient::get_with_retry`, which re-sends a request whose
+/// response was 429, 500 or 503 (`RETRYABLE_ERROR_CODES`) up to this many
+/// times. A transport error, the client timeout included, is not retried. The
+/// builder in `chain::layer` leaves this at the default. Mirrored here because
+/// the crate keeps it private.
 #[cfg(feature = "swaps")]
-pub(crate) const ESPLORA_TX_STATUS_BUDGET: Duration =
-	Duration::from_secs(2 * DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
+const ESPLORA_MAX_RETRIES: u64 = 6;
+/// esplora-client's `BASE_BACKOFF_MILLIS`: the sleep before the first retry,
+/// doubled before each further one.
+#[cfg(feature = "swaps")]
+const ESPLORA_BASE_BACKOFF_MILLIS: u64 = 256;
+
+/// The backoff `get_with_retry` sleeps through when every retry is used:
+/// 256 ms × (1 + 2 + … + 2^(retries-1)) = 256 ms × (2^retries − 1).
+#[cfg(feature = "swaps")]
+const ESPLORA_BACKOFF_TOTAL_MILLIS: u64 =
+	ESPLORA_BASE_BACKOFF_MILLIS * ((1 << ESPLORA_MAX_RETRIES) - 1);
+
+/// What one Esplora GET can take before the client gives up on its own: each
+/// of the `MAX_RETRIES + 1` attempts is bounded by the reqwest client timeout
+/// (`DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS`, a server that takes the whole
+/// timeout to answer 503 is retried), plus the backoff between them.
+/// 7 × 10 s + 16.128 s.
+#[cfg(feature = "swaps")]
+const ESPLORA_GET_BOUND_MILLIS: u64 =
+	(ESPLORA_MAX_RETRIES + 1) * DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS * 1_000
+		+ ESPLORA_BACKOFF_TOTAL_MILLIS;
+
+/// TX_STATUS budget: pre-seam `swap_query_tx` made two GETs (status, then tip
+/// height) with no bound of its own, each on the retrying path, so twice
+/// [`ESPLORA_GET_BOUND_MILLIS`] plus the margin lets the client's own timeout,
+/// and its log line, fire first even when the server is limping through 503s.
+#[cfg(feature = "swaps")]
+const ESPLORA_TX_STATUS_BUDGET: Duration =
+	Duration::from_millis(2 * ESPLORA_GET_BOUND_MILLIS + ADAPTER_BUDGET_MARGIN.as_millis() as u64);
 
 /// An `Unavailable` for a failed Esplora call, `timed_out` when the HTTP
 /// client's own timeout is what failed it.
@@ -141,7 +171,10 @@ impl FeeAction for EsploraChainAdapter {
 
 	/// Pre-seam timing preserved: the fetch bounds itself at
 	/// `FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS`; the margin lets that timeout, and
-	/// its error log, fire before the seam's.
+	/// its error log, fire before the seam's. `/fee-estimates` is on the
+	/// client's retrying GET path (up to 6 retries with backoff on 429/500/503),
+	/// but the fetch's own timeout cuts that path short, so it does not widen
+	/// this budget.
 	fn budget(&self) -> Option<Duration> {
 		Some(Duration::from_secs(FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS) + ADAPTER_BUDGET_MARGIN)
 	}
@@ -241,7 +274,9 @@ impl BroadcastAction for EsploraChainAdapter {
 
 	/// Pre-seam timing preserved: each transaction is sent under its own
 	/// `TX_BROADCAST_TIMEOUT_SECS`, so the HTTP client's timeout and its error
-	/// log fire before the seam's.
+	/// log fire before the seam's. `POST /tx` is not on the client's retrying
+	/// path (`post_request_bytes` sends once), so one client timeout is all a
+	/// send can take even without the per-transaction bound.
 	fn budget(&self) -> Option<Duration> {
 		Some(PER_TX_BROADCAST_BUDGET)
 	}
@@ -259,11 +294,15 @@ impl BroadcastAction for EsploraChainAdapter {
 }
 
 impl EsploraChainAdapter {
-	/// The pre-seam per-transaction send, with its classification and log
-	/// levels: an HTTP 400 usually just means bitcoind already knows the
-	/// transaction, so it is logged at trace and counts as already known;
-	/// every other failure is logged at error and is `Unavailable`, timed out
-	/// when the client's own timeout or ours is what failed it.
+	/// The pre-seam per-transaction send and its log levels. electrs answers
+	/// every `sendrawtransaction` failure with HTTP 400 and relays bitcoind's
+	/// error in the body (`sendrawtransaction RPC error: {"code":..,
+	/// "message":..}`), so a 400 is classified by the shared verdict table: a
+	/// verdict is logged at trace, the layer's tail logs what it does about it.
+	/// A 400 whose body is not that relay says nothing about the transaction
+	/// and is `Unavailable`, like every other status and every transport
+	/// failure — timed out when the client's own timeout or ours is what
+	/// failed it.
 	async fn broadcast_tx(&self, tx: &Transaction) -> TxBroadcastOutcome {
 		let txid = tx.compute_txid();
 		let timeout_fut = tokio::time::timeout(
@@ -277,40 +316,52 @@ impl EsploraChainAdapter {
 					TxBroadcastOutcome::Accepted
 				},
 				Err(e) => match e {
+					esplora_client::Error::HttpResponse { status: 400, message } => {
+						let outcome = match classify_relayed_sendrawtransaction(&message) {
+							Some(outcome) => {
+								log_trace!(
+									self.logger,
+									"Esplora relayed bitcoind's verdict on transaction {}: {}",
+									txid,
+									message
+								);
+								outcome
+							},
+							None => {
+								log_error!(
+									self.logger,
+									"Failed to broadcast transaction {} due to HTTP 400 with an unrecognised body: {}",
+									txid,
+									message
+								);
+								TxBroadcastOutcome::Unavailable {
+									reason: format!("HTTP 400: {}", message),
+									timed_out: false,
+								}
+							},
+						};
+						log_trace!(
+							self.logger,
+							"Failed broadcast transaction bytes: {}",
+							log_bytes!(tx.encode())
+						);
+						outcome
+					},
 					esplora_client::Error::HttpResponse { status, message } => {
-						if status == 400 {
-							// Log 400 at lesser level, as this often just means bitcoind already knows the
-							// transaction.
-							// FIXME: We can further differentiate here based on the error
-							// message which will be available with rust-esplora-client 0.7 and
-							// later.
-							log_trace!(
-								self.logger,
-								"Failed to broadcast due to HTTP connection error: {}",
-								message
-							);
-							log_trace!(
-								self.logger,
-								"Failed broadcast transaction bytes: {}",
-								log_bytes!(tx.encode())
-							);
-							TxBroadcastOutcome::AlreadyKnown
-						} else {
-							log_error!(
-								self.logger,
-								"Failed to broadcast due to HTTP connection error: {} - {}",
-								status,
-								message
-							);
-							log_trace!(
-								self.logger,
-								"Failed broadcast transaction bytes: {}",
-								log_bytes!(tx.encode())
-							);
-							TxBroadcastOutcome::Unavailable {
-								reason: format!("HTTP {}: {}", status, message),
-								timed_out: false,
-							}
+						log_error!(
+							self.logger,
+							"Failed to broadcast due to HTTP connection error: {} - {}",
+							status,
+							message
+						);
+						log_trace!(
+							self.logger,
+							"Failed broadcast transaction bytes: {}",
+							log_bytes!(tx.encode())
+						);
+						TxBroadcastOutcome::Unavailable {
+							reason: format!("HTTP {}: {}", status, message),
+							timed_out: false,
 						}
 					},
 					_ => {
@@ -343,5 +394,27 @@ impl EsploraChainAdapter {
 				TxBroadcastOutcome::Unavailable { reason: e.to_string(), timed_out: true }
 			},
 		}
+	}
+}
+
+#[cfg(all(test, feature = "swaps"))]
+mod tests {
+	use super::*;
+
+	/// The retry arithmetic the TX_STATUS budget rests on, spelled out.
+	#[test]
+	fn tx_status_budget_covers_the_clients_retrying_get_path() {
+		// 256 ms × (1 + 2 + 4 + 8 + 16 + 32).
+		assert_eq!(ESPLORA_BACKOFF_TOTAL_MILLIS, 16_128);
+		// 7 attempts × 10 s client timeout + the backoff.
+		assert_eq!(ESPLORA_GET_BOUND_MILLIS, 7 * 10_000 + 16_128);
+		// Two GETs plus the 1 s margin.
+		assert_eq!(ESPLORA_TX_STATUS_BUDGET, Duration::from_millis(2 * 86_128 + 1_000));
+		assert!(
+			ESPLORA_TX_STATUS_BUDGET
+				> Duration::from_secs(
+					2 * (ESPLORA_MAX_RETRIES + 1) * DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS
+				)
+		);
 	}
 }

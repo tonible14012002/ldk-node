@@ -34,6 +34,7 @@ use electrum_client::{Batch, ElectrumApi};
 
 use bitcoin::{BlockHash, FeeRate, Network, OutPoint, Script, ScriptBuf, Transaction, Txid};
 
+use crate::chain::adapters::classify_electrum_protocol_error;
 use crate::chain::provider::{
 	WireBlockId, WireConfirmedTx, WireLightningSyncRequest, WireLightningSyncResponse,
 	WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
@@ -211,9 +212,11 @@ impl ElectrumRuntimeClient {
 
 	/// Send one transaction, logging its own outcome.
 	///
-	/// A server-side refusal arrives as an opaque protocol error whose text
-	/// cannot be classified reliably, so it is reported as `Unavailable`, never
-	/// as a rejection; so is a failed or timed-out call.
+	/// A server-side refusal arrives as a protocol error carrying an opaque
+	/// JSON value. Strictly best-effort: when that value holds the
+	/// `sendrawtransaction RPC error: {..}` relay electrs writes, the shared
+	/// verdict table classifies it and the verdict is logged at trace; any
+	/// other protocol error, a failed call or a timed-out one is `Unavailable`.
 	pub(crate) async fn broadcast(&self, tx: Transaction) -> TxBroadcastOutcome {
 		let electrum_client = Arc::clone(&self.electrum_client);
 
@@ -230,6 +233,37 @@ impl ElectrumRuntimeClient {
 			Ok(Ok(Ok(_))) => {
 				log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
 				TxBroadcastOutcome::Accepted
+			},
+			Ok(Ok(Err(electrum_client::Error::Protocol(value)))) => {
+				let outcome = match classify_electrum_protocol_error(&value) {
+					Some(outcome) => {
+						log_trace!(
+							self.logger,
+							"Electrum server relayed bitcoind's verdict on transaction {}: {}",
+							txid,
+							value
+						);
+						outcome
+					},
+					None => {
+						log_error!(
+							self.logger,
+							"Failed to broadcast transaction {}: Electrum server error: {}",
+							txid,
+							value
+						);
+						TxBroadcastOutcome::Unavailable {
+							reason: format!("Electrum server error: {}", value),
+							timed_out: false,
+						}
+					},
+				};
+				log_trace!(
+					self.logger,
+					"Failed broadcast transaction bytes: {}",
+					log_bytes!(tx_bytes)
+				);
+				outcome
 			},
 			Ok(Ok(Err(e))) => {
 				log_error!(self.logger, "Failed to broadcast transaction {}: {}", txid, e);
