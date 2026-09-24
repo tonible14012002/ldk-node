@@ -19,7 +19,7 @@ pub(crate) mod applicator;
 pub(crate) mod birthday;
 pub(crate) mod fee;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
@@ -31,6 +31,7 @@ use bdk_chain::BlockId;
 use bitcoin::block::Header;
 use bitcoin::Txid;
 
+use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::BestBlock;
 
 use tokio::sync::watch;
@@ -296,6 +297,19 @@ pub(crate) fn resume_anchor(bdk_cp: CheckPoint, target_height: u32) -> CheckPoin
 	cursor
 }
 
+/// How deep an LDK-registered transaction is buried before the ledger lets its watch go: twice
+/// the depth LDK itself waits out before it considers a confirmation final. LDK learns of the
+/// confirmation from the blocks the applicator hands it, never from the ledger; what the ledger
+/// keeps for an LDK registration is only a TX_STATUS answer, and past this depth nothing a
+/// reorg could undo is left for that answer to track.
+pub(crate) const LDK_WATCH_PRUNE_DEPTH: u32 = 2 * ANTI_REORG_DELAY;
+
+/// The most LDK registrations the ledger holds at once. LDK registers every transaction it
+/// must see confirmed — fundings, commitments, claims — and one that never confirms is never
+/// pruned by depth; past this the oldest registration is let go, so the ledger stays bounded
+/// on a node that runs for years. A swap watch is never let go this way.
+pub(crate) const MAX_LDK_WATCHES: usize = 10_000;
+
 /// Where the transactions this node was asked to watch were seen confirmed, as the applicator
 /// saw the blocks go by, together with the block it most recently applied.
 ///
@@ -305,16 +319,41 @@ pub(crate) fn resume_anchor(bdk_cp: CheckPoint, target_height: u32) -> CheckPoin
 /// confirmation it never observed — a filter-driven node has no history to look back into.
 /// Disconnects drop every confirmation at or above the rewound height, so an answer never
 /// outlives the branch it was seen on.
+///
+/// Two kinds of registration are kept apart, because they end differently. LDK's
+/// (`Filter::register_tx`) are never withdrawn by LDK, so the ledger lets them go itself: once
+/// buried [`LDK_WATCH_PRUNE_DEPTH`] deep, and oldest-first past [`MAX_LDK_WATCHES`]. A swap's
+/// is withdrawn by the swap ([`WatchLedger::unwatch_swap`]), and only its own: a transaction
+/// LDK also registered stays watched for LDK.
 pub(crate) struct WatchLedger {
 	inner: Mutex<WatchLedgerInner>,
 }
 
 #[derive(Default)]
 struct WatchLedgerInner {
-	watched: HashSet<Txid>,
+	/// Registered by LDK.
+	ldk: HashSet<Txid>,
+	/// LDK registrations, oldest first, for the cap. May hold txids already let go; they are
+	/// skipped when met, and the queue is compacted once it outgrows the set.
+	ldk_order: VecDeque<Txid>,
+	/// Registered by a swap watch.
+	swap: HashSet<Txid>,
 	confirmed: HashMap<Txid, BlockId>,
 	/// The block the applicator most recently connected, rewound to the parent on disconnect.
 	tip: Option<BlockId>,
+}
+
+impl WatchLedgerInner {
+	fn is_watched(&self, txid: &Txid) -> bool {
+		self.ldk.contains(txid) || self.swap.contains(txid)
+	}
+
+	/// Let LDK's registration of `txid` go, keeping any sighting a swap still watches.
+	fn drop_ldk(&mut self, txid: &Txid) {
+		if self.ldk.remove(txid) && !self.swap.contains(txid) {
+			self.confirmed.remove(txid);
+		}
+	}
 }
 
 impl WatchLedger {
@@ -326,9 +365,29 @@ impl WatchLedger {
 		self.inner.lock().unwrap_or_else(|e| e.into_inner())
 	}
 
-	/// Start watching `txid` in every block applied from now on.
-	pub(crate) fn watch(&self, txid: Txid) {
-		self.lock().watched.insert(txid);
+	/// LDK registered `txid`: watch it in every block applied from now on, until it is buried
+	/// or the cap lets it go.
+	pub(crate) fn watch_ldk(&self, txid: Txid) {
+		let mut inner = self.lock();
+		if !inner.ldk.insert(txid) {
+			return;
+		}
+		inner.ldk_order.push_back(txid);
+		while inner.ldk.len() > MAX_LDK_WATCHES {
+			let Some(oldest) = inner.ldk_order.pop_front() else { break };
+			inner.drop_ldk(&oldest);
+		}
+		if inner.ldk_order.len() > 2 * MAX_LDK_WATCHES {
+			let WatchLedgerInner { ldk, ldk_order, .. } = &mut *inner;
+			let mut kept = HashSet::with_capacity(ldk.len());
+			ldk_order.retain(|txid| ldk.contains(txid) && kept.insert(*txid));
+		}
+	}
+
+	/// A swap asked to watch `txid`: watch it in every block applied from now on, until the
+	/// swap lets it go.
+	pub(crate) fn watch_swap(&self, txid: Txid) {
+		self.lock().swap.insert(txid);
 	}
 
 	/// The block most recently applied by the applicator, if any block has been: the tip the
@@ -339,18 +398,27 @@ impl WatchLedger {
 	}
 
 	/// The applicator connected `block`: it is the tip now, and any watched transaction among
-	/// `txids` confirmed in it.
+	/// `txids` confirmed in it. LDK registrations buried [`LDK_WATCH_PRUNE_DEPTH`] deep under
+	/// it are let go.
 	pub(crate) fn note_connected(&self, block: BlockId, txids: impl IntoIterator<Item = Txid>) {
 		let mut inner = self.lock();
 		inner.tip = Some(block);
-		if inner.watched.is_empty() {
+		if inner.ldk.is_empty() && inner.swap.is_empty() {
 			return;
 		}
 		for txid in txids {
-			if inner.watched.contains(&txid) {
+			if inner.is_watched(&txid) {
 				inner.confirmed.insert(txid, block);
 			}
 		}
+		let WatchLedgerInner { ldk, swap, confirmed, .. } = &mut *inner;
+		confirmed.retain(|txid, at| {
+			let depth = block.height.saturating_sub(at.height).saturating_add(1);
+			if depth >= LDK_WATCH_PRUNE_DEPTH {
+				ldk.remove(txid);
+			}
+			ldk.contains(txid) || swap.contains(txid)
+		});
 	}
 
 	/// The applicator disconnected the block `header` at `height`: nothing seen at or above
@@ -375,17 +443,20 @@ impl WatchLedger {
 // go; that adapter exists only with the `swaps` feature, which is what TX_STATUS is.
 #[cfg_attr(not(feature = "swaps"), allow(dead_code))]
 impl WatchLedger {
-	/// Stop watching `txid` and forget where it was seen.
-	pub(crate) fn unwatch(&self, txid: &Txid) {
+	/// The swap stops watching `txid`. An LDK registration of the same transaction stays, and
+	/// so does the sighting it may still be asked about.
+	pub(crate) fn unwatch_swap(&self, txid: &Txid) {
 		let mut inner = self.lock();
-		inner.watched.remove(txid);
-		inner.confirmed.remove(txid);
+		inner.swap.remove(txid);
+		if !inner.ldk.contains(txid) {
+			inner.confirmed.remove(txid);
+		}
 	}
 
 	/// Whether `txid` is watched at all — the difference between "not seen yet" and "never
 	/// asked", which the adapter must not conflate.
 	pub(crate) fn is_watched(&self, txid: &Txid) -> bool {
-		self.lock().watched.contains(txid)
+		self.lock().is_watched(txid)
 	}
 
 	/// The block `txid` was seen confirmed in, if the applicator saw it since the watch began.
@@ -564,8 +635,8 @@ mod tests {
 
 		// Seen before the watch began: never matched, even though it was in an applied block.
 		ledger.note_connected(block(100, 0xa0), [early]);
-		ledger.watch(early);
-		ledger.watch(late);
+		ledger.watch_swap(early);
+		ledger.watch_swap(late);
 		assert_eq!(ledger.confirmation(&early), None, "a confirmation before the watch is unseen");
 		assert_eq!(ledger.tip(), Some(block(100, 0xa0)));
 
@@ -588,7 +659,7 @@ mod tests {
 		assert_eq!(ledger.tip(), Some(block(100, 0xa0)));
 		assert!(ledger.is_watched(&late), "the watch survives the reorg; only the sighting goes");
 
-		ledger.unwatch(&late);
+		ledger.unwatch_swap(&late);
 		assert!(!ledger.is_watched(&late));
 	}
 
@@ -596,7 +667,7 @@ mod tests {
 	fn watch_ledger_never_moves_the_applied_tip_forward_on_disconnect() {
 		let ledger = WatchLedger::new();
 		let seen = txid(1);
-		ledger.watch(seen);
+		ledger.watch_swap(seen);
 		let above = Header {
 			version: bitcoin::block::Version::TWO,
 			prev_blockhash: block(104, 0xa4).hash,
@@ -622,5 +693,70 @@ mod tests {
 		ledger.note_disconnected(&at_tip, 100);
 		assert_eq!(ledger.tip(), Some(block(99, 0x99)));
 		assert_eq!(ledger.confirmation(&seen), None);
+	}
+
+	#[test]
+	fn ldk_and_swap_registrations_are_kept_apart() {
+		let ledger = WatchLedger::new();
+		let both = txid(1);
+		ledger.watch_ldk(both);
+		ledger.watch_swap(both);
+		ledger.note_connected(block(100, 0xa0), [both]);
+
+		// The swap lets go; LDK's registration, and the sighting, stay.
+		ledger.unwatch_swap(&both);
+		assert!(ledger.is_watched(&both), "an LDK registration outlives the swap's");
+		assert_eq!(ledger.confirmation(&both), Some(block(100, 0xa0)));
+
+		// A swap's own watch goes with it.
+		let swap_only = txid(2);
+		ledger.watch_swap(swap_only);
+		ledger.unwatch_swap(&swap_only);
+		assert!(!ledger.is_watched(&swap_only));
+	}
+
+	#[test]
+	fn buried_ldk_registrations_are_let_go_and_swap_watches_are_not() {
+		let ledger = WatchLedger::new();
+		let (ldk_only, swap_too) = (txid(1), txid(2));
+		ledger.watch_ldk(ldk_only);
+		ledger.watch_ldk(swap_too);
+		ledger.watch_swap(swap_too);
+		ledger.note_connected(block(100, 0xa0), [ldk_only, swap_too]);
+
+		// One block short of the prune depth: still watched.
+		for height in 101..100 + LDK_WATCH_PRUNE_DEPTH - 1 {
+			ledger.note_connected(block(height, height as u8), []);
+		}
+		assert!(ledger.is_watched(&ldk_only));
+		assert_eq!(ledger.confirmation(&ldk_only), Some(block(100, 0xa0)));
+
+		// Buried LDK_WATCH_PRUNE_DEPTH deep: LDK's registration goes, the swap's stays.
+		let height = 100 + LDK_WATCH_PRUNE_DEPTH - 1;
+		ledger.note_connected(block(height, height as u8), []);
+		assert!(!ledger.is_watched(&ldk_only));
+		assert_eq!(ledger.confirmation(&ldk_only), None);
+		assert!(ledger.is_watched(&swap_too));
+		assert_eq!(ledger.confirmation(&swap_too), Some(block(100, 0xa0)));
+	}
+
+	#[test]
+	fn ldk_registrations_are_capped_oldest_first() {
+		let ledger = WatchLedger::new();
+		let txid_n = |n: u32| {
+			let mut bytes = [0u8; 32];
+			bytes[..4].copy_from_slice(&n.to_le_bytes());
+			Txid::from_byte_array(bytes)
+		};
+		let swap = txid(0xff);
+		ledger.watch_swap(swap);
+		for n in 0..=MAX_LDK_WATCHES as u32 {
+			ledger.watch_ldk(txid_n(n));
+		}
+		assert!(!ledger.is_watched(&txid_n(0)), "the oldest registration went");
+		assert!(ledger.is_watched(&txid_n(1)));
+		assert!(ledger.is_watched(&txid_n(MAX_LDK_WATCHES as u32)));
+		assert!(ledger.is_watched(&swap), "the cap never touches a swap watch");
+		assert_eq!(ledger.lock().ldk.len(), MAX_LDK_WATCHES);
 	}
 }

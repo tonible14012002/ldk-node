@@ -14,6 +14,7 @@ use bitcoin::Transaction;
 
 use crate::chain::electrum::{
 	ElectrumRuntimeClient, ELECTRUM_CLIENT_NUM_RETRIES, ELECTRUM_CLIENT_TIMEOUT_SECS,
+	ELECTRUM_MEMPOOL_VIEW_TIMEOUT_SECS,
 };
 use crate::chain::seam::{
 	ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
@@ -79,16 +80,21 @@ const ELECTRUM_CALL_BOUND_SECS: u64 = ELECTRUM_CLIENT_ATTEMPTS
 	* (ELECTRUM_CLIENT_TIMEOUT_SECS as u64)
 	+ electrum_reconnect_sleeps_secs(ELECTRUM_CLIENT_NUM_RETRIES as u64);
 
-/// MEMPOOL budget. A view is three steps — the tip, the script histories,
-/// the unconfirmed transactions — so three times [`ELECTRUM_CALL_BOUND_SECS`]
-/// plus the margin. The history step is one batch per hundred scripts, so a
-/// served question of thousands runs it as several round trips; against the
-/// local electrs a Pro node runs, each is milliseconds, and the budget is the
-/// client's allowance for the answer as a whole, as the bitcoind poll's is.
-/// A view cut short is asked for again on the next tick, with nothing
-/// half-applied: the answer is assembled in full before it is handed back.
+/// MEMPOOL budget: the view's own [`ELECTRUM_MEMPOOL_VIEW_TIMEOUT_SECS`] plus
+/// the margin, so the view's timeout and its log line fire first.
+///
+/// Not the client's worst case. A view is three steps — the tip, the script
+/// histories, the unconfirmed transactions — and three times
+/// [`ELECTRUM_CALL_BOUND_SECS`] is over twelve minutes, sized for a server
+/// that is down and being reconnected to. A Pro node reads from a public
+/// server, not a local index, and serves the view to a hybrid node whose own
+/// provider call gives up after 20 s and asks again on its next tick; a view
+/// that has not come back in a minute is not one anyone is still waiting for,
+/// and holding the slot open for twelve would only stack up the next asks
+/// behind it on the one shared client. The answer is assembled in full before
+/// it is handed back, so a view cut short leaves nothing half-applied.
 const ELECTRUM_MEMPOOL_BUDGET: Duration =
-	Duration::from_secs(3 * ELECTRUM_CALL_BOUND_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
+	Duration::from_secs(ELECTRUM_MEMPOOL_VIEW_TIMEOUT_SECS + ADAPTER_BUDGET_MARGIN.as_secs());
 
 /// TX_STATUS budget: pre-seam `swap_query_tx` had no bound of its own and
 /// makes two socket calls (script history, then headers subscribe), so twice
@@ -153,9 +159,10 @@ impl FeeAction for ElectrumChainAdapter {
 	}
 }
 
-/// The Electrum client answers from a script-hash history and reports the tip
-/// as a bare height, so no observation it produces can be anchored: `tip` is
-/// always `None`.
+/// The Electrum client answers from a script-hash history, and reads the
+/// server's header tip in the same round trip set to count depth against; the
+/// observation is anchored to that tip, so the serving path can hand its hash
+/// on and a hybrid asker can check it against its own chain.
 #[cfg(feature = "swaps")]
 #[async_trait]
 impl TxStatusAction for ElectrumChainAdapter {
@@ -188,14 +195,15 @@ impl TxStatusAction for ElectrumChainAdapter {
 				return Err(ChainActionError::unavailable("chain source not started"));
 			},
 		};
-		match client.swap_query_tx(txid, script_pubkey).await {
+		let observed = client.swap_query_tx(txid, script_pubkey).await;
+		match observed.value {
 			// The client has already logged why. It folds every failure —
 			// socket timeout included — into `Unreachable` without saying
 			// which, so no timeout can be claimed here.
 			RawTxObservation::Unreachable => {
 				Err(ChainActionError::unavailable("Electrum query failed"))
 			},
-			value => Ok(Anchored { value, tip: None }),
+			_ => Ok(observed),
 		}
 	}
 }
@@ -313,8 +321,9 @@ mod tests {
 		assert_eq!(electrum_reconnect_sleeps_secs(0), 0);
 		// 4 attempts × (connect + write + read) × 20 s + the sleeps.
 		assert_eq!(ELECTRUM_CALL_BOUND_SECS, 4 * 3 * 20 + 14);
-		// Three steps plus the 1 s margin.
-		assert_eq!(ELECTRUM_MEMPOOL_BUDGET, Duration::from_secs(3 * 254 + 1));
+		// The view's own minute plus the 1 s margin — not the client's twelve-minute
+		// worst case, which a public server must not be allowed to hold the slot for.
+		assert_eq!(ELECTRUM_MEMPOOL_BUDGET, Duration::from_secs(60 + 1));
 		// Two calls plus the 1 s margin.
 		#[cfg(feature = "swaps")]
 		assert_eq!(ELECTRUM_TX_STATUS_BUDGET, Duration::from_secs(2 * 254 + 1));

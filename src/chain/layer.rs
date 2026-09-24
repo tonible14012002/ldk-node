@@ -145,6 +145,33 @@ pub(crate) struct ChainSlots {
 type Unconfirmed = Vec<(Transaction, u64)>;
 type Evicted = Vec<(Txid, u64)>;
 
+/// What [`ChainLayer::borrow_mempool`] applied, and who answered.
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BorrowedMempool {
+	pub(crate) by: &'static str,
+	pub(crate) unconfirmed: usize,
+	pub(crate) evicted: usize,
+}
+
+/// A borrowed mempool answer, every time in it replaced by `now` on this
+/// node's clock.
+///
+/// The wallet orders a transaction's last sighting against its eviction to
+/// decide whether it is still unconfirmed. Evictions are stamped locally —
+/// the wire carries none — so a sighting stamped on the provider's clock
+/// would be compared across two clocks: a provider running behind would have
+/// a transaction that re-entered its mempool stay evicted here, one running
+/// ahead would pin a stale sighting over a later local eviction. Both are
+/// stamped with the moment this node learned of them instead.
+#[cfg(feature = "cbf")]
+pub(crate) fn stamp_locally(answer: MempoolAnswer, now: u64) -> (Unconfirmed, Evicted) {
+	(
+		answer.unconfirmed.into_iter().map(|(tx, _)| (tx, now)).collect(),
+		answer.evicted.into_iter().map(|(txid, _)| (txid, now)).collect(),
+	)
+}
+
 /// One package's run through the BROADCAST chain: the chain's verdict, and
 /// every transaction some adapter reported as on the network along the way.
 struct BroadcastRun {
@@ -989,7 +1016,11 @@ impl ChainLayer {
 	}
 
 	/// The hybrid reorg-consistency check, run on every [`Anchored`] answer
-	/// inside its chain's run so a refused answer advances the chain.
+	/// as its chain's check ([`ActionChain::run_checked`]) so a refused answer
+	/// advances the chain. It runs after the adapter's budgeted call, not
+	/// inside it: the header lookup it may make is bounded by the engine, and
+	/// counting it against the adapter's budget would drop an answer that
+	/// arrived in time. `Some(false)` still refuses the answer and advances.
 	///
 	/// An answer a provider computed on a chain this node does not consider
 	/// best — the engine knows a different block at the tip's height — is
@@ -1065,16 +1096,49 @@ impl ChainLayer {
 		let mut answered = self
 			.slots
 			.mempool
-			.run(|a| async move {
-				let answer = a.mempool(query).await?;
-				self.anchored_on_our_chain("mempool", a.name(), answer).await
-			})
+			.run_checked(
+				|a| async move { a.mempool(query).await },
+				|by, answer| self.anchored_on_our_chain("mempool", by, answer),
+			)
 			.await?;
 
 		if self.engine.tracks_own_broadcasts() {
 			self.shield_own_broadcasts(&mut answered.value.value.evicted, answered.by);
 		}
 		Ok(answered)
+	}
+
+	/// Borrow a mempool view for this node's own on-chain wallet, and apply it.
+	///
+	/// For an engine with no mempool of its own: the filter-following engine
+	/// asks on its own cadence and on every foreground pass. The answer goes
+	/// through [`ChainLayer::mempool`] — refused if anchored off this node's
+	/// chain, with fresh own broadcasts shielded from eviction — and is then
+	/// stamped on this node's clock ([`stamp_locally`]) before the wallet sees
+	/// it. An empty chain is `Unavailable`; the engine checks
+	/// [`ChainLayer::has_mempool_chain`] before asking.
+	#[cfg(feature = "cbf")]
+	pub(crate) async fn borrow_mempool(
+		&self, query: &MempoolQuery,
+	) -> ActionResult<BorrowedMempool> {
+		let Some(wallet) = self.engine.onchain_wallet() else {
+			return Err(ChainActionError::unavailable(
+				"no on-chain wallet to apply a mempool view to",
+			));
+		};
+		let answered = self.mempool(query).await?;
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		let (unconfirmed, evicted) = stamp_locally(answered.value.value, now);
+		let borrowed = BorrowedMempool {
+			by: answered.by,
+			unconfirmed: unconfirmed.len(),
+			evicted: evicted.len(),
+		};
+		wallet.apply_mempool_txs(unconfirmed, evicted).map_err(|e| {
+			log_error!(self.shared.logger, "Failed to apply a borrowed mempool view: {}", e);
+			ChainActionError::unavailable(format!("applying the mempool view failed: {}", e))
+		})?;
+		Ok(borrowed)
 	}
 
 	/// Drop from `evicted` every transaction this node itself broadcast within
@@ -1113,10 +1177,10 @@ impl ChainLayer {
 	) -> ActionResult<Answered<Anchored<bdk_wallet::Update>>> {
 		self.slots
 			.script_history
-			.run(|a| async move {
-				let answer = a.script_history(req.clone()).await?;
-				self.anchored_on_our_chain("script_history", a.name(), answer).await
-			})
+			.run_checked(
+				|a| async move { a.script_history(req.clone()).await },
+				|by, answer| self.anchored_on_our_chain("script_history", by, answer),
+			)
 			.await
 	}
 
@@ -1145,10 +1209,10 @@ impl ChainLayer {
 		match self
 			.slots
 			.tx_status
-			.run(|a| async move {
-				let answer = a.tx_status(txid, script_pubkey).await?;
-				self.anchored_on_our_chain("tx_status", a.name(), answer).await
-			})
+			.run_checked(
+				|a| async move { a.tx_status(txid, script_pubkey).await },
+				|by, answer| self.anchored_on_our_chain("tx_status", by, answer),
+			)
 			.await
 		{
 			Ok(answered) => answered.value,
@@ -1259,11 +1323,12 @@ impl ChainLayer {
 
 		let observed = self.observe_tx_anchored(txid, script_pubkey).await;
 		// The tip the adapter derived the answer against, when it reported
-		// one. `tip_height` below is still reconstructed from the depth, as
-		// it always was; the hash is the addition, for an asker that can
-		// place it on its own chain.
+		// one: its hash, for an asker that can place it on its own chain, and
+		// its height with it, so the pair names one block. Without a tip the
+		// height is reconstructed from the depth, as it always was.
 		let tip_hash = observed.tip.map(|tip| tip.hash.to_string());
-		let (confirmed, in_mempool, confirmation_height, tip_height) = match observed.value {
+		let anchored_height = observed.tip.map(|tip| tip.height);
+		let (confirmed, in_mempool, confirmation_height, depth_tip) = match observed.value {
 			RawTxObservation::Confirmed { height, confirmations } => {
 				// Reconstruct the tip the adapter derived depth against,
 				// so the caller can recompute rather than trust a count
@@ -1288,7 +1353,7 @@ impl ChainLayer {
 			confirmed,
 			in_mempool,
 			confirmation_height,
-			tip_height,
+			tip_height: anchored_height.or(depth_tip),
 			tip_hash,
 		})
 	}
@@ -2938,6 +3003,62 @@ mod tests {
 		let answered =
 			h.layer.mempool(&complete_query(vec![spend.compute_txid(), stale])).await.unwrap();
 		assert_eq!(answered.value.value.evicted, vec![(spend.compute_txid(), 2), (stale, 2)]);
+	}
+
+	/// The hybrid's borrow: the answer reaches the wallet, stamped on this
+	/// node's clock. A provider whose clock runs behind would otherwise have
+	/// a transaction that re-entered its mempool stay evicted here, since the
+	/// eviction was stamped locally and a sighting must be later to win.
+	#[cfg(feature = "cbf")]
+	#[tokio::test]
+	async fn a_borrowed_mempool_view_reaches_the_wallet_on_this_nodes_clock() {
+		let tip = tip_at(7, 0x07);
+		let known = Txid::from_byte_array([3u8; 32]);
+		let answer =
+			MempoolAnswer { unconfirmed: vec![(unrelated(1), 1)], evicted: vec![(known, 2)] };
+		assert_eq!(
+			stamp_locally(answer, 1_000),
+			(vec![(unrelated(1), 1_000)], vec![(known, 1_000)])
+		);
+
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let incoming = deposit(&wallet, 1);
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+		// Seen, then evicted a minute and a half ago on this node's clock.
+		wallet.apply_mempool_txs(vec![(incoming.clone(), now - 120)], Vec::new()).unwrap();
+		wallet.apply_mempool_txs(Vec::new(), vec![(incoming.compute_txid(), now - 90)]).unwrap();
+		assert!(!unconfirmed_txids(&wallet).contains(&incoming.compute_txid()));
+
+		// The provider sees it again, and stamps it `1` on its own clock.
+		let provider = FakeMempool::new(
+			"provider",
+			MempoolBehaviour::Answer { unconfirmed: vec![incoming.clone()], tip: Some(tip) },
+		);
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&provider)]),
+			tracks_own_broadcasts: true,
+			known_blocks: [(tip, true)].into(),
+			wallet: Some(Arc::clone(&wallet)),
+			..HarnessSpec::default()
+		});
+		let borrowed = h.layer.borrow_mempool(&complete_query(Vec::new())).await.unwrap();
+		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
+		assert!(
+			unconfirmed_txids(&wallet).contains(&incoming.compute_txid()),
+			"back in the mempool: the sighting is later than the eviction on one clock"
+		);
+
+		// No chain to borrow from: unavailable, and the wallet is left alone.
+		let h = build(HarnessSpec {
+			tracks_own_broadcasts: true,
+			wallet: Some(Arc::clone(&wallet)),
+			..HarnessSpec::default()
+		});
+		assert!(h.layer.borrow_mempool(&complete_query(Vec::new())).await.is_err());
 	}
 
 	/// The own-broadcast memory forgets by age and caps by count, oldest

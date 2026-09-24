@@ -207,9 +207,21 @@ impl CbfDerivedFee {
 				continue;
 			}
 
-			match bounded(CBF_BLOCK_FETCH_TIMEOUT_SECS, requester.average_fee_rate(canonical_hash))
-				.await
-			{
+			// The sample downloads a full block, so it counts against the same
+			// `CBF_FULL_BLOCK_PERMITS` bound the applicator's matched blocks do: a fee window
+			// refilled after a restart is fourteen blocks, and on a small device those must
+			// not be held in memory next to the applicator's. The wait for a permit is inside
+			// the per-block bound, so the budget above still covers it.
+			let permits = self.engine.full_block_permits();
+			let sample = bounded(CBF_BLOCK_FETCH_TIMEOUT_SECS, async {
+				let _permit = permits
+					.acquire()
+					.await
+					.map_err(|_closed| "the full-block permits were closed".to_string())?;
+				requester.average_fee_rate(canonical_hash).await.map_err(|e| e.to_string())
+			})
+			.await;
+			match sample {
 				Ok(Ok(fee_rate)) => {
 					window.insert(height, (canonical_hash, fee_rate));
 				},
@@ -332,11 +344,13 @@ enum Handoff {
 	Relayed,
 	/// Kyoto refused the submission: the node has stopped.
 	Refused(String),
-	/// No peer asked for the transaction inside the budget. Usually benign — a peer that
-	/// already has a transaction never asks for it — and the announcement stands.
+	/// Kyoto took the transaction and announced it, but no peer asked for it inside the
+	/// budget. Usually benign — a peer that already has a transaction never asks for it — and
+	/// the announcement stands.
 	Unanswered,
 }
 
+#[cfg(test)]
 impl Handoff {
 	fn relayed(&self) -> bool {
 		matches!(self, Self::Relayed)
@@ -386,12 +400,15 @@ where
 /// one — a single transaction, or a parent and the child that spends it — and one
 /// transaction at a time otherwise, each handoff bounded by `hold_timeout`.
 ///
-/// One outcome per transaction, in package order. A pulled transaction is `Accepted`. Once
-/// any handoff of the package completed, the transactions no peer asked for were announced
-/// to the same peers alongside one they did pull, and a peer that already has a transaction
-/// never asks for it: they are `AlreadyKnown`, and the package is on the network. When no
-/// handoff completed nothing is known about the package's fate, and every transaction is
-/// `Unavailable` — timed out for one nobody asked for, not for one kyoto refused.
+/// One outcome per transaction, in package order. A pulled transaction is `Accepted`. One
+/// kyoto took but no peer pulled inside the bound is `AlreadyKnown`: it was announced, it
+/// stays in kyoto's queue to be served to any peer that asks and re-announced to every peer
+/// that connects, and a peer that already has a transaction never asks for it. It has been
+/// handed to the network, and the wallet must hear so — reporting it `Unavailable` would
+/// exhaust the chain, leave the wallet unaware of the spend, and have it offer the same
+/// inputs to the next send, which the network then refuses as a conflict. The handoff has
+/// already logged that nobody pulled it. Only a submission kyoto refused — its node has
+/// stopped — is `Unavailable`: that transaction was handed to nobody.
 ///
 /// Never `Rejected`. Kyoto learns of a peer's verdict, if at all, from a `reject` message it
 /// reports on its warning channel, asynchronously, keyed by wtxid, and only from peers that
@@ -437,21 +454,13 @@ where
 		},
 	};
 
-	let any_relayed = handoffs.iter().any(Handoff::relayed);
 	txids
 		.into_iter()
 		.zip(handoffs)
 		.map(|(txid, handoff)| {
 			let outcome = match handoff {
 				Handoff::Relayed => TxBroadcastOutcome::Accepted,
-				Handoff::Unanswered if any_relayed => TxBroadcastOutcome::AlreadyKnown,
-				Handoff::Unanswered => TxBroadcastOutcome::Unavailable {
-					reason: format!(
-						"no peer requested the transaction within {}s",
-						hold_timeout.as_secs()
-					),
-					timed_out: true,
-				},
+				Handoff::Unanswered => TxBroadcastOutcome::AlreadyKnown,
 				Handoff::Refused(reason) => {
 					TxBroadcastOutcome::Unavailable { reason, timed_out: false }
 				},
@@ -1000,7 +1009,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn relay_package_outcomes_follow_whether_any_handoff_completed() {
+	async fn relay_package_outcomes_count_every_announced_transaction_as_on_the_network() {
 		let logger = test_logger();
 		let package = [unrelated(1), unrelated(2), unrelated(3)];
 
@@ -1016,12 +1025,28 @@ mod tests {
 			]
 		);
 
-		// None pulled: nothing is known about the package; every send timed out.
+		// None pulled: kyoto took and announced every one, so every one was handed to the
+		// network. Reporting them unavailable would leave the wallet offering their inputs again.
 		let (_, submit) = scripted_submit(vec![Peer::Ignores, Peer::Ignores, Peer::Ignores]);
 		let outcomes = relay_package(&logger, short_handoff_timeout(), &package, submit).await;
-		assert!(outcomes
-			.iter()
-			.all(|(_, o)| matches!(o, TxBroadcastOutcome::Unavailable { timed_out: true, .. })));
+		assert!(outcomes.iter().all(|(_, o)| *o == TxBroadcastOutcome::AlreadyKnown));
+		assert_eq!(
+			crate::chain::seam::package_result(outcomes),
+			Ok(()),
+			"an announced package is on the network: the chain stops, and the tail records it"
+		);
+
+		// A single transaction nobody pulled: the same.
+		let (_, submit) = scripted_submit(vec![Peer::Ignores]);
+		let outcomes =
+			relay_package(&logger, short_handoff_timeout(), &[unrelated(4)], submit).await;
+		assert_eq!(outcomes_of(&outcomes), vec![&TxBroadcastOutcome::AlreadyKnown]);
+
+		// Kyoto refused the only transaction: handed to nobody, so unavailable.
+		let (_, submit) = scripted_submit(vec![Peer::NodeStopped]);
+		let outcomes =
+			relay_package(&logger, short_handoff_timeout(), &[unrelated(5)], submit).await;
+		assert!(matches!(outcomes[0].1, TxBroadcastOutcome::Unavailable { timed_out: false, .. }));
 
 		// The node stopped mid-package: the refused sends are unavailable and not a timeout,
 		// even though an earlier one was pulled.
@@ -1114,7 +1139,7 @@ mod tests {
 		assert!(unavailable(adapter.tx_status(unwatched, None).await));
 
 		// Watched but not seen yet: a filter node cannot tell the cases apart, so no answer.
-		ledger.watch(watched);
+		ledger.watch_swap(watched);
 		assert!(unavailable(adapter.tx_status(watched, None).await));
 
 		// Seen at 100, tip at 102: three confirmations, anchored to the applied tip.
@@ -1149,7 +1174,7 @@ mod tests {
 		);
 
 		// Let go: never asked again.
-		ledger.unwatch(&watched);
+		ledger.unwatch_swap(&watched);
 		assert!(unavailable(adapter.tx_status(watched, None).await));
 	}
 

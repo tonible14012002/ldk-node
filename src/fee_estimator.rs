@@ -56,6 +56,13 @@ impl OnchainFeeEstimator {
 			false
 		}
 	}
+
+	/// Whether any refresh has filled the cache since this process started. The cache lives
+	/// in memory only, so `false` means every estimate is still a hardcoded fallback.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
+	pub(crate) fn has_estimates(&self) -> bool {
+		!self.fee_rate_cache.read().unwrap().is_empty()
+	}
 }
 
 impl FeeEstimator for OnchainFeeEstimator {

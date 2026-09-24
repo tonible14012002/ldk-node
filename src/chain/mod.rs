@@ -16,6 +16,8 @@ pub mod provider;
 pub(crate) mod seam;
 pub(crate) mod wire_convert;
 
+#[cfg(feature = "cbf")]
+pub(crate) use layer::BorrowedMempool;
 pub(crate) use layer::ChainLayer;
 
 use crate::chain::electrum::ElectrumRuntimeClient;

@@ -717,6 +717,28 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 		F: Fn(Arc<A>) -> Fut,
 		Fut: Future<Output = ActionResult<T, R>>,
 	{
+		self.run_checked(action, |_, value| std::future::ready(Ok(value))).await
+	}
+
+	/// [`ActionChain::run`], with every answer passed through `check` before
+	/// the chain accepts it.
+	///
+	/// `check` runs *after* the adapter's budgeted call, outside that budget:
+	/// the budget bounds the adapter, and a check that has to ask something
+	/// else — the hybrid tip check looks a header up, under its own bound —
+	/// must not eat into it, or a slow-but-valid answer would be dropped for
+	/// time the adapter never spent. The check must bound itself. What it
+	/// returns is judged exactly like the adapter's own answer: `Ok` stops the
+	/// chain, `Unavailable` advances it, `Rejected` ends it.
+	pub(crate) async fn run_checked<T, R, F, Fut, C, CFut>(
+		&self, action: F, check: C,
+	) -> ActionResult<Answered<T>, R>
+	where
+		F: Fn(Arc<A>) -> Fut,
+		Fut: Future<Output = ActionResult<T, R>>,
+		C: Fn(&'static str, T) -> CFut,
+		CFut: Future<Output = ActionResult<T, R>>,
+	{
 		let mut reasons: Vec<String> = Vec::with_capacity(self.adapters.len());
 		let mut any_timed_out = false;
 
@@ -726,7 +748,8 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 			let budget = SlotAdapter::budget(&**adapter).unwrap_or(self.budget);
 
 			let outcome = match tokio::time::timeout(budget, action(Arc::clone(adapter))).await {
-				Ok(outcome) => outcome,
+				Ok(Ok(value)) => check(name, value).await,
+				Ok(Err(e)) => Err(e),
 				Err(_elapsed) => Err(ChainActionError::budget_exceeded(budget)),
 			};
 
@@ -960,6 +983,55 @@ mod tests {
 		assert_eq!(first.calls(), 1);
 		assert_eq!(second.calls(), 1);
 		assert_eq!(chain.last_answered(), Some("second"));
+	}
+
+	/// The check runs after the budgeted call and outside its budget: an
+	/// answer that arrived in time is not dropped because the check took the
+	/// rest of the budget and more. A check that says `Unavailable` advances
+	/// the chain like the adapter's own `Unavailable` would.
+	#[tokio::test]
+	async fn check_runs_outside_the_adapter_budget_and_can_advance_the_chain() {
+		let budget = Duration::from_millis(150);
+		let slow_but_valid = FakeFee::with_budget(
+			"slow",
+			Behaviour::SlowOk(Duration::from_millis(100), 250),
+			budget,
+		);
+		let second = FakeFee::new("second", Behaviour::Ok(300));
+		let chain =
+			chain(Duration::from_secs(5), &[Arc::clone(&slow_but_valid), Arc::clone(&second)]);
+
+		// 100 ms of adapter plus 100 ms of check is past the 150 ms budget; accepted anyway.
+		let answered = chain
+			.run_checked(
+				|a| async move { a.fee_rate_update().await },
+				|_, update| async move {
+					tokio::time::sleep(Duration::from_millis(100)).await;
+					Ok(update)
+				},
+			)
+			.await
+			.unwrap();
+		assert_eq!(answered.by, "slow");
+		assert_eq!(applied_rate(answered.value), 250);
+		assert_eq!(second.calls(), 0);
+
+		// A check that refuses the first answer hands the turn to the next adapter.
+		let answered = chain
+			.run_checked(
+				|a| async move { a.fee_rate_update().await },
+				|by, update| async move {
+					if by == "slow" {
+						Err(ChainActionError::unavailable("not on our chain"))
+					} else {
+						Ok(update)
+					}
+				},
+			)
+			.await
+			.unwrap();
+		assert_eq!(answered.by, "second");
+		assert_eq!(applied_rate(answered.value), 300);
 	}
 
 	#[tokio::test]

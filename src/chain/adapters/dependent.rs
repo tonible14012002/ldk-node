@@ -49,7 +49,7 @@ use crate::chain::provider::WireTxStatusRequest;
 #[cfg(feature = "swaps")]
 use crate::chain::seam::TxStatusAction;
 #[cfg(feature = "swaps")]
-use crate::chain::wire_convert::{script_to_wire, txid_to_wire};
+use crate::chain::wire_convert::{block_hash_from_wire, script_to_wire, txid_to_wire};
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
 #[cfg(feature = "swaps")]
@@ -236,8 +236,11 @@ impl DependentChainAdapter {
 	}
 }
 
-/// The wire answer carries the tip as a bare height, so no observation can be
-/// anchored: `tip` is always `None`.
+/// Anchored at `(tip_height, tip_hash)` when the answer carries both — a
+/// serving node that read the tip it answered at says which block it was —
+/// so a hybrid node checks the answer against its own chain. An answer with
+/// either missing is unanchored, as every answer was before the hash was on
+/// the wire; one whose hash does not parse is unusable and fails closed.
 #[cfg(feature = "swaps")]
 #[async_trait]
 impl TxStatusAction for DependentChainAdapter {
@@ -252,8 +255,6 @@ impl TxStatusAction for DependentChainAdapter {
 	async fn tx_status(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> ActionResult<Anchored<RawTxObservation>> {
-		let unanchored = |value| Ok(Anchored { value, tip: None });
-
 		let req = WireTxStatusRequest {
 			version: CHAIN_WIRE_VERSION,
 			txid: txid_to_wire(&txid),
@@ -289,8 +290,22 @@ impl TxStatusAction for DependentChainAdapter {
 			)));
 		}
 
+		let tip = match wire_tip(&resp) {
+			Ok(tip) => tip,
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: chain provider answered for {} with an unusable tip hash; failing closed: {}",
+					txid,
+					e
+				);
+				return Err(ChainActionError::unavailable(format!("unusable tip hash: {}", e)));
+			},
+		};
+		let anchored = |value| Ok(Anchored { value, tip });
+
 		if !resp.confirmed {
-			return unanchored(if resp.in_mempool {
+			return anchored(if resp.in_mempool {
 				RawTxObservation::InMempool
 			} else {
 				RawTxObservation::NotFound
@@ -327,7 +342,21 @@ impl TxStatusAction for DependentChainAdapter {
 		}
 
 		let confirmations = tip_height.saturating_sub(height).saturating_add(1);
-		unanchored(RawTxObservation::Confirmed { height: Some(height), confirmations })
+		anchored(RawTxObservation::Confirmed { height: Some(height), confirmations })
+	}
+}
+
+/// The block a TX_STATUS answer was taken at, when the answer names both its
+/// height and its hash; `None` when either is missing.
+#[cfg(feature = "swaps")]
+fn wire_tip(
+	resp: &crate::chain::provider::WireTxStatusResponse,
+) -> Result<Option<bdk_chain::BlockId>, crate::chain::provider::ChainProviderError> {
+	match (resp.tip_height, resp.tip_hash.as_deref()) {
+		(Some(height), Some(hash)) => {
+			Ok(Some(bdk_chain::BlockId { height, hash: block_hash_from_wire(hash)? }))
+		},
+		_ => Ok(None),
 	}
 }
 
@@ -477,6 +506,102 @@ mod tests {
 				timed_out: false,
 			}
 		);
+	}
+
+	/// A provider whose TX_STATUS answer is fixed.
+	#[cfg(feature = "swaps")]
+	struct AnsweringProvider(WireTxStatusResponse);
+
+	#[cfg(feature = "swaps")]
+	#[async_trait]
+	impl ChainDataProvider for AnsweringProvider {
+		fn name(&self) -> String {
+			"answering".into()
+		}
+
+		async fn fee_estimates(&self) -> Result<WireFeeEstimates, ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+
+		async fn broadcast(&self, _req: WireBroadcastRequest) -> Result<(), ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+
+		async fn tx_status(
+			&self, _req: WireTxStatusRequest,
+		) -> Result<WireTxStatusResponse, ChainProviderError> {
+			Ok(self.0.clone())
+		}
+
+		async fn wallet_sync(
+			&self, _req: WireSyncRequest,
+		) -> Result<WireUpdate, ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+
+		async fn lightning_sync(
+			&self, _req: WireLightningSyncRequest,
+		) -> Result<WireLightningSyncResponse, ChainProviderError> {
+			Err(ChainProviderError::Unreachable("not under test".into()))
+		}
+	}
+
+	/// The answer is anchored at the serving node's tip when the wire names
+	/// both its height and its hash — so a hybrid node's tip check has
+	/// something to check — unanchored when either is missing, and refused
+	/// when the hash is garbage.
+	#[cfg(feature = "swaps")]
+	#[tokio::test]
+	async fn dependent_tx_status_is_anchored_when_the_wire_names_the_tip() {
+		use bitcoin::hashes::Hash;
+
+		let tip_hash = bitcoin::BlockHash::from_byte_array([0x42; 32]);
+		let confirmed = WireTxStatusResponse {
+			version: CHAIN_WIRE_VERSION,
+			confirmed: true,
+			in_mempool: false,
+			confirmation_height: Some(100),
+			tip_height: Some(102),
+			tip_hash: Some(tip_hash.to_string()),
+		};
+		let ask = |resp: WireTxStatusResponse| async move {
+			let adapter = DependentChainAdapter::new(
+				Arc::new(AnsweringProvider(resp)),
+				Arc::new(Logger::new_log_facade()),
+			);
+			adapter.tx_status(Txid::from_byte_array([1u8; 32]), None).await
+		};
+
+		let answer = ask(confirmed.clone()).await.unwrap();
+		assert_eq!(
+			answer.value,
+			RawTxObservation::Confirmed { height: Some(100), confirmations: 3 }
+		);
+		assert_eq!(answer.tip, Some(bdk_chain::BlockId { height: 102, hash: tip_hash }));
+
+		let in_mempool = WireTxStatusResponse {
+			confirmed: false,
+			in_mempool: true,
+			confirmation_height: None,
+			..confirmed.clone()
+		};
+		let answer = ask(in_mempool).await.unwrap();
+		assert_eq!(answer.value, RawTxObservation::InMempool);
+		assert_eq!(answer.tip, Some(bdk_chain::BlockId { height: 102, hash: tip_hash }));
+
+		let no_hash = WireTxStatusResponse { tip_hash: None, ..confirmed.clone() };
+		let answer = ask(no_hash).await.unwrap();
+		assert_eq!(answer.tip, None, "an answer from an older provider is unanchored");
+		assert_eq!(
+			answer.value,
+			RawTxObservation::Confirmed { height: Some(100), confirmations: 3 }
+		);
+
+		let garbage = WireTxStatusResponse { tip_hash: Some("not a hash".into()), ..confirmed };
+		assert!(matches!(
+			ask(garbage).await,
+			Err(ChainActionError::Unavailable { timed_out: false, .. })
+		));
 	}
 
 	/// The budgets are the app's per-call ceiling plus the margin, so the

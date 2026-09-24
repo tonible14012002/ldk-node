@@ -228,10 +228,12 @@ pub struct WireTxStatusResponse {
 	pub tip_height: Option<u32>,
 	/// Hash of that tip, hex, when the serving node's lookup reported the tip
 	/// it derived the answer against — so a consumer that follows the chain
-	/// itself can check the answer was taken on its chain. Today only a
-	/// `confirmed` answer from a bitcoind-served node carries it, since that
-	/// lookup reads the tip it derives the height against; an `in_mempool`
-	/// or unknown answer consults no tip, an Electrum- or Esplora-served node
+	/// itself can check the answer was taken on its chain. A `confirmed`
+	/// answer from a bitcoind-served node carries it, since that lookup reads
+	/// the tip it derives the height against, and so does every answer from
+	/// an Electrum-served node, which reads the server's header tip with the
+	/// history; `tip_height` is then that same tip's height. A bitcoind
+	/// `in_mempool` or unknown answer consults no tip, an Esplora-served node
 	/// reports none, and answers written before the field existed have none.
 	/// A consumer must treat `None` as unanchored — an answer it cannot place
 	/// on its own chain, to be used as a bare status and never checked

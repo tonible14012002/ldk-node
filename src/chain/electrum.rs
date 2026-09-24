@@ -118,6 +118,50 @@ pub(crate) fn evicted_txids(
 		.copied()
 		.collect()
 }
+/// The most unconfirmed transactions one mempool view fetches. The asker's own relevant
+/// transactions are a handful; a view that finds more than this is a question the server
+/// should not answer by pulling every raw transaction into memory — on a 463 MB Pi, a few
+/// thousand large transactions is real pressure — so the view fails instead, and the asker's
+/// chain moves on.
+pub(crate) const MAX_MEMPOOL_ANSWER_TXS: usize = 1_000;
+
+/// How long reading one mempool view may take, end to end. The Pro node reads it from a
+/// public Electrum server, not a local index, so the calls are real round trips; but a view is
+/// asked for on a cadence and re-asked on the next tick, and the asker's own provider call
+/// gives up after 20 s. A minute covers a slow server with thousands of scripts to page
+/// through; past it the answer is abandoned rather than letting one stuck view hold the
+/// shared client's attention for the ten-plus minutes its retry path allows.
+pub(crate) const ELECTRUM_MEMPOOL_VIEW_TIMEOUT_SECS: u64 = 60;
+
+/// What a mempool view does once the script histories are in: which unconfirmed transactions
+/// to fetch, and which of the asker's known-unconfirmed ones are evicted.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MempoolViewPlan {
+	pub(crate) fetch: Vec<Txid>,
+	pub(crate) evicted: Vec<Txid>,
+}
+
+/// Plan a mempool view from the histories of the `scripts_asked` scripts.
+///
+/// No script asked means no history was read: nothing is known about any transaction, so
+/// nothing is evicted — declaring every known transaction evicted because an empty question
+/// found none would release the inputs of transactions that are sitting in the mempool. More
+/// than [`MAX_MEMPOOL_ANSWER_TXS`] unconfirmed transactions is `Err` with the count.
+pub(crate) fn plan_mempool_view<'a>(
+	scripts_asked: usize, entries: impl IntoIterator<Item = &'a GetHistoryRes>,
+	known_unconfirmed: &[Txid],
+) -> Result<MempoolViewPlan, usize> {
+	if scripts_asked == 0 {
+		return Ok(MempoolViewPlan { fetch: Vec::new(), evicted: Vec::new() });
+	}
+	let MempoolHistory { unconfirmed, confirmed } = split_histories(entries);
+	if unconfirmed.len() > MAX_MEMPOOL_ANSWER_TXS {
+		return Err(unconfirmed.len());
+	}
+	let evicted = evicted_txids(known_unconfirmed, &unconfirmed, &confirmed);
+	Ok(MempoolViewPlan { fetch: unconfirmed, evicted })
+}
+
 pub(crate) const ELECTRUM_CLIENT_NUM_RETRIES: u8 = 3;
 pub(crate) const ELECTRUM_CLIENT_TIMEOUT_SECS: u8 = 20;
 
@@ -375,25 +419,33 @@ impl ElectrumRuntimeClient {
 	/// txid), so the watched output script is required. Any client/transport/
 	/// task failure yields [`RawTxObservation::Unreachable`] so the caller fails
 	/// closed (never a falsely-confirmed result, E6).
+	///
+	/// Every observation is anchored to the server's header tip, read right
+	/// after the history — the tip the depth is counted against — so an asker
+	/// that follows the chain itself can check the answer was taken on its
+	/// chain. An unreachable observation has no tip.
 	#[cfg(feature = "swaps")]
 	pub(crate) async fn swap_query_tx(
 		&self, txid: Txid, script_pubkey: bitcoin::ScriptBuf,
-	) -> crate::chain::RawTxObservation {
+	) -> crate::chain::seam::Anchored<crate::chain::RawTxObservation> {
+		use crate::chain::seam::Anchored;
 		use crate::chain::RawTxObservation;
+
+		let unreachable = Anchored { value: RawTxObservation::Unreachable, tip: None };
 
 		let electrum_client = Arc::clone(&self.electrum_client);
 
 		let spawn_fut = self.runtime.spawn_blocking(move || {
 			let history = electrum_client.script_get_history(script_pubkey.as_script())?;
 			let tip = electrum_client.block_headers_subscribe()?;
-			Ok::<_, electrum_client::Error>((history, tip.height))
+			Ok::<_, electrum_client::Error>((history, tip))
 		});
 
-		let (history, tip_height) = match spawn_fut.await {
+		let (history, tip) = match spawn_fut.await {
 			Ok(Ok(result)) => result,
 			Ok(Err(e)) => {
 				log_error!(self.logger, "swap_query_tx: Electrum query failed for {}: {}", txid, e);
-				return RawTxObservation::Unreachable;
+				return unreachable;
 			},
 			Err(e) => {
 				log_error!(
@@ -402,11 +454,13 @@ impl ElectrumRuntimeClient {
 					txid,
 					e
 				);
-				return RawTxObservation::Unreachable;
+				return unreachable;
 			},
 		};
+		let tip_height = tip.height as u32;
+		let anchor = BlockId { height: tip_height, hash: tip.header.block_hash() };
 
-		match history.into_iter().find(|entry| entry.tx_hash == txid) {
+		let value = match history.into_iter().find(|entry| entry.tx_hash == txid) {
 			Some(entry) => {
 				// Electrum reports height 0 (unconfirmed) or -1 (unconfirmed with
 				// unconfirmed parents); both mean "in the mempool".
@@ -414,13 +468,13 @@ impl ElectrumRuntimeClient {
 					RawTxObservation::InMempool
 				} else {
 					let height = entry.height as u32;
-					let confirmations =
-						(tip_height as u32).saturating_sub(height).saturating_add(1);
+					let confirmations = tip_height.saturating_sub(height).saturating_add(1);
 					RawTxObservation::Confirmed { height: Some(height), confirmations }
 				}
 			},
 			None => RawTxObservation::NotFound,
-		}
+		};
+		Anchored { value, tip: Some(anchor) }
 	}
 
 	pub(crate) async fn get_fee_rate_cache_update(
@@ -521,10 +575,20 @@ impl ElectrumRuntimeClient {
 		let spawn_fut = self.runtime.spawn_blocking(move || {
 			mempool_view_blocking(&electrum_client, &logger, scripts, known_unconfirmed)
 		});
-		spawn_fut.await.map_err(|e| {
-			log_error!(self.logger, "Reading a mempool view could not run: {}", e);
-			Error::WalletOperationFailed
-		})?
+		tokio::time::timeout(Duration::from_secs(ELECTRUM_MEMPOOL_VIEW_TIMEOUT_SECS), spawn_fut)
+			.await
+			.map_err(|_elapsed| {
+				log_error!(
+					self.logger,
+					"Reading a mempool view timed out after {}s",
+					ELECTRUM_MEMPOOL_VIEW_TIMEOUT_SECS
+				);
+				Error::WalletOperationTimeout
+			})?
+			.map_err(|e| {
+				log_error!(self.logger, "Reading a mempool view could not run: {}", e);
+				Error::WalletOperationFailed
+			})?
 	}
 
 	// ── serving a Dependent node ─────────────────────────────────────────────
@@ -794,7 +858,8 @@ fn confirmed_tx_entry(
 /// The tip first, so everything else is reported relative to a tip that is not ahead of it.
 /// Then the histories, chunked so a served question of thousands of scripts is several
 /// round trips rather than one a server may refuse. Then the unconfirmed transactions
-/// themselves, in one batch: the mempool relevant to one asker is a handful. A transaction
+/// themselves, in one batch: the mempool relevant to one asker is a handful, and a view of more
+/// than [`MAX_MEMPOOL_ANSWER_TXS`] fails rather than fetching them all. A transaction
 /// that left the mempool between the two reads fails the fetch and the whole view with it —
 /// the next tick asks again — rather than answering with a hole in it.
 fn mempool_view_blocking(
@@ -819,14 +884,25 @@ fn mempool_view_blocking(
 				.map_err(|e| chain_failed("reading script histories", e))?,
 		);
 	}
-	let MempoolHistory { unconfirmed, confirmed } = split_histories(histories.iter().flatten());
-	let evicted = evicted_txids(&known_unconfirmed, &unconfirmed, &confirmed);
+	let MempoolViewPlan { fetch, evicted } =
+		plan_mempool_view(scripts.len(), histories.iter().flatten(), &known_unconfirmed).map_err(
+			|count| {
+				log_error!(
+					logger,
+					"Refusing a mempool view of {} unconfirmed transactions; the most one view \
+					 fetches is {}",
+					count,
+					MAX_MEMPOOL_ANSWER_TXS
+				);
+				Error::WalletOperationFailed
+			},
+		)?;
 
-	let unconfirmed = if unconfirmed.is_empty() {
+	let unconfirmed = if fetch.is_empty() {
 		Vec::new()
 	} else {
 		electrum_client
-			.batch_transaction_get(unconfirmed.iter())
+			.batch_transaction_get(fetch.iter())
 			.map_err(|e| chain_failed("fetching unconfirmed transactions", e))?
 	};
 
@@ -872,6 +948,44 @@ mod tests {
 
 		let empty: Vec<Vec<GetHistoryRes>> = Vec::new();
 		assert_eq!(split_histories(empty.iter().flatten()), MempoolHistory::default());
+	}
+
+	/// An empty question reads no history and so knows nothing: it evicts nothing, whatever
+	/// the asker holds. A view of more unconfirmed transactions than the cap is refused before
+	/// a single one is fetched; one at the cap is planned whole.
+	#[test]
+	fn plan_mempool_view_evicts_nothing_unasked_and_caps_the_fetch() {
+		let known = [txid(1), txid(2)];
+		let none: Vec<GetHistoryRes> = Vec::new();
+		assert_eq!(
+			plan_mempool_view(0, none.iter(), &known),
+			Ok(MempoolViewPlan { fetch: Vec::new(), evicted: Vec::new() }),
+			"no scripts, no verdict on any known transaction"
+		);
+
+		let history = vec![entry(0, 2), entry(800_000, 3)];
+		assert_eq!(
+			plan_mempool_view(1, history.iter(), &known),
+			Ok(MempoolViewPlan { fetch: vec![txid(2)], evicted: vec![txid(1)] })
+		);
+
+		let at_cap: Vec<GetHistoryRes> = (0..MAX_MEMPOOL_ANSWER_TXS as u32)
+			.map(|n| {
+				let mut bytes = [0u8; 32];
+				bytes[..4].copy_from_slice(&n.to_le_bytes());
+				GetHistoryRes { height: 0, tx_hash: Txid::from_byte_array(bytes), fee: None }
+			})
+			.collect();
+		let plan = plan_mempool_view(1, at_cap.iter(), &[]).expect("at the cap is answered");
+		assert_eq!(plan.fetch.len(), MAX_MEMPOOL_ANSWER_TXS);
+
+		let mut over_cap = at_cap;
+		over_cap.push(entry(0, 0xee));
+		assert_eq!(
+			plan_mempool_view(1, over_cap.iter(), &[]),
+			Err(MAX_MEMPOOL_ANSWER_TXS + 1),
+			"refused before anything is fetched"
+		);
 	}
 
 	/// Evicted is what the asker knows and the server no longer shows at all: not in the
