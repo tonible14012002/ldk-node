@@ -413,8 +413,10 @@ where
 /// Never `Rejected`. Kyoto learns of a peer's verdict, if at all, from a `reject` message it
 /// reports on its warning channel, asynchronously, keyed by wtxid, and only from peers that
 /// still send one — Bitcoin Core stopped in 0.20. That cannot be tied to a handoff with any
-/// reliability, so no P2P answer is ever a verdict on the transaction; a verdict, when one
-/// exists, comes from a provider earlier in the chain.
+/// reliability, so no P2P answer is ever a verdict on the transaction, and on a hybrid node the
+/// provider after this adapter is not asked for one: an announced package ends the chain here. A
+/// transaction the network refuses is found out late, by the borrowed mempool view no longer
+/// holding it once the own-broadcast grace window has passed.
 ///
 /// A free function, generic over `submit`, so it is unit-testable without a live kyoto node.
 async fn relay_package<F, Fut, T, E>(

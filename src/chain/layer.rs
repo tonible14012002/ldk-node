@@ -538,11 +538,26 @@ impl ChainLayer {
 	///
 	/// The chains, in order:
 	///
-	/// * FEE = [external fee, if configured; provider, if any; coinbase-derived].
-	///   A mempool-aware source first; the after-the-fact fee market of recent
-	///   blocks is what remains when nobody answers.
-	/// * BROADCAST = [provider, if any; P2P]. A provider's bitcoind gives a
-	///   verdict; the node's own peers give none, so they come second.
+	/// A hybrid node runs on its own abilities first: in every slot where the
+	/// filter node has an adapter, that adapter leads and the provider is the
+	/// fallback, asked only when the node's own adapter cannot answer.
+	///
+	/// * FEE = [external fee, if configured; coinbase-derived; provider, if
+	///   any]. An external fee server is an explicit operator choice and stays
+	///   first. The coinbase-derived rates are `Unavailable` while kyoto is not
+	///   running — the boot refresh runs before it is launched — and while the
+	///   window holds no sample, so the provider answers until the filter node
+	///   has a fee market of its own; the background loop retries a failed
+	///   refresh on its short recovery cadence. Once samples exist the
+	///   after-the-fact rates of recent blocks answer, however thin the window.
+	/// * BROADCAST = [P2P; provider, if any]. The node's own peers take the
+	///   package. An announced package ends the chain, pulled or not
+	///   (`AlreadyKnown` for one no peer asked for); the provider is asked only
+	///   when kyoto refused the handoff or is not running. The trade-off: P2P
+	///   relay gives no accept/reject verdict, so a transaction the network
+	///   refuses is not evicted at once — it is found out late, when the
+	///   borrowed mempool view no longer holds it after the own-broadcast grace
+	///   window, and only then are its inputs released.
 	/// * TX_STATUS = [forward-only watch; provider, if any]. What this node saw
 	///   confirm itself outranks what it is told, and costs nothing to ask.
 	/// * MEMPOOL = [provider, if any], SCRIPT_HISTORY = [provider, if any]:
@@ -603,14 +618,14 @@ impl ChainLayer {
 
 		let provider = fallback
 			.map(|provider| Arc::new(DependentChainAdapter::new(provider, Arc::clone(&logger))));
+		fee.push(Arc::new(CbfDerivedFee::new(Arc::clone(&engine), Arc::clone(&logger))));
 		if let Some(provider) = &provider {
 			fee.push(Arc::clone(provider) as Arc<dyn FeeAction>);
 		}
-		fee.push(Arc::new(CbfDerivedFee::new(Arc::clone(&engine), Arc::clone(&logger))));
 
 		let mut broadcast: Vec<Arc<dyn BroadcastAction>> =
-			provider.iter().map(|p| Arc::clone(p) as Arc<dyn BroadcastAction>).collect();
-		broadcast.push(Arc::new(CbfP2pBroadcast::new(Arc::clone(&engine), Arc::clone(&logger))));
+			vec![Arc::new(CbfP2pBroadcast::new(Arc::clone(&engine), Arc::clone(&logger)))];
+		broadcast.extend(provider.iter().map(|p| Arc::clone(p) as Arc<dyn BroadcastAction>));
 
 		#[cfg(feature = "swaps")]
 		let tx_status: Vec<Arc<dyn TxStatusAction>> = {
@@ -2402,13 +2417,13 @@ mod tests {
 		)
 	}
 
-	/// The hybrid CBF preset: a mempool-aware fee source and the provider
-	/// before the coinbase-derived fallback, the provider's verdict before a
-	/// P2P relay that gives none, what this node saw confirm before what it
-	/// is told, and the slots a filter node cannot fill left to the provider.
+	/// The hybrid CBF preset: the operator's external fee server first, then
+	/// in every slot the filter node can fill its own adapter ahead of the
+	/// provider — coinbase-derived rates, the P2P relay, what this node saw
+	/// confirm — and the slots a filter node cannot fill left to the provider.
 	#[cfg(feature = "cbf")]
 	#[test]
-	fn new_cbf_orders_the_borrowed_adapters_around_the_cbf_ones() {
+	fn new_cbf_puts_its_own_adapters_ahead_of_the_provider() {
 		let cbf_config = CbfConfig {
 			external_fee: Some(CbfExternalFee::Electrum("tcp://127.0.0.1:1".into())),
 			..CbfConfig::default()
@@ -2422,8 +2437,8 @@ mod tests {
 
 		let slots = layer.slot_adapters();
 		assert_eq!(slots.engine, "cbf");
-		assert_eq!(slots.fee, vec!["electrum", "dependent", "cbf_derived"]);
-		assert_eq!(slots.broadcast, vec!["dependent", "cbf_p2p"]);
+		assert_eq!(slots.fee, vec!["electrum", "cbf_derived", "dependent"]);
+		assert_eq!(slots.broadcast, vec!["cbf_p2p", "dependent"]);
 		#[cfg(feature = "swaps")]
 		assert_eq!(slots.tx_status, vec!["cbf_watch", "dependent"]);
 		assert_eq!(slots.mempool, vec!["dependent"]);
@@ -2685,8 +2700,8 @@ mod tests {
 	}
 
 	/// T9: the CBF preset with an external fee server puts it first — in
-	/// front of the provider when there is one, in front of the
-	/// coinbase-derived rates when there is not — and reports a CBF status.
+	/// front of the coinbase-derived rates, which lead the provider when there
+	/// is one — and reports a CBF status.
 	#[cfg(feature = "cbf")]
 	#[test]
 	fn new_cbf_puts_an_external_fee_server_first() {
@@ -2698,8 +2713,8 @@ mod tests {
 		let hybrid = cbf_layer(Vec::new(), esplora_fee(), Some(Arc::new(SilentProvider)))
 			.expect("a well-formed preset");
 		let slots = hybrid.slot_adapters();
-		assert_eq!(slots.fee, vec!["esplora", "dependent", "cbf_derived"]);
-		assert_eq!(slots.broadcast, vec!["dependent", "cbf_p2p"]);
+		assert_eq!(slots.fee, vec!["esplora", "cbf_derived", "dependent"]);
+		assert_eq!(slots.broadcast, vec!["cbf_p2p", "dependent"]);
 		assert_eq!(slots.mempool, vec!["dependent"]);
 		assert_eq!(hybrid.cbf_sync_status(), Some(CbfSyncStatus::Syncing));
 
@@ -2719,9 +2734,9 @@ mod tests {
 		assert_eq!(status.engine, "cbf");
 		assert_eq!(
 			status.fee.adapters,
-			vec!["esplora".to_string(), "dependent".to_string(), "cbf_derived".to_string()]
+			vec!["esplora".to_string(), "cbf_derived".to_string(), "dependent".to_string()]
 		);
-		assert_eq!(status.broadcast.adapters, vec!["dependent".to_string(), "cbf_p2p".to_string()]);
+		assert_eq!(status.broadcast.adapters, vec!["cbf_p2p".to_string(), "dependent".to_string()]);
 		assert_eq!(status.script_history.adapters, vec!["dependent".to_string()]);
 		assert!(status.utxo.is_none());
 	}

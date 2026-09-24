@@ -462,9 +462,12 @@ impl NodeBuilder {
 
 	/// Names the provider a filter-following node borrows from — the hybrid
 	/// node: [`NodeBuilder::set_chain_source_cbf`] for headers, filters,
-	/// blocks and P2P broadcast, this provider for the mempool, arbitrary
-	/// transaction status, fee estimates and a broadcast with a verdict,
-	/// ahead of the node's own P2P relay and coinbase-derived rates.
+	/// blocks and P2P broadcast, this provider for what filters cannot show
+	/// (the mempool, arbitrary script history) and as the fallback wherever
+	/// the node has an adapter of its own: fee estimates when the
+	/// coinbase-derived rates cannot answer, a broadcast when the node's own
+	/// P2P relay cannot take it, and the status of a transaction the
+	/// filter sync did not see confirm.
 	///
 	/// Consulted only by the CBF preset. Every other chain source scans its
 	/// own backend — and the Dependent tier already fills every slot from the
