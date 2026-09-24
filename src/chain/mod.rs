@@ -16,9 +16,9 @@ pub mod provider;
 pub(crate) mod seam;
 pub(crate) mod wire_convert;
 
-#[cfg(feature = "cbf")]
-pub(crate) use layer::BorrowedMempool;
 pub(crate) use layer::ChainLayer;
+#[cfg(feature = "cbf")]
+pub(crate) use layer::{BorrowedMempool, MempoolEvictions};
 
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::config::{Config, RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL};

@@ -25,7 +25,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bip157::chain::BlockHeaderChanges;
 use bip157::{
@@ -57,7 +57,7 @@ use crate::chain::cbf::{
 };
 use crate::chain::engine::SyncEngine;
 use crate::chain::seam::{ActionResult, MempoolQuery, MempoolScope};
-use crate::chain::BorrowedMempool;
+use crate::chain::{BorrowedMempool, MempoolEvictions};
 use crate::chain::{CbfSyncStatus, ChainLayer, ElectrumRuntimeStatus};
 use crate::config::{
 	BackgroundSyncConfig, Config, BDK_WALLET_SYNC_TIMEOUT_SECS,
@@ -73,12 +73,23 @@ use async_trait::async_trait;
 /// Peer response timeout passed to kyoto's `Builder::response_timeout`.
 const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 30;
 
-/// Maximum consecutive failed runs — `node.run()` erroring, or the event loop giving up on the
-/// node — before the restart loop gives up. Reset once a run catches up to the tip.
+/// Maximum consecutive unexpected failed runs — the event stream closing under a running node,
+/// or the event loop ending for a reason the network does not explain — before the restart
+/// loop gives up. Reset once a run catches up to the tip. A run that fails on the network (no
+/// reachable peers, peers not serving blocks) never counts: see [`RestartPolicy`].
 const MAX_RESTART_RETRIES: u32 = 5;
 
-/// Initial backoff delay between restart attempts; doubles each failure.
+/// Initial backoff delay between restart attempts; doubles each failure up to
+/// [`CBF_MAX_BACKOFF_MS`], and starts over after a peer handshake or a caught-up run.
 const INITIAL_BACKOFF_MS: u64 = 500;
+
+/// The longest the restart loop waits between two attempts. Five minutes: a node waiting on a
+/// network that is down keeps trying, without hammering DNS seeds or a Pi's radio.
+const CBF_MAX_BACKOFF_MS: u64 = 300_000;
+
+/// While the node waits for peers, how often the wait is reported at warn; every retry in
+/// between is logged at debug only.
+const CBF_PEER_WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Retry matched block downloads before giving up on the node and rebuilding it.
 const CBF_BLOCK_FETCH_RETRIES: u8 = 3;
@@ -381,8 +392,11 @@ impl CbfSyncEngine {
 	///
 	/// The layer refuses an answer anchored to a tip this engine does not consider best, keeps
 	/// fresh own broadcasts from being evicted on a borrowed word, and stamps the answer on
-	/// this node's clock ([`ChainLayer::borrow_mempool`]).
-	async fn borrow_mempool(&self, layer: &ChainLayer) -> ActionResult<BorrowedMempool> {
+	/// this node's clock ([`ChainLayer::borrow_mempool`]). Evictions are applied only as
+	/// `evictions` says; see [`Self::mempool_borrow_due`].
+	async fn borrow_mempool(
+		&self, layer: &ChainLayer, evictions: MempoolEvictions,
+	) -> ActionResult<BorrowedMempool> {
 		let mut scripts = self.onchain_wallet.list_watched_scripts();
 		scripts.extend(
 			self.registered_scripts.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned(),
@@ -393,7 +407,7 @@ impl CbfSyncEngine {
 			scope: MempoolScope::Incremental { best_processed_height: self.applied_tip_height() },
 		};
 		let started = std::time::Instant::now();
-		let borrowed = layer.borrow_mempool(&query).await?;
+		let borrowed = layer.borrow_mempool(&query, evictions).await?;
 		log_trace!(
 			self.logger,
 			"Borrowed a mempool view of {} unconfirmed and {} evicted transactions via {} in {}ms",
@@ -405,12 +419,42 @@ impl CbfSyncEngine {
 		Ok(borrowed)
 	}
 
-	/// Whether the background loop borrows a mempool view on this tick: only once synced — a
-	/// view taken while the filters are still catching up would be anchored above what the
-	/// wallet has applied, and an eviction would outrun the block that confirmed it — and only
-	/// when there is a chain to borrow from.
-	fn mempool_borrow_due(&self, layer: &ChainLayer) -> bool {
-		layer.has_mempool_chain() && self.is_synced()
+	/// Whether the background loop borrows a mempool view on this tick, and with which
+	/// evictions: `None` when there is no chain to borrow from.
+	///
+	/// A node catching up — kyoto still syncing, or waiting for peers after a cold boot whose
+	/// network came up late — borrows too. Gating the borrow on being synced stopped it for
+	/// exactly as long as the node was behind, which is when an incoming payment is most worth
+	/// seeing. The answer is still tip-checked: one anchored off this node's chain is refused,
+	/// and one above its applied tip cannot be placed and is accepted, as on a synced node.
+	///
+	/// What waits for the sync is the evictions. A view taken above the applied tip does not
+	/// have the transactions that confirmed in the blocks between; the wallet's known
+	/// unconfirmed ones among them would read as evicted, their inputs as spendable again and
+	/// the payments as gone from the balance, until the blocks arrive. So a node behind the tip
+	/// applies the unconfirmed half only ([`MempoolEvictions::Withhold`]) — nothing in it needs
+	/// a block of ours — and a synced node applies both.
+	fn mempool_borrow_due(&self, layer: &ChainLayer) -> Option<MempoolEvictions> {
+		mempool_borrow_plan(layer.has_mempool_chain(), self.is_synced())
+	}
+
+	/// Which evictions a borrow taken now may apply: all of them only once synced.
+	fn mempool_evictions(&self) -> MempoolEvictions {
+		mempool_evictions_when(self.is_synced())
+	}
+}
+
+/// [`CbfSyncEngine::mempool_borrow_due`], on its two inputs.
+fn mempool_borrow_plan(has_mempool_chain: bool, synced: bool) -> Option<MempoolEvictions> {
+	has_mempool_chain.then(|| mempool_evictions_when(synced))
+}
+
+/// [`CbfSyncEngine::mempool_evictions`], on whether the engine is synced.
+fn mempool_evictions_when(synced: bool) -> MempoolEvictions {
+	if synced {
+		MempoolEvictions::Apply
+	} else {
+		MempoolEvictions::Withhold
 	}
 }
 
@@ -646,7 +690,8 @@ impl SyncEngine for CbfSyncEngine {
 		self.wait_until_synced_within(CBF_SYNC_WAIT_TIMEOUT).await?;
 
 		if layer.has_mempool_chain() {
-			if let Err(e) = self.borrow_mempool(layer).await {
+			// Just waited for the sync, but a block may have landed since: ask again.
+			if let Err(e) = self.borrow_mempool(layer, self.mempool_evictions()).await {
 				log_error!(
 					self.logger,
 					"Could not borrow a mempool view this pass; the filter sync is complete \
@@ -673,7 +718,7 @@ impl SyncEngine for CbfSyncEngine {
 	}
 
 	/// Launches kyoto and the applicator, then, until told to stop, keeps the fee cache fresh
-	/// through the FEE slot and — once synced, when the MEMPOOL chain has an adapter — borrows
+	/// through the FEE slot and — when the MEMPOOL chain has an adapter, synced or not — borrows
 	/// a mempool view on the on-chain wallet sync interval. Block application itself is
 	/// event-driven and runs on the spawned tasks; this loop owns only the two ticks.
 	async fn run_background(
@@ -763,16 +808,16 @@ impl SyncEngine for CbfSyncEngine {
 					}
 				}
 				_ = mempool_interval.tick() => {
-					if !self.mempool_borrow_due(&layer) {
+					let Some(evictions) = self.mempool_borrow_due(&layer) else {
 						continue;
-					}
+					};
 					// A borrow runs up to its chain's budget; a stop must not wait it out.
 					tokio::select! {
 						_ = stop_sync_receiver.changed() => {
 							log_trace!(self.logger, "Stopping CBF background loop mid-borrow.");
 							return;
 						}
-						borrowed = self.borrow_mempool(&layer) => {
+						borrowed = self.borrow_mempool(&layer, evictions) => {
 							// Every tick asks again, so one that cannot answer is not news.
 							if let Err(e) = borrowed {
 								log_debug!(
@@ -892,10 +937,20 @@ struct KyotoLoop {
 enum RunEnd {
 	/// `node.run()` returned `Ok`: it was asked to shut down.
 	Shutdown,
-	/// `node.run()` returned an error, or its event stream ended under a running node.
+	/// `node.run()` returned [`NodeError::NoReachablePeers`]: kyoto tried every peer it knew and
+	/// reached none. Environmental — the network is down (a Pi whose Wi-Fi or DHCP came up late
+	/// after a cold boot), DNS seeds are unreachable, or the trusted peers are offline — and it
+	/// clears by itself once the network does.
+	NoPeers,
+	/// The event loop gave up on the node because a matched block could not be fetched after
+	/// every retry: the peers stopped answering, timed out, or dropped the request. Environmental
+	/// like [`RunEnd::NoPeers`]: a rebuilt node on healthier peers fetches the block.
+	PeersUnresponsive,
+	/// The node's event stream ended while `node.run()` was still going. Nothing in the network
+	/// explains it.
 	NodeFailed,
-	/// The event task gave up on this node — a matched block could not be fetched after every
-	/// retry, or the requester was gone — while the node itself kept running. Before this was
+	/// The event task ended for any other reason — its requester was gone, the block permits
+	/// were closed, or the task panicked — while the node itself kept running. Before this was
 	/// a distinct end the failure was reported and the node left running: a permanent stall,
 	/// since nothing else ever restarted it.
 	EventLoopFailed,
@@ -904,58 +959,146 @@ enum RunEnd {
 	ApplicatorGone,
 }
 
+impl RunEnd {
+	/// Whether the run ended on the network rather than on the node: such an end is retried for
+	/// as long as it takes and never spends the failure budget.
+	fn is_environmental(self) -> bool {
+		matches!(self, RunEnd::NoPeers | RunEnd::PeersUnresponsive)
+	}
+}
+
+/// How the restart loop reports a restart it is about to wait out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartReport {
+	/// The node started waiting on the network just now, or has been waiting another
+	/// [`CBF_PEER_WAIT_REPORT_INTERVAL`]: one warning.
+	WaitingWarn,
+	/// Still waiting on the network, reported recently: debug only.
+	WaitingQuiet,
+	/// An unexpected failure, counted against the budget: an error.
+	Failure,
+}
+
 /// What the restart loop does once a run has ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartDecision {
-	/// Rebuild the node after this delay.
-	Restart { backoff: Duration },
-	/// The budget of consecutive failures is spent: publish a failed sync.
+	/// Rebuild the node after this delay, reported as `report` says.
+	Restart { backoff: Duration, report: RestartReport },
+	/// The budget of consecutive unexpected failures is spent: publish a failed sync.
 	GiveUp,
 	/// Nothing to restart: the node was stopped on purpose, or a restart cannot help.
 	Stop,
 }
 
-/// The restart budget: how many runs in a row may fail before the engine gives up, and how long
-/// to wait before each attempt.
+/// When to restart the node, and when to give up on it.
 ///
-/// Kept apart from the loop that acts on it so the decision that matters — an event-loop
-/// failure rebuilds the node exactly like a node failure, and a run that caught up refills the
-/// budget — can be checked without a node.
+/// Two kinds of failed run. One that ended on the network ([`RunEnd::is_environmental`]) is
+/// retried forever: a Pi that booted before its Wi-Fi saw six `NoReachablePeers` in sixteen
+/// seconds, and a budget sized for node failures gave up for good on a network that came up a
+/// minute later — the node stayed behind, its channel monitors unfed, until someone restarted
+/// the process. Its backoff doubles to [`CBF_MAX_BACKOFF_MS`] and it is reported once, then
+/// once per [`CBF_PEER_WAIT_REPORT_INTERVAL`] while it lasts. Every other failure spends the
+/// budget of [`MAX_RESTART_RETRIES`] consecutive runs; only that budget running out gives up.
+///
+/// Kept apart from the loop that acts on it so the decisions that matter can be checked
+/// without a node.
 struct RestartPolicy {
+	/// Consecutive unexpected failures; the budget.
 	retries: u32,
 	backoff_ms: u64,
+	/// Since when the node has been failing on the network, while it is.
+	waiting_since: Option<Instant>,
+	/// When the wait was last reported at warn.
+	last_wait_report: Option<Instant>,
 }
 
 impl RestartPolicy {
 	fn new() -> Self {
-		Self { retries: 0, backoff_ms: INITIAL_BACKOFF_MS }
+		Self {
+			retries: 0,
+			backoff_ms: INITIAL_BACKOFF_MS,
+			waiting_since: None,
+			last_wait_report: None,
+		}
 	}
 
 	/// The run that just ended caught up to the tip at least once: it was a healthy node that
-	/// failed later, not a failed restart, so the budget starts over.
+	/// failed later, not a failed restart, so the budget and the backoff start over.
 	fn note_progress(&mut self) {
 		self.retries = 0;
-		self.backoff_ms = INITIAL_BACKOFF_MS;
+		self.note_connected();
 	}
 
-	fn decide(&mut self, end: RunEnd) -> RestartDecision {
+	/// The run that just ended completed a peer handshake: the network is back, so the next
+	/// failure is retried promptly and a later wait is reported afresh. How long the node
+	/// waited, if it was waiting.
+	///
+	/// The failure budget is left alone: a handshake proves the network, not the node, and a
+	/// node that handshakes and then fails the same unexpected way every run must still give up.
+	fn note_connected(&mut self) -> Option<Duration> {
+		self.backoff_ms = INITIAL_BACKOFF_MS;
+		self.last_wait_report = None;
+		self.waiting_since.take().map(|since| since.elapsed())
+	}
+
+	fn next_backoff(&mut self) -> Duration {
+		let backoff = Duration::from_millis(self.backoff_ms);
+		self.backoff_ms = self.backoff_ms.saturating_mul(2).min(CBF_MAX_BACKOFF_MS);
+		backoff
+	}
+
+	fn decide(&mut self, end: RunEnd, now: Instant) -> RestartDecision {
 		match end {
 			RunEnd::Shutdown | RunEnd::ApplicatorGone => RestartDecision::Stop,
+			RunEnd::NoPeers | RunEnd::PeersUnresponsive => {
+				debug_assert!(end.is_environmental());
+				self.waiting_since.get_or_insert(now);
+				let report = match self.last_wait_report {
+					Some(last)
+						if now.saturating_duration_since(last) < CBF_PEER_WAIT_REPORT_INTERVAL =>
+					{
+						RestartReport::WaitingQuiet
+					},
+					_ => {
+						self.last_wait_report = Some(now);
+						RestartReport::WaitingWarn
+					},
+				};
+				RestartDecision::Restart { backoff: self.next_backoff(), report }
+			},
 			RunEnd::NodeFailed | RunEnd::EventLoopFailed => {
 				self.retries += 1;
 				if self.retries > MAX_RESTART_RETRIES {
 					return RestartDecision::GiveUp;
 				}
-				let backoff = Duration::from_millis(self.backoff_ms);
-				self.backoff_ms = self.backoff_ms.saturating_mul(2);
-				RestartDecision::Restart { backoff }
+				RestartDecision::Restart {
+					backoff: self.next_backoff(),
+					report: RestartReport::Failure,
+				}
 			},
 		}
 	}
 
-	/// How many runs in a row have failed.
+	/// How many runs in a row have failed unexpectedly.
 	fn failures(&self) -> u32 {
 		self.retries
+	}
+
+	/// How long the node has been failing on the network, while it is.
+	fn waiting_for(&self, now: Instant) -> Option<Duration> {
+		self.waiting_since.map(|since| now.saturating_duration_since(since))
+	}
+}
+
+/// What a run that ended on the network ran into, for the wait log.
+fn run_end_reason(end: RunEnd) -> &'static str {
+	match end {
+		RunEnd::NoPeers => "no reachable peers",
+		RunEnd::PeersUnresponsive => "peers did not serve a matched block",
+		RunEnd::Shutdown => "shut down",
+		RunEnd::NodeFailed => "event stream ended",
+		RunEnd::EventLoopFailed => "event loop failed",
+		RunEnd::ApplicatorGone => "applicator halted",
 	}
 }
 
@@ -982,11 +1125,16 @@ impl KyotoLoop {
 		let mut policy = RestartPolicy::new();
 		// Set by the event loop on `FiltersSynced`, read once per run end.
 		let synced_this_run = Arc::new(AtomicBool::new(false));
+		// Set by the info consumer on a peer handshake, read once per run end.
+		let connected_this_run = Arc::new(AtomicBool::new(false));
 
 		loop {
 			let (node, info_rx, warn_rx, event_rx) = current;
-			let info_handle =
-				tokio::spawn(process_info_messages(info_rx, Arc::clone(&self.logger)));
+			let info_handle = tokio::spawn(process_info_messages(
+				info_rx,
+				Arc::clone(&connected_this_run),
+				Arc::clone(&self.logger),
+			));
 			let warn_handle =
 				tokio::spawn(process_warn_messages(warn_rx, Arc::clone(&self.logger)));
 			let mut event_handle =
@@ -1008,13 +1156,20 @@ impl KyotoLoop {
 					RunEnd::Shutdown
 				},
 				Turn::Node(Err(e)) => {
-					log_error!(self.logger, "CBF node exited with error: {:?}", e);
+					// Matched exhaustively so a kyoto upgrade that adds a failure has to be
+					// classified here: environmental ends are retried forever, and reported by
+					// the restart decision below at a rate that suits a network that is down.
+					let end = match e {
+						NodeError::NoReachablePeers => RunEnd::NoPeers,
+					};
+					log_debug!(self.logger, "CBF node exited with error: {}", e);
 					event_handle.abort();
-					RunEnd::NodeFailed
+					end
 				},
 				Turn::Events(joined) => {
 					let end = match joined {
 						Ok(EventLoopEnd::ApplicatorGone) => RunEnd::ApplicatorGone,
+						Ok(EventLoopEnd::PeersUnresponsive) => RunEnd::PeersUnresponsive,
 						Ok(EventLoopEnd::Failed(e)) => {
 							log_error!(self.logger, "CBF event loop gave up on the node: {}", e);
 							RunEnd::EventLoopFailed
@@ -1044,10 +1199,20 @@ impl KyotoLoop {
 			info_handle.abort();
 			warn_handle.abort();
 
+			let connected = connected_this_run.swap(false, Ordering::AcqRel);
 			if synced_this_run.swap(false, Ordering::AcqRel) {
 				policy.note_progress();
+			} else if connected {
+				if let Some(waited) = policy.note_connected() {
+					log_info!(
+						self.logger,
+						"CBF reached peers again after waiting {}s.",
+						waited.as_secs()
+					);
+				}
 			}
-			match policy.decide(end) {
+			let now = Instant::now();
+			match policy.decide(end, now) {
 				RestartDecision::Stop => {
 					// A `stop()` settled the status and state itself, and a halted applicator
 					// published its failure; this only lands for an exit nobody asked for.
@@ -1067,14 +1232,33 @@ impl KyotoLoop {
 					self.settle(CbfSyncState::Failed(Error::TxSyncFailed));
 					break;
 				},
-				RestartDecision::Restart { backoff } => {
-					log_error!(
-						self.logger,
-						"Restarting the CBF node in {}ms (attempt {}/{}).",
-						backoff.as_millis(),
-						policy.failures(),
-						MAX_RESTART_RETRIES,
-					);
+				RestartDecision::Restart { backoff, report } => {
+					match report {
+						RestartReport::WaitingWarn => log_warn!(
+							self.logger,
+							"CBF waiting for peers: {}; waiting {}s so far, next retry in {}s.",
+							run_end_reason(end),
+							policy.waiting_for(now).unwrap_or_default().as_secs(),
+							backoff.as_secs().max(1)
+						),
+						RestartReport::WaitingQuiet => log_debug!(
+							self.logger,
+							"CBF still waiting for peers: {}; next retry in {}ms.",
+							run_end_reason(end),
+							backoff.as_millis()
+						),
+						RestartReport::Failure => log_error!(
+							self.logger,
+							"Restarting the CBF node in {}ms (attempt {}/{}).",
+							backoff.as_millis(),
+							policy.failures(),
+							MAX_RESTART_RETRIES,
+						),
+					}
+					// Between two runs the node is catching up, not caught up: a run that had
+					// synced and then lost its peers must not read `Synced` through a backoff of
+					// up to five minutes.
+					self.publish_catching_up();
 					tokio::time::sleep(backoff).await;
 					match self.rebuild() {
 						Some(next) => current = next,
@@ -1129,6 +1313,12 @@ impl KyotoLoop {
 				CBF_NODE_SHUTDOWN_TIMEOUT_SECS
 			),
 		}
+	}
+
+	/// Publishes that the node is behind — `Syncing`, never `Failed` — while this launch still
+	/// owns the runtime status; after a `stop()` or a newer launch the state is not ours.
+	fn publish_catching_up(&self) {
+		publish_catching_up(&self.runtime_status, self.generation, &self.sync_state_tx);
 	}
 
 	/// Marks kyoto stopped and publishes `state` — unless the runtime status no longer belongs
@@ -1197,6 +1387,22 @@ impl KyotoLoop {
 	}
 }
 
+/// [`KyotoLoop::publish_catching_up`] for launch `generation`. The status lock is held across
+/// the publish so a concurrent `stop()` cannot slip its `Failed` in between and be overwritten.
+fn publish_catching_up(
+	runtime_status: &Mutex<CbfRuntimeStatus>, generation: u64,
+	sync_state_tx: &watch::Sender<CbfSyncState>,
+) {
+	let status = runtime_status.lock().unwrap_or_else(|e| e.into_inner());
+	let owned = matches!(
+		&*status,
+		CbfRuntimeStatus::Started { generation: owner, .. } if *owner == generation
+	);
+	if owned {
+		mark_syncing(sync_state_tx);
+	}
+}
+
 /// The requester of launch `generation`, if the runtime status still belongs to it. Copied
 /// out under the lock so no caller holds a `std::sync::Mutex` guard across an `.await`.
 fn own_requester(runtime_status: &Mutex<CbfRuntimeStatus>, generation: u64) -> Option<Requester> {
@@ -1211,7 +1417,11 @@ fn own_requester(runtime_status: &Mutex<CbfRuntimeStatus>, generation: u64) -> O
 /// Kyoto reports progress on every filter batch and a handshake per peer. On a device whose
 /// log is the only window into "syncing" versus "no peers", one line per peer and one per ten
 /// percent of a catch-up is the signal without the noise.
-async fn process_info_messages(mut info_rx: mpsc::Receiver<Info>, logger: Arc<Logger>) {
+///
+/// Raises `connected` on every handshake, for the restart loop's backoff.
+async fn process_info_messages(
+	mut info_rx: mpsc::Receiver<Info>, connected: Arc<AtomicBool>, logger: Arc<Logger>,
+) {
 	let mut handshakes = 0usize;
 	// Progress restarts from zero on every batch after the first, and the `FiltersSynced` line
 	// already marks each of those; only a rising decile is worth a line.
@@ -1219,6 +1429,7 @@ async fn process_info_messages(mut info_rx: mpsc::Receiver<Info>, logger: Arc<Lo
 	while let Some(info) = info_rx.recv().await {
 		match info {
 			Info::SuccessfulHandshake => {
+				connected.store(true, Ordering::Release);
 				handshakes += 1;
 				log_info!(logger, "CBF peer connected ({} handshakes this run).", handshakes);
 			},
@@ -1317,8 +1528,11 @@ enum EventLoopEnd {
 	EventsClosed,
 	/// The applicator is gone: it halted on a divergence, and nothing can take blocks.
 	ApplicatorGone,
-	/// The loop cannot go on with this node: the requester was gone, or a matched block could
-	/// not be fetched after every retry.
+	/// A matched block could not be fetched after every retry: the peers timed out, dropped the
+	/// request, or would not serve it. A rebuilt node, on whichever peers it reaches, retries.
+	PeersUnresponsive,
+	/// The loop cannot go on with this node: the requester was gone, or the block permits were
+	/// closed.
 	Failed(Error),
 }
 
@@ -1468,14 +1682,14 @@ impl EventLoop {
 					);
 				},
 				Err(reason) => {
-					log_error!(
+					log_warn!(
 						self.logger,
 						"CBF block fetch for {} {} after {} attempts; giving up on this node",
 						block_hash,
 						reason,
 						CBF_BLOCK_FETCH_RETRIES
 					);
-					return Err(EventLoopEnd::Failed(Error::TxSyncFailed));
+					return Err(EventLoopEnd::PeersUnresponsive);
 				},
 			}
 		}
@@ -1486,45 +1700,209 @@ impl EventLoop {
 mod tests {
 	use super::*;
 
+	fn restart_backoff(decision: RestartDecision) -> Duration {
+		match decision {
+			RestartDecision::Restart { backoff, .. } => backoff,
+			other => panic!("expected a restart, got {:?}", other),
+		}
+	}
+
 	#[test]
 	fn an_event_loop_failure_restarts_the_node_like_a_node_failure() {
 		// The give-up that used to be a permanent stall: the event task reports it, the node is
 		// still running, and the policy treats it as one failed run — backoff, rebuild.
+		let now = Instant::now();
 		let mut policy = RestartPolicy::new();
 		assert_eq!(
-			policy.decide(RunEnd::EventLoopFailed),
-			RestartDecision::Restart { backoff: Duration::from_millis(INITIAL_BACKOFF_MS) }
+			policy.decide(RunEnd::EventLoopFailed, now),
+			RestartDecision::Restart {
+				backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
+				report: RestartReport::Failure,
+			}
 		);
 		assert_eq!(
-			policy.decide(RunEnd::NodeFailed),
-			RestartDecision::Restart { backoff: Duration::from_millis(2 * INITIAL_BACKOFF_MS) },
+			policy.decide(RunEnd::NodeFailed, now),
+			RestartDecision::Restart {
+				backoff: Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+				report: RestartReport::Failure,
+			},
 			"the two kinds of failure share one budget and one backoff"
 		);
 		assert_eq!(policy.failures(), 2);
 	}
 
 	#[test]
-	fn the_budget_is_spent_after_max_retries_and_refilled_by_a_run_that_caught_up() {
+	fn an_unexpected_failure_still_gives_up_once_the_budget_is_spent() {
+		let now = Instant::now();
 		let mut policy = RestartPolicy::new();
 		for attempt in 1..=MAX_RESTART_RETRIES {
 			let expected = Duration::from_millis(INITIAL_BACKOFF_MS << (attempt - 1));
 			assert_eq!(
-				policy.decide(RunEnd::EventLoopFailed),
-				RestartDecision::Restart { backoff: expected },
+				restart_backoff(policy.decide(RunEnd::EventLoopFailed, now)),
+				expected,
 				"attempt {} restarts",
 				attempt
 			);
 		}
-		assert_eq!(policy.decide(RunEnd::NodeFailed), RestartDecision::GiveUp);
+		assert_eq!(policy.decide(RunEnd::NodeFailed, now), RestartDecision::GiveUp);
 
 		// A run that reached `FiltersSynced` was a healthy node that failed later; the budget
 		// starts over rather than counting a week-old restart against it.
 		policy.note_progress();
 		assert_eq!(policy.failures(), 0);
 		assert_eq!(
-			policy.decide(RunEnd::NodeFailed),
-			RestartDecision::Restart { backoff: Duration::from_millis(INITIAL_BACKOFF_MS) }
+			restart_backoff(policy.decide(RunEnd::NodeFailed, now)),
+			Duration::from_millis(INITIAL_BACKOFF_MS)
 		);
+	}
+
+	/// The Pi that booted before its Wi-Fi: `NoReachablePeers` run after run. The policy never
+	/// gives up on it, the backoff stops growing at the cap, and the failure budget is untouched.
+	#[test]
+	fn no_reachable_peers_is_retried_forever_on_a_capped_backoff() {
+		let now = Instant::now();
+		let mut policy = RestartPolicy::new();
+		let mut last = Duration::ZERO;
+		for run in 0..200 {
+			let end = if run % 7 == 3 { RunEnd::PeersUnresponsive } else { RunEnd::NoPeers };
+			let backoff = restart_backoff(policy.decide(end, now));
+			assert!(backoff >= last, "the backoff never shrinks while waiting");
+			assert!(backoff <= Duration::from_millis(CBF_MAX_BACKOFF_MS));
+			last = backoff;
+		}
+		assert_eq!(last, Duration::from_millis(CBF_MAX_BACKOFF_MS), "capped at five minutes");
+		assert_eq!(policy.failures(), 0, "waiting on the network spends no budget");
+
+		// Unexpected failures in between still count, and still run out.
+		for _ in 0..MAX_RESTART_RETRIES {
+			restart_backoff(policy.decide(RunEnd::NodeFailed, now));
+			restart_backoff(policy.decide(RunEnd::NoPeers, now));
+		}
+		assert_eq!(policy.decide(RunEnd::NodeFailed, now), RestartDecision::GiveUp);
+	}
+
+	/// Warned once when the wait starts, then once per report interval; debug in between.
+	#[test]
+	fn a_wait_for_peers_is_reported_once_then_once_per_interval() {
+		let start = Instant::now();
+		let mut policy = RestartPolicy::new();
+		let report =
+			|policy: &mut RestartPolicy, at: Instant| match policy.decide(RunEnd::NoPeers, at) {
+				RestartDecision::Restart { report, .. } => report,
+				other => panic!("expected a restart, got {:?}", other),
+			};
+		assert_eq!(report(&mut policy, start), RestartReport::WaitingWarn);
+		for secs in [1, 5, 60, 599] {
+			assert_eq!(
+				report(&mut policy, start + Duration::from_secs(secs)),
+				RestartReport::WaitingQuiet
+			);
+		}
+		let later = start + CBF_PEER_WAIT_REPORT_INTERVAL;
+		assert_eq!(report(&mut policy, later), RestartReport::WaitingWarn);
+		assert_eq!(policy.waiting_for(later), Some(CBF_PEER_WAIT_REPORT_INTERVAL));
+		assert_eq!(
+			report(&mut policy, later + Duration::from_secs(1)),
+			RestartReport::WaitingQuiet
+		);
+	}
+
+	/// A handshake means the network is back: the backoff and the wait start over, so the next
+	/// outage is retried promptly and warned about afresh. The failure budget is not refilled —
+	/// only a run that caught up does that.
+	#[test]
+	fn a_handshake_resets_the_backoff_and_the_wait_but_not_the_budget() {
+		let now = Instant::now();
+		let mut policy = RestartPolicy::new();
+		restart_backoff(policy.decide(RunEnd::NodeFailed, now));
+		for _ in 0..20 {
+			restart_backoff(policy.decide(RunEnd::NoPeers, now));
+		}
+		assert!(policy.waiting_for(now).is_some());
+
+		assert!(policy.note_connected().is_some(), "it was waiting");
+		assert_eq!(policy.waiting_for(now), None);
+		assert_eq!(policy.note_connected(), None, "and is not any more");
+		assert_eq!(policy.failures(), 1, "a handshake proves the network, not the node");
+		assert_eq!(
+			policy.decide(RunEnd::NoPeers, now),
+			RestartDecision::Restart {
+				backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
+				report: RestartReport::WaitingWarn,
+			}
+		);
+
+		// A run that caught up resets everything.
+		for _ in 0..20 {
+			restart_backoff(policy.decide(RunEnd::NoPeers, now));
+		}
+		policy.note_progress();
+		assert_eq!(policy.failures(), 0);
+		assert_eq!(policy.waiting_for(now), None);
+		assert_eq!(
+			restart_backoff(policy.decide(RunEnd::PeersUnresponsive, now)),
+			Duration::from_millis(INITIAL_BACKOFF_MS)
+		);
+	}
+
+	#[test]
+	fn only_the_network_ends_are_environmental() {
+		assert!(RunEnd::NoPeers.is_environmental());
+		assert!(RunEnd::PeersUnresponsive.is_environmental());
+		for end in
+			[RunEnd::Shutdown, RunEnd::NodeFailed, RunEnd::EventLoopFailed, RunEnd::ApplicatorGone]
+		{
+			assert!(!end.is_environmental(), "{:?}", end);
+		}
+	}
+
+	/// Between two runs — waiting out the backoff for peers — the status reads `Syncing`, never
+	/// `Synced` from before the outage and never `Failed`; and a launch that no longer owns the
+	/// status leaves it alone.
+	#[test]
+	fn a_node_waiting_for_peers_reads_syncing() {
+		let data_dir = std::env::temp_dir().join(format!(
+			"ldk-node-cbf-status-{}-{}",
+			std::process::id(),
+			SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+		));
+		let (_node, client) =
+			KyotoBuilder::new(bitcoin::Network::Regtest).data_dir(data_dir.clone()).build();
+		let runtime_status =
+			Mutex::new(CbfRuntimeStatus::Started { requester: client.requester, generation: 1 });
+		let (sync_state_tx, _rx) =
+			watch::channel(CbfSyncState::Active { applied_tip: Some(100), synced_to_tip: true });
+
+		publish_catching_up(&runtime_status, 2, &sync_state_tx);
+		assert_eq!(
+			simplify_sync_state(*sync_state_tx.borrow()),
+			CbfSyncStatus::Synced,
+			"a stale launch does not touch the new one's status"
+		);
+
+		publish_catching_up(&runtime_status, 1, &sync_state_tx);
+		assert_eq!(simplify_sync_state(*sync_state_tx.borrow()), CbfSyncStatus::Syncing);
+		assert!(matches!(
+			*sync_state_tx.borrow(),
+			CbfSyncState::Active { applied_tip: Some(100), synced_to_tip: false }
+		));
+
+		// After a `stop()` the failure it published stands.
+		*runtime_status.lock().unwrap() = CbfRuntimeStatus::Stopped;
+		sync_state_tx.send_replace(CbfSyncState::Failed(Error::NotRunning));
+		publish_catching_up(&runtime_status, 1, &sync_state_tx);
+		assert_eq!(simplify_sync_state(*sync_state_tx.borrow()), CbfSyncStatus::Failed);
+		let _ = std::fs::remove_dir_all(data_dir);
+	}
+
+	/// The mempool is borrowed whenever there is a chain to borrow from; the evictions wait for
+	/// the sync, the unconfirmed half does not.
+	#[test]
+	fn the_mempool_is_borrowed_while_catching_up_without_its_evictions() {
+		assert_eq!(mempool_borrow_plan(false, false), None);
+		assert_eq!(mempool_borrow_plan(false, true), None);
+		assert_eq!(mempool_borrow_plan(true, false), Some(MempoolEvictions::Withhold));
+		assert_eq!(mempool_borrow_plan(true, true), Some(MempoolEvictions::Apply));
 	}
 
 	fn unlaunched_engine() -> CbfSyncEngine {
@@ -1571,7 +1949,8 @@ mod tests {
 		engine
 			.sync_state_tx
 			.send_replace(CbfSyncState::Active { applied_tip: Some(100), synced_to_tip: true });
-		assert!(engine.is_synced(), "the background borrow is due only now");
+		assert!(engine.is_synced(), "a borrow may apply evictions only now");
+		assert_eq!(engine.mempool_evictions(), MempoolEvictions::Apply);
 		assert_eq!(engine.wait_until_synced_within(Duration::from_millis(50)).await, Ok(()));
 
 		engine.sync_state_tx.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
@@ -1615,9 +1994,10 @@ mod tests {
 
 	#[test]
 	fn a_shutdown_or_a_halted_applicator_is_never_restarted() {
+		let now = Instant::now();
 		let mut policy = RestartPolicy::new();
-		assert_eq!(policy.decide(RunEnd::Shutdown), RestartDecision::Stop);
-		assert_eq!(policy.decide(RunEnd::ApplicatorGone), RestartDecision::Stop);
+		assert_eq!(policy.decide(RunEnd::Shutdown, now), RestartDecision::Stop);
+		assert_eq!(policy.decide(RunEnd::ApplicatorGone, now), RestartDecision::Stop);
 		assert_eq!(policy.failures(), 0, "neither counts against the failure budget");
 	}
 

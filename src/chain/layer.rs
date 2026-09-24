@@ -154,6 +154,23 @@ pub(crate) struct BorrowedMempool {
 	pub(crate) evicted: usize,
 }
 
+/// Whether [`ChainLayer::borrow_mempool`] applies the evictions in a borrowed
+/// answer, or only its unconfirmed transactions.
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MempoolEvictions {
+	/// Apply both halves: the wallet has every block up to the tip applied.
+	Apply,
+	/// Apply the unconfirmed transactions and drop the evictions: the wallet
+	/// is behind the tip. A known unconfirmed transaction missing from the
+	/// provider's mempool may have confirmed in a block this node has not
+	/// applied yet, and evicting it would hand its inputs back to the wallet
+	/// as spendable — until that block arrives — and drop the payment from the
+	/// balance. An unconfirmed transaction needs no block of ours to be
+	/// right, so that half is safe at any height.
+	Withhold,
+}
+
 /// A borrowed mempool answer, every time in it replaced by `now` on this
 /// node's clock.
 ///
@@ -1131,10 +1148,12 @@ impl ChainLayer {
 	/// chain, with fresh own broadcasts shielded from eviction — and is then
 	/// stamped on this node's clock ([`stamp_locally`]) before the wallet sees
 	/// it. An empty chain is `Unavailable`; the engine checks
-	/// [`ChainLayer::has_mempool_chain`] before asking.
+	/// [`ChainLayer::has_mempool_chain`] before asking. With
+	/// [`MempoolEvictions::Withhold`] only the unconfirmed half is applied,
+	/// and the result counts no evictions.
 	#[cfg(feature = "cbf")]
 	pub(crate) async fn borrow_mempool(
-		&self, query: &MempoolQuery,
+		&self, query: &MempoolQuery, evictions: MempoolEvictions,
 	) -> ActionResult<BorrowedMempool> {
 		let Some(wallet) = self.engine.onchain_wallet() else {
 			return Err(ChainActionError::unavailable(
@@ -1143,7 +1162,16 @@ impl ChainLayer {
 		};
 		let answered = self.mempool(query).await?;
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-		let (unconfirmed, evicted) = stamp_locally(answered.value.value, now);
+		let (unconfirmed, mut evicted) = stamp_locally(answered.value.value, now);
+		if evictions == MempoolEvictions::Withhold && !evicted.is_empty() {
+			log_debug!(
+				self.shared.logger,
+				"Withholding {} evictions from {}'s mempool view: this node is still catching up to the tip",
+				evicted.len(),
+				answered.by
+			);
+			evicted.clear();
+		}
 		let borrowed = BorrowedMempool {
 			by: answered.by,
 			unconfirmed: unconfirmed.len(),
@@ -3060,7 +3088,11 @@ mod tests {
 			wallet: Some(Arc::clone(&wallet)),
 			..HarnessSpec::default()
 		});
-		let borrowed = h.layer.borrow_mempool(&complete_query(Vec::new())).await.unwrap();
+		let borrowed = h
+			.layer
+			.borrow_mempool(&complete_query(Vec::new()), MempoolEvictions::Apply)
+			.await
+			.unwrap();
 		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
 		assert!(
 			unconfirmed_txids(&wallet).contains(&incoming.compute_txid()),
@@ -3073,7 +3105,58 @@ mod tests {
 			wallet: Some(Arc::clone(&wallet)),
 			..HarnessSpec::default()
 		});
-		assert!(h.layer.borrow_mempool(&complete_query(Vec::new())).await.is_err());
+		assert!(h
+			.layer
+			.borrow_mempool(&complete_query(Vec::new()), MempoolEvictions::Apply)
+			.await
+			.is_err());
+	}
+
+	/// A node still catching up borrows the unconfirmed half of the view and
+	/// withholds the evictions: a known transaction missing from the
+	/// provider's mempool may have confirmed in a block not yet applied here.
+	/// Once caught up, the same answer evicts it.
+	#[cfg(feature = "cbf")]
+	#[tokio::test]
+	async fn a_node_still_catching_up_borrows_unconfirmed_but_withholds_evictions() {
+		let tip = tip_at(7, 0x07);
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let known = deposit(&wallet, 1);
+		unconfirmed(&wallet, &[&known]);
+		let incoming = deposit(&wallet, 2);
+
+		// The provider has `incoming` and no longer has `known`: the fake
+		// evicts every known unconfirmed transaction it is asked about.
+		let provider = FakeMempool::new(
+			"provider",
+			MempoolBehaviour::Answer { unconfirmed: vec![incoming.clone()], tip: Some(tip) },
+		);
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&provider)]),
+			tracks_own_broadcasts: true,
+			known_blocks: [(tip, true)].into(),
+			wallet: Some(Arc::clone(&wallet)),
+			..HarnessSpec::default()
+		});
+		let query = complete_query(vec![known.compute_txid()]);
+
+		let borrowed = h.layer.borrow_mempool(&query, MempoolEvictions::Withhold).await.unwrap();
+		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
+		let mut both = vec![known.compute_txid(), incoming.compute_txid()];
+		both.sort();
+		assert_eq!(
+			unconfirmed_txids(&wallet),
+			both,
+			"the new payment is seen; the missing one is kept until our blocks say otherwise"
+		);
+
+		let borrowed = h.layer.borrow_mempool(&query, MempoolEvictions::Apply).await.unwrap();
+		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 1 });
+		assert_eq!(unconfirmed_txids(&wallet), vec![incoming.compute_txid()]);
 	}
 
 	/// The own-broadcast memory forgets by age and caps by count, oldest
