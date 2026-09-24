@@ -23,7 +23,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,12 +44,17 @@ use tokio::sync::{mpsc, watch, Semaphore};
 
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::cbf::applicator::{
-	BlockApplicator, ChainOp, CBF_CHAIN_OP_QUEUE_DEPTH, CBF_FULL_BLOCK_PERMITS,
+	BlockApplicator, ChainFanout, ChainOp, CBF_CHAIN_OP_QUEUE_DEPTH, CBF_FULL_BLOCK_PERMITS,
 };
 use crate::chain::cbf::birthday::resolve_birthday;
 use crate::chain::cbf::fee::{new_block_fee_cache, BlockFeeCache};
 use crate::chain::cbf::fee_sampler::{
 	BlockFetch, FeeBlockSource, FeeSampler, SampleFailure, CBF_FEE_SAMPLE_INTERVAL,
+};
+use crate::chain::cbf::source::FilterSource;
+use crate::chain::cbf::source_sync::{
+	lock_headers, new_shared_header_chain, HeaderChain, SharedHeaderChain, SourceFeeSource,
+	SourceSync, SourceSyncEnd, SourceTuning, WatchedScripts,
 };
 use crate::chain::cbf::{
 	mark_syncing, parse_trusted_peer, resume_checkpoint, simplify_sync_state, CbfSyncState,
@@ -60,7 +65,7 @@ use crate::chain::seam::{ActionResult, MempoolQuery, MempoolScope};
 use crate::chain::{BorrowedMempool, MempoolEvictions};
 use crate::chain::{CbfSyncStatus, ChainLayer, ElectrumRuntimeStatus};
 use crate::config::{
-	BackgroundSyncConfig, Config, BDK_WALLET_SYNC_TIMEOUT_SECS,
+	BackgroundSyncConfig, CbfSource, Config, BDK_WALLET_SYNC_TIMEOUT_SECS,
 	DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS, WALLET_SYNC_INTERVAL_MINIMUM_SECS,
 };
 use crate::io::utils::write_node_metrics;
@@ -81,15 +86,15 @@ const MAX_RESTART_RETRIES: u32 = 5;
 
 /// Initial backoff delay between restart attempts; doubles each failure up to
 /// [`CBF_MAX_BACKOFF_MS`], and starts over after a peer handshake or a caught-up run.
-const INITIAL_BACKOFF_MS: u64 = 500;
+pub(crate) const INITIAL_BACKOFF_MS: u64 = 500;
 
 /// The longest the restart loop waits between two attempts. Five minutes: a node waiting on a
 /// network that is down keeps trying, without hammering DNS seeds or a Pi's radio.
-const CBF_MAX_BACKOFF_MS: u64 = 300_000;
+pub(crate) const CBF_MAX_BACKOFF_MS: u64 = 300_000;
 
 /// While the node waits for peers, how often the wait is reported at warn; every retry in
 /// between is logged at debug only.
-const CBF_PEER_WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(600);
+pub(crate) const CBF_PEER_WAIT_REPORT_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Retry matched block downloads before giving up on the node and rebuilding it.
 const CBF_BLOCK_FETCH_RETRIES: u8 = 3;
@@ -111,6 +116,17 @@ const CBF_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(BDK_WALLET_SYNC_TIME
 /// is its own blocks it cannot succeed; waiting out the regular ten-minute tick would leave the
 /// node on hardcoded fallbacks — and `Node::chain_freshness` stale — for that long.
 const CBF_FEE_RECOVERY_RETRY: Duration = Duration::from_secs(15);
+
+/// [`CbfSyncEngine::active_source`]: kyoto feeds the applicator.
+const ACTIVE_P2P: u8 = 0;
+/// [`CbfSyncEngine::active_source`]: the node filter source feeds the applicator.
+const ACTIVE_NODE: u8 = 1;
+
+/// A running node-source sync: which launch it belongs to, and how to stop it.
+struct SourceRun {
+	generation: u64,
+	stop_tx: watch::Sender<bool>,
+}
 
 /// Runtime status of the underlying kyoto node.
 enum CbfRuntimeStatus {
@@ -181,6 +197,18 @@ fn kyoto_builder(
 
 pub(crate) struct CbfSyncEngine {
 	kyoto: KyotoParams,
+	/// Where the chain data comes from; see [`CbfSource`].
+	source_mode: CbfSource,
+	/// The node filter source, kept only when `source_mode` uses it.
+	filter_source: Option<Arc<dyn FilterSource>>,
+	/// The header chain the node-source sync verified; read by its fee source and
+	/// `is_on_chain`. Empty while kyoto runs.
+	source_headers: SharedHeaderChain,
+	/// Which source feeds the applicator now: [`ACTIVE_P2P`] or [`ACTIVE_NODE`]. Moves from
+	/// node to P2P once, when `node,p2p` falls back.
+	active_source: Arc<AtomicU8>,
+	/// The node-source sync, while one runs.
+	source_run: Arc<Mutex<Option<SourceRun>>>,
 	/// Scripts LDK asked to watch. The wallet's own are pulled from the wallet, not kept here,
 	/// so nothing is tracked twice.
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
@@ -213,10 +241,33 @@ impl CbfSyncEngine {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		peers: Vec<String>, required_peers: u8, wallet_birthday_height: Option<u32>,
+		source_mode: CbfSource, filter_source: Option<Arc<dyn FilterSource>>,
 		external_electrum: Option<ExternalElectrum>, onchain_wallet: Arc<Wallet>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Result<Self, Error> {
+		let filter_source = match (source_mode.uses_node_source(), filter_source) {
+			(true, Some(source)) => Some(source),
+			(true, None) => {
+				log_error!(
+					logger,
+					"CBF source {:?} needs a filter source, and none was given \
+					 (NodeBuilder::set_cbf_filter_source).",
+					source_mode
+				);
+				return Err(Error::ConnectionFailed);
+			},
+			(false, Some(source)) => {
+				log_info!(
+					logger,
+					"A CBF filter source ('{}') is set, but the CBF source is P2P; ignoring it.",
+					source.name()
+				);
+				None
+			},
+			(false, None) => None,
+		};
+
 		let mut trusted_peers = Vec::with_capacity(peers.len());
 		for peer_str in &peers {
 			let parsed = parse_trusted_peer(peer_str).map_err(|e| {
@@ -240,6 +291,15 @@ impl CbfSyncEngine {
 				config: Arc::clone(&config),
 				logger: Arc::clone(&logger),
 			},
+			source_mode,
+			filter_source,
+			source_headers: new_shared_header_chain(),
+			active_source: Arc::new(AtomicU8::new(if source_mode.uses_node_source() {
+				ACTIVE_NODE
+			} else {
+				ACTIVE_P2P
+			})),
+			source_run: Arc::new(Mutex::new(None)),
 			registered_scripts: Arc::new(Mutex::new(HashSet::new())),
 			watch_ledger: Arc::new(WatchLedger::new()),
 			block_fee_cache: new_block_fee_cache(),
@@ -268,6 +328,22 @@ impl CbfSyncEngine {
 	/// a failed sync and nothing is spawned: the node comes up, `wait_until_synced` errors, and
 	/// the log says what to configure.
 	fn launch(&self, runtime: Arc<tokio::runtime::Runtime>, listener: Arc<ChainListener>) {
+		if self.source_mode.uses_node_source() {
+			let anchor = match resume_checkpoint(&self.logger, &listener, self.kyoto.birthday) {
+				Ok(checkpoint) => BlockId { height: checkpoint.height, hash: checkpoint.hash },
+				Err(refusal) => {
+					log_error!(self.logger, "CBF sync cannot start: {}", refusal);
+					self.sync_state_tx.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
+					return;
+				},
+			};
+			let best_block_height = listener.get_best_block().height;
+			let fallback =
+				(self.source_mode == CbfSource::NodeThenP2p).then(|| Arc::clone(&listener));
+			self.launch_source(runtime.handle(), listener, anchor, best_block_height, fallback);
+			return;
+		}
+
 		let (node, client) = match self.kyoto.build(&listener) {
 			Ok(built) => built,
 			Err(refusal) => {
@@ -309,7 +385,7 @@ impl CbfSyncEngine {
 		);
 		runtime.spawn(applicator.run());
 
-		log_info!(self.logger, "CBF chain source started.");
+		log_info!(self.logger, "CBF chain source started: filters from the P2P network (kyoto).");
 
 		let kyoto_loop = KyotoLoop {
 			kyoto: self.kyoto.clone(),
@@ -323,6 +399,121 @@ impl CbfSyncEngine {
 			logger: Arc::clone(&self.logger),
 		};
 		runtime.spawn(kyoto_loop.run(node, info_rx, warn_rx, event_rx));
+	}
+
+	/// Starts the applicator over `fanout` and the sync loop over the node filter source,
+	/// resuming from `anchor`. Kyoto is not built: no Bitcoin P2P connection is opened. With
+	/// `fallback_listener` (`node,p2p`) the loop hands over to kyoto, on the same applicator,
+	/// once the source has stayed unavailable too long.
+	///
+	/// Generic over the fan-out so it can be driven without a `ChannelManager`.
+	fn launch_source<F: ChainFanout + 'static>(
+		&self, handle: &tokio::runtime::Handle, fanout: Arc<F>, anchor: BlockId,
+		best_block_height: u32, fallback_listener: Option<Arc<ChainListener>>,
+	) {
+		let Some(source) = self.filter_source.clone() else {
+			debug_assert!(false, "a node-source launch without a filter source");
+			log_error!(self.logger, "CBF sync cannot start: no filter source.");
+			self.sync_state_tx.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
+			return;
+		};
+		let generation = self.launch_generation.fetch_add(1, Ordering::AcqRel) + 1;
+		let (stop_tx, stop_rx) = watch::channel(false);
+		{
+			// Lock order: `source_run`, then `runtime_status` — as in the fallback.
+			let mut run = self.source_run.lock().unwrap_or_else(|e| e.into_inner());
+			let kyoto_running = matches!(
+				*self.runtime_status.lock().unwrap_or_else(|e| e.into_inner()),
+				CbfRuntimeStatus::Started { .. }
+			);
+			if run.is_some() || kyoto_running {
+				debug_assert!(false, "launch() called while the CBF engine is already running");
+				return;
+			}
+			*run = Some(SourceRun { generation, stop_tx });
+		}
+		*lock_headers(&self.source_headers) = HeaderChain::default();
+		self.active_source.store(ACTIVE_NODE, Ordering::Release);
+
+		let (ops_tx, ops_rx) = mpsc::channel(CBF_CHAIN_OP_QUEUE_DEPTH);
+		self.sync_state_tx.send_replace(CbfSyncState::Active {
+			applied_tip: Some(best_block_height),
+			synced_to_tip: false,
+		});
+		let applicator = BlockApplicator::new(
+			fanout,
+			ops_rx,
+			best_block_height + 1,
+			self.sync_state_tx.clone(),
+			Arc::clone(&self.block_fee_cache),
+			Arc::clone(&self.watch_ledger),
+			Arc::clone(&self.kv_store),
+			Arc::clone(&self.node_metrics),
+			Arc::clone(&self.logger),
+		);
+		handle.spawn(applicator.run());
+
+		let fall_back = self.source_mode == CbfSource::NodeThenP2p;
+		let sync = SourceSync::new(
+			Arc::clone(&source),
+			self.config.network,
+			anchor,
+			Arc::clone(&self.source_headers),
+			Arc::new(EngineScripts {
+				wallet: Arc::clone(&self.onchain_wallet),
+				registered: Arc::clone(&self.registered_scripts),
+			}),
+			ops_tx.clone(),
+			self.sync_state_tx.clone(),
+			Arc::clone(&self.full_block_permits),
+			stop_rx,
+			SourceTuning::production(fall_back),
+			Arc::clone(&self.logger),
+		);
+		log_info!(
+			self.logger,
+			"CBF chain source started: filters from the node source '{}'{}; no Bitcoin P2P connection.",
+			source.name(),
+			if fall_back { ", falling back to P2P if it stays unavailable" } else { "" }
+		);
+
+		let fallback = fallback_listener.filter(|_| fall_back).map(|listener| KyotoFallback {
+			kyoto: self.kyoto.clone(),
+			generation,
+			listener,
+			registered_scripts: Arc::clone(&self.registered_scripts),
+			runtime_status: Arc::clone(&self.runtime_status),
+			sync_state_tx: self.sync_state_tx.clone(),
+			ops_tx,
+			full_block_permits: Arc::clone(&self.full_block_permits),
+			source_run: Arc::clone(&self.source_run),
+			active_source: Arc::clone(&self.active_source),
+			logger: Arc::clone(&self.logger),
+		});
+		let source_run = Arc::clone(&self.source_run);
+		let logger = Arc::clone(&self.logger);
+		let spawn_handle = handle.clone();
+		handle.spawn(async move {
+			match sync.run().await {
+				SourceSyncEnd::FallBack => {
+					if let Some(fallback) = fallback {
+						fallback.start(&spawn_handle);
+						return;
+					}
+					log_error!(logger, "CBF node source asked for a P2P fallback it has not got.");
+				},
+				SourceSyncEnd::Stopped => log_debug!(logger, "CBF node-source sync stopped."),
+				SourceSyncEnd::ApplicatorGone => {
+					log_debug!(logger, "CBF node-source sync ended: the applicator halted.")
+				},
+				// Logged, and published as failed, by the loop.
+				SourceSyncEnd::Failed(_) => {},
+			}
+			let mut run = source_run.lock().unwrap_or_else(|e| e.into_inner());
+			if run.as_ref().is_some_and(|r| r.generation == generation) {
+				*run = None;
+			}
+		});
 	}
 
 	/// Blocks until the applicator has applied every block through the tip kyoto reports, or
@@ -563,10 +754,76 @@ impl FeeBlockSource for KyotoFeeSource {
 	}
 }
 
+/// The chain as the fee sampler and the FEE adapter read it, from whichever source feeds the
+/// applicator now: kyoto's header chain and peers, or the node source's verified header chain
+/// and blocks.
+pub(crate) struct CbfFeeSource {
+	kyoto: KyotoFeeSource,
+	node: Option<SourceFeeSource>,
+	active_source: Arc<AtomicU8>,
+}
+
+impl CbfFeeSource {
+	fn node(&self) -> Option<&SourceFeeSource> {
+		self.node.as_ref().filter(|_| self.active_source.load(Ordering::Acquire) == ACTIVE_NODE)
+	}
+}
+
+#[async_trait]
+impl FeeBlockSource for CbfFeeSource {
+	async fn tip_height(&self) -> Result<u32, SampleFailure> {
+		match self.node() {
+			Some(node) => node.tip_height().await,
+			None => self.kyoto.tip_height().await,
+		}
+	}
+
+	async fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, SampleFailure> {
+		match self.node() {
+			Some(node) => node.block_hash_at(height).await,
+			None => self.kyoto.block_hash_at(height).await,
+		}
+	}
+
+	fn can_fetch(&self) -> bool {
+		match self.node() {
+			Some(node) => node.can_fetch(),
+			None => self.kyoto.can_fetch(),
+		}
+	}
+
+	fn request_block(&self, hash: BlockHash) -> Result<BlockFetch, SampleFailure> {
+		match self.node() {
+			Some(node) => node.request_block(hash),
+			None => self.kyoto.request_block(hash),
+		}
+	}
+}
+
+/// The scripts the node-source sync matches filters against: the wallet's and LDK's, as the
+/// kyoto event loop's `MatchSet` reads them.
+struct EngineScripts {
+	wallet: Arc<Wallet>,
+	registered: Arc<Mutex<HashSet<ScriptBuf>>>,
+}
+
+impl WatchedScripts for EngineScripts {
+	fn counts(&self) -> (usize, usize) {
+		let registered = self.registered.lock().unwrap_or_else(|e| e.into_inner()).len();
+		(self.wallet.watched_script_count(), registered)
+	}
+
+	fn scripts(&self) -> Vec<ScriptBuf> {
+		let mut scripts = self.wallet.list_watched_scripts();
+		scripts.extend(self.registered.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+		scripts
+	}
+}
+
 /// Keeps the block-fee cache warm until `stop` fires; see [`FeeSampler`]. A pass is raced
 /// against the stop, so shutting down never waits out a block download.
 async fn run_fee_sampler(
-	mut sampler: FeeSampler<KyotoFeeSource>, mut stop: tokio::sync::watch::Receiver<()>,
+	mut sampler: FeeSampler<CbfFeeSource>, mut stop: tokio::sync::watch::Receiver<()>,
 ) {
 	let mut tick = tokio::time::interval(CBF_FEE_SAMPLE_INTERVAL);
 	tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -609,14 +866,31 @@ impl CbfSyncEngine {
 		&self.block_fee_cache
 	}
 
-	/// The chain as the fee sampler and the FEE adapter read it: kyoto's header chain, and
-	/// block downloads under one of the full-block permits.
-	pub(crate) fn fee_source(&self) -> KyotoFeeSource {
-		KyotoFeeSource {
-			runtime_status: Arc::clone(&self.runtime_status),
-			sync_state_rx: self.sync_state_tx.subscribe(),
-			full_block_permits: Arc::clone(&self.full_block_permits),
+	/// The chain as the fee sampler and the FEE adapter read it — kyoto's header chain or the
+	/// node source's verified one, whichever feeds the applicator — and block downloads under
+	/// one of the full-block permits.
+	pub(crate) fn fee_source(&self) -> CbfFeeSource {
+		CbfFeeSource {
+			kyoto: KyotoFeeSource {
+				runtime_status: Arc::clone(&self.runtime_status),
+				sync_state_rx: self.sync_state_tx.subscribe(),
+				full_block_permits: Arc::clone(&self.full_block_permits),
+			},
+			node: self.filter_source.as_ref().map(|source| {
+				SourceFeeSource::new(
+					Arc::clone(source),
+					Arc::clone(&self.source_headers),
+					self.sync_state_tx.subscribe(),
+					Arc::clone(&self.full_block_permits),
+				)
+			}),
+			active_source: Arc::clone(&self.active_source),
 		}
+	}
+
+	/// Whether the node filter source, rather than kyoto, feeds the applicator now.
+	fn node_source_active(&self) -> bool {
+		self.filter_source.is_some() && self.active_source.load(Ordering::Acquire) == ACTIVE_NODE
 	}
 
 	/// Where watched transactions were seen confirmed, and the block the applicator most
@@ -634,8 +908,14 @@ impl CbfSyncEngine {
 
 #[async_trait]
 impl SyncEngine for CbfSyncEngine {
+	/// `"cbf"` for the P2P-only source, as before; `"cbf(node)"` or `"cbf(p2p)"` for the
+	/// node sources, by which one feeds the applicator now.
 	fn name(&self) -> &'static str {
-		"cbf"
+		match self.source_mode {
+			CbfSource::P2p => "cbf",
+			_ if self.node_source_active() => "cbf(node)",
+			_ => "cbf(p2p)",
+		}
 	}
 
 	/// Keeps the runtime for [`Self::run_background`] to spawn on, and connects the external
@@ -658,6 +938,12 @@ impl SyncEngine for CbfSyncEngine {
 	}
 
 	fn stop(&self) {
+		// The node-source sync first: a `node,p2p` fallback checks it under the same lock
+		// before it starts kyoto, so once it is taken no kyoto can start behind this stop.
+		let source_run = self.source_run.lock().unwrap_or_else(|e| e.into_inner()).take();
+		if let Some(run) = source_run {
+			let _ = run.stop_tx.send(true);
+		}
 		let requester = {
 			let mut status = self.runtime_status.lock().unwrap_or_else(|e| e.into_inner());
 			match std::mem::replace(&mut *status, CbfRuntimeStatus::Stopped) {
@@ -884,6 +1170,11 @@ impl SyncEngine for CbfSyncEngine {
 	/// outside the header range kyoto holds (above its tip, or below the checkpoint it
 	/// resumed from): an answer this engine cannot check is not one it refutes.
 	async fn is_on_chain(&self, block: &BlockId) -> Option<bool> {
+		if self.node_source_active() {
+			// The verified header chain; a height outside it is not one this engine refutes.
+			let held = lock_headers(&self.source_headers).hash(block.height);
+			return held.map(|hash| hash == block.hash);
+		}
 		let requester = self.requester()?;
 		let lookup = tokio::time::timeout(
 			Duration::from_secs(CBF_HEADER_LOOKUP_TIMEOUT_SECS),
@@ -912,6 +1203,68 @@ impl SyncEngine for CbfSyncEngine {
 				None
 			},
 		}
+	}
+}
+
+/// What a `node,p2p` engine needs to start kyoto on the applicator the node source fed, once
+/// that source has stayed unavailable too long.
+struct KyotoFallback {
+	kyoto: KyotoParams,
+	generation: u64,
+	listener: Arc<ChainListener>,
+	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
+	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
+	sync_state_tx: watch::Sender<CbfSyncState>,
+	ops_tx: mpsc::Sender<ChainOp>,
+	full_block_permits: Arc<Semaphore>,
+	source_run: Arc<Mutex<Option<SourceRun>>>,
+	active_source: Arc<AtomicU8>,
+	logger: Arc<Logger>,
+}
+
+impl KyotoFallback {
+	/// Builds kyoto — re-anchored on the listeners, so the blocks the node source already
+	/// applied are skipped by the applicator — and runs it under the node source's launch
+	/// generation. Nothing starts if `stop()` took the run first.
+	fn start(self, handle: &tokio::runtime::Handle) {
+		let mut run = self.source_run.lock().unwrap_or_else(|e| e.into_inner());
+		if !run.as_ref().is_some_and(|r| r.generation == self.generation) {
+			log_info!(self.logger, "CBF P2P fallback aborted: the engine was stopped.");
+			return;
+		}
+		let (node, client) = match self.kyoto.build(&self.listener) {
+			Ok(built) => built,
+			Err(refusal) => {
+				*run = None;
+				drop(run);
+				log_error!(self.logger, "CBF P2P fallback cannot start: {}", refusal);
+				self.sync_state_tx.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
+				return;
+			},
+		};
+		let Client { requester, info_rx, warn_rx, event_rx } = client;
+		*self.runtime_status.lock().unwrap_or_else(|e| e.into_inner()) =
+			CbfRuntimeStatus::Started { requester, generation: self.generation };
+		*run = None;
+		drop(run);
+		self.active_source.store(ACTIVE_P2P, Ordering::Release);
+		log_warn!(
+			self.logger,
+			"CBF fell back to the P2P network (kyoto) for the rest of this run: the node source stayed unavailable."
+		);
+
+		let kyoto_loop = KyotoLoop {
+			kyoto: self.kyoto,
+			generation: self.generation,
+			listener: self.listener,
+			registered_scripts: self.registered_scripts,
+			runtime_status: self.runtime_status,
+			sync_state_tx: self.sync_state_tx,
+			ops_tx: self.ops_tx,
+			full_block_permits: self.full_block_permits,
+			logger: self.logger,
+		};
+		handle.spawn(kyoto_loop.run(node, info_rx, warn_rx, event_rx));
 	}
 }
 
@@ -1906,6 +2259,13 @@ mod tests {
 	}
 
 	fn unlaunched_engine() -> CbfSyncEngine {
+		engine_with(CbfSource::P2p, None, Config::default().storage_dir_path)
+	}
+
+	fn engine_with(
+		source_mode: CbfSource, filter_source: Option<Arc<dyn FilterSource>>,
+		storage_dir_path: String,
+	) -> CbfSyncEngine {
 		use lightning::util::test_utils::TestStore;
 
 		use crate::chain::test_wallet::fresh_regtest_wallet;
@@ -1917,11 +2277,17 @@ mod tests {
 		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 		let wallet = fresh_regtest_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
-		let config = Arc::new(Config { network: bitcoin::Network::Regtest, ..Config::default() });
+		let config = Arc::new(Config {
+			network: bitcoin::Network::Regtest,
+			storage_dir_path,
+			..Config::default()
+		});
 		CbfSyncEngine::new(
 			Vec::new(),
 			1,
 			None,
+			source_mode,
+			filter_source,
 			None,
 			wallet,
 			kv_store,
@@ -1930,6 +2296,92 @@ mod tests {
 			Arc::new(RwLock::new(NodeMetrics::default())),
 		)
 		.expect("an engine that connects to nothing")
+	}
+
+	/// A fan-out whose one listener takes every block in order.
+	#[derive(Default)]
+	struct AcceptingFanout {
+		tip: Mutex<u32>,
+	}
+
+	impl ChainFanout for AcceptingFanout {
+		fn connect_block(&self, block: &bitcoin::Block, height: u32) {
+			self.connect_filtered(&block.header, height)
+		}
+		fn connect_filtered(&self, _header: &Header, height: u32) {
+			let mut tip = self.tip.lock().unwrap();
+			assert_eq!(*tip + 1, height, "blocks arrive in order");
+			*tip = height;
+		}
+		fn disconnect(&self, _header: &Header, height: u32) {
+			*self.tip.lock().unwrap() = height - 1;
+		}
+		fn take_divergence(&self) -> Option<String> {
+			None
+		}
+		fn record_stranded_listeners(&self, _tip_height: u32) -> bool {
+			false
+		}
+		fn set_bulk_chain_persistence(&self, _enabled: bool) {}
+		fn flush_chain_persistence(&self) -> Result<(), Error> {
+			Ok(())
+		}
+	}
+
+	/// `node` mode syncs to the source's tip through the real applicator and never builds
+	/// kyoto: no requester, no kyoto data directory, and the header, fee and `is_on_chain`
+	/// readers answer from the verified chain.
+	#[tokio::test]
+	async fn node_source_mode_syncs_without_ever_building_kyoto() {
+		use crate::chain::cbf::source_sync::test_support::FakeSource;
+
+		let dir = std::env::temp_dir().join(format!(
+			"ldk-node-cbf-node-mode-{}-{:?}",
+			std::process::id(),
+			Instant::now()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		let source = Arc::new(FakeSource::new(30, &[]));
+		let engine = engine_with(
+			CbfSource::Node,
+			Some(Arc::clone(&source) as Arc<dyn FilterSource>),
+			dir.to_string_lossy().into_owned(),
+		);
+		assert_eq!(SyncEngine::name(&engine), "cbf(node)");
+
+		let fanout = Arc::new(AcceptingFanout::default());
+		*fanout.tip.lock().unwrap() = 10;
+		let anchor = BlockId { height: 10, hash: source.block_at(10).block_hash() };
+		engine.launch_source(
+			&tokio::runtime::Handle::current(),
+			Arc::clone(&fanout),
+			anchor,
+			10,
+			None,
+		);
+
+		engine
+			.wait_until_synced_within(Duration::from_secs(20))
+			.await
+			.expect("synced from the node source");
+		assert_eq!(*fanout.tip.lock().unwrap(), 29);
+		assert_eq!(engine.sync_status(), CbfSyncStatus::Synced);
+
+		assert!(engine.requester().is_none(), "kyoto was never started");
+		assert!(matches!(*engine.runtime_status.lock().unwrap(), CbfRuntimeStatus::Stopped));
+		assert!(!dir.join("bip157_data").exists(), "kyoto never touched its data directory");
+		assert_eq!(
+			engine
+				.is_on_chain(&BlockId { height: 20, hash: source.block_at(20).block_hash() })
+				.await,
+			Some(true)
+		);
+		assert_eq!(engine.fee_source().tip_height().await, Ok(29));
+
+		engine.stop();
+		assert!(engine.source_run.lock().unwrap().is_none(), "stop() took the running sync");
+		assert_eq!(engine.sync_status(), CbfSyncStatus::Failed, "a stopped engine is not synced");
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	/// A foreground pass that can never catch up — kyoto not launched, no peers — gives up

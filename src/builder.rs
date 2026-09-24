@@ -8,6 +8,8 @@
 use crate::chain::adapters::bitcoind_raw::BitcoindRpcSource;
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::birthday::birthday_checkpoint;
+#[cfg(feature = "cbf")]
+use crate::chain::cbf::source::FilterSource;
 use crate::chain::provider::ChainDataProvider;
 use crate::chain::{ChainLayer, DEFAULT_ESPLORA_SERVER_URL};
 #[cfg(feature = "cbf")]
@@ -159,6 +161,20 @@ struct ChainProviderFallback(Arc<dyn ChainDataProvider>);
 impl std::fmt::Debug for ChainProviderFallback {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_tuple("ChainProviderFallback").field(&self.0.name()).finish()
+	}
+}
+
+/// The raw BIP157 source a filter-following node syncs from when
+/// [`CbfConfig::source`] names the node source; see
+/// [`NodeBuilder::set_cbf_filter_source`].
+#[cfg(feature = "cbf")]
+#[derive(Clone)]
+struct CbfFilterSource(Arc<dyn FilterSource>);
+
+#[cfg(feature = "cbf")]
+impl std::fmt::Debug for CbfFilterSource {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("CbfFilterSource").field(&self.0.name()).finish()
 	}
 }
 
@@ -334,6 +350,8 @@ pub struct NodeBuilder {
 	chain_data_source_config: Option<ChainDataSourceConfig>,
 	#[cfg(feature = "cbf")]
 	chain_provider_fallback: Option<ChainProviderFallback>,
+	#[cfg(feature = "cbf")]
+	cbf_filter_source: Option<CbfFilterSource>,
 	raw_chain_source_config: Option<RawChainSourceConfig>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
@@ -362,6 +380,8 @@ impl NodeBuilder {
 			chain_data_source_config,
 			#[cfg(feature = "cbf")]
 			chain_provider_fallback: None,
+			#[cfg(feature = "cbf")]
+			cbf_filter_source: None,
 			raw_chain_source_config: None,
 			gossip_source_config,
 			liquidity_source_config,
@@ -507,6 +527,32 @@ impl NodeBuilder {
 	) -> &mut Self {
 		self.chain_provider_fallback = Some(ChainProviderFallback(provider));
 		self
+	}
+
+	/// Supplies the raw BIP157/158 source a filter-following node syncs from
+	/// when [`CbfConfig::source`] is [`CbfSource::Node`] or
+	/// [`CbfSource::NodeThenP2p`] — typically the embedding app's client of
+	/// another Node device that serves raw chain data. Every header, filter
+	/// header, filter and block it returns is verified by this node before it
+	/// is applied.
+	///
+	/// A node-source mode without a filter source fails the build with
+	/// [`BuildError::ChainSourceSetupFailed`]; a filter source beside the
+	/// default [`CbfSource::P2p`] is ignored, and the build says so in the log.
+	///
+	/// [`CbfSource::Node`]: crate::config::CbfSource::Node
+	/// [`CbfSource::NodeThenP2p`]: crate::config::CbfSource::NodeThenP2p
+	/// [`CbfSource::P2p`]: crate::config::CbfSource::P2p
+	#[cfg(feature = "cbf")]
+	pub fn set_cbf_filter_source(&mut self, source: Arc<dyn FilterSource>) -> &mut Self {
+		self.cbf_filter_source = Some(CbfFilterSource(source));
+		self
+	}
+
+	/// The filter source to hand the build, if any.
+	#[cfg(feature = "cbf")]
+	fn cbf_filter_source(&self) -> Option<Arc<dyn FilterSource>> {
+		self.cbf_filter_source.as_ref().map(|source| Arc::clone(&source.0))
 	}
 
 	/// The fallback provider to hand the build, if any. Only a `cbf` build
@@ -906,6 +952,8 @@ impl NodeBuilder {
 			config,
 			self.chain_data_source_config.as_ref(),
 			self.chain_provider_fallback(),
+			#[cfg(feature = "cbf")]
+			self.cbf_filter_source(),
 			self.raw_chain_source_config.as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
@@ -931,6 +979,8 @@ impl NodeBuilder {
 			config,
 			self.chain_data_source_config.as_ref(),
 			self.chain_provider_fallback(),
+			#[cfg(feature = "cbf")]
+			self.cbf_filter_source(),
 			self.raw_chain_source_config.as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
@@ -1080,6 +1130,16 @@ impl ArcedNodeBuilder {
 	#[cfg(feature = "cbf")]
 	pub fn set_chain_provider_fallback(&self, provider: Arc<dyn ChainDataProvider>) {
 		self.inner.write().unwrap().set_chain_provider_fallback(provider);
+	}
+
+	/// Supplies the raw BIP157/158 source a filter-following node syncs from;
+	/// see [`NodeBuilder::set_cbf_filter_source`].
+	///
+	/// Rust-only: a [`FilterSource`] is not a bindings type, so this is not in
+	/// the UDL.
+	#[cfg(feature = "cbf")]
+	pub fn set_cbf_filter_source(&self, source: Arc<dyn FilterSource>) {
+		self.inner.write().unwrap().set_cbf_filter_source(source);
 	}
 
 	/// Serve raw BIP157/158 data read from a bitcoind's JSON-RPC; see
@@ -1348,6 +1408,7 @@ fn seed_wallet_at_birthday(
 fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	chain_provider_fallback: Option<Arc<dyn ChainDataProvider>>,
+	#[cfg(feature = "cbf")] cbf_filter_source: Option<Arc<dyn FilterSource>>,
 	raw_chain_source_config: Option<&RawChainSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
@@ -1586,6 +1647,7 @@ fn build_with_store_internal(
 				peers.clone(),
 				cbf_config.clone(),
 				chain_provider_fallback,
+				cbf_filter_source,
 				Arc::clone(&wallet),
 				Arc::clone(&fee_estimator),
 				Arc::clone(&tx_broadcaster),

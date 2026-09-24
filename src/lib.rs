@@ -131,7 +131,7 @@ pub use chain::{
 	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
 };
 #[cfg(feature = "cbf")]
-pub use config::{CbfConfig, CbfExternalFee};
+pub use config::{CbfConfig, CbfExternalFee, CbfSource};
 pub use error::Error as NodeError;
 use error::Error;
 

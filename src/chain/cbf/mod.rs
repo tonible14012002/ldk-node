@@ -19,7 +19,9 @@ pub(crate) mod applicator;
 pub(crate) mod birthday;
 pub(crate) mod fee;
 pub(crate) mod fee_sampler;
+pub(crate) mod header_verify;
 pub mod source;
+pub(crate) mod source_sync;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;

@@ -598,6 +598,11 @@ impl ChainLayer {
 	/// * UTXO = the existence-only source over the filters when
 	///   `cbf_config.utxo_source` asks for it; none otherwise.
 	///
+	/// `cbf_config.source` picks where headers, filters and blocks come from:
+	/// kyoto over P2P, or `filter_source` — required then — with or without
+	/// kyoto as its fallback. The P2P broadcast adapter needs kyoto running,
+	/// so on a node source it passes to the provider.
+	///
 	/// `wallet_birthday_height` floors the resume checkpoint here; the builder
 	/// seeds a fresh wallet, `ChannelManager` and sweeper at the same anchor.
 	/// `fallback` is the provider a hybrid node borrows from, set through
@@ -606,9 +611,10 @@ impl ChainLayer {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_cbf(
 		peers: Vec<String>, cbf_config: CbfConfig, fallback: Option<Arc<dyn ChainDataProvider>>,
-		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+		filter_source: Option<Arc<dyn FilterSource>>, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Result<Self, Error> {
 		let mut fee: Vec<Arc<dyn FeeAction>> = Vec::new();
 		let mut external_electrum = None;
@@ -641,6 +647,8 @@ impl ChainLayer {
 			peers,
 			cbf_config.required_peers,
 			cbf_config.wallet_birthday_height,
+			cbf_config.source,
+			filter_source,
 			external_electrum,
 			onchain_wallet,
 			Arc::clone(&kv_store),
@@ -2487,6 +2495,14 @@ mod tests {
 	fn cbf_layer(
 		peers: Vec<String>, cbf_config: CbfConfig, fallback: Option<Arc<dyn ChainDataProvider>>,
 	) -> Result<ChainLayer, Error> {
+		cbf_layer_with_source(peers, cbf_config, fallback, None)
+	}
+
+	#[cfg(feature = "cbf")]
+	fn cbf_layer_with_source(
+		peers: Vec<String>, cbf_config: CbfConfig, fallback: Option<Arc<dyn ChainDataProvider>>,
+		filter_source: Option<Arc<dyn FilterSource>>,
+	) -> Result<ChainLayer, Error> {
 		let logger = Arc::new(Logger::new_log_facade());
 		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
 		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
@@ -2497,6 +2513,7 @@ mod tests {
 			peers,
 			cbf_config,
 			fallback,
+			filter_source,
 			wallet,
 			fee_estimator,
 			broadcaster,
@@ -2567,6 +2584,38 @@ mod tests {
 			.err()
 			.expect("a peer without a port is refused");
 		assert_eq!(err, Error::InvalidSocketAddress);
+	}
+
+	/// The node filter sources: the engine names the source in the slot view,
+	/// and asking for one without supplying it is a setup failure.
+	#[cfg(feature = "cbf")]
+	#[test]
+	fn new_cbf_on_a_node_source_names_it_and_requires_it() {
+		use crate::chain::raw_serve::MockFilterSource;
+		use crate::config::CbfSource;
+
+		let source: Arc<dyn FilterSource> = Arc::new(MockFilterSource::new(3, 10));
+		let node = CbfConfig { source: CbfSource::Node, ..CbfConfig::default() };
+		let layer =
+			cbf_layer_with_source(Vec::new(), node.clone(), None, Some(Arc::clone(&source)))
+				.expect("a node source was supplied");
+		assert_eq!(layer.slot_adapters().engine, "cbf(node)");
+		assert_eq!(layer.slot_status().engine, "cbf(node)");
+
+		let both = CbfConfig { source: CbfSource::NodeThenP2p, ..CbfConfig::default() };
+		let layer = cbf_layer_with_source(Vec::new(), both.clone(), None, Some(source))
+			.expect("a node source was supplied");
+		assert_eq!(layer.slot_adapters().engine, "cbf(node)", "the node source leads");
+
+		for config in [node, both] {
+			assert!(
+				cbf_layer_with_source(Vec::new(), config, None, None).is_err(),
+				"a node source mode without a filter source is refused"
+			);
+		}
+		// The default stays P2P, under the engine name it always had.
+		let layer = cbf_layer(Vec::new(), CbfConfig::default(), None).unwrap();
+		assert_eq!(layer.slot_adapters().engine, "cbf");
 	}
 
 	/// The Electrum preset fills MEMPOOL with its own server and says it may

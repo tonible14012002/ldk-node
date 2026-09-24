@@ -195,6 +195,7 @@ impl Default for Config {
 /// | `external_fee`            | None   |
 /// | `utxo_source`             | false  |
 /// | `required_peers`          | 1      |
+/// | `source`                  | P2p    |
 #[cfg(feature = "cbf")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CbfConfig {
@@ -215,6 +216,12 @@ pub struct CbfConfig {
 	pub utxo_source: bool,
 	/// Number of peers that must agree on filter headers before they are accepted.
 	pub required_peers: u8,
+	/// Where the headers, filter headers, filters and blocks come from: the Bitcoin P2P
+	/// network (the default), a node source supplied through
+	/// [`NodeBuilder::set_cbf_filter_source`], or the node source with P2P as its fallback.
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	pub source: CbfSource,
 }
 
 #[cfg(feature = "cbf")]
@@ -225,7 +232,42 @@ impl Default for CbfConfig {
 			external_fee: None,
 			utxo_source: false,
 			required_peers: DEFAULT_CBF_REQUIRED_PEERS,
+			source: CbfSource::default(),
 		}
+	}
+}
+
+/// Where a compact-block-filter node gets its raw chain data from.
+///
+/// Whatever the source, every header, filter header, filter and block is verified by this
+/// node before it is applied; the source can withhold data, not make the node accept a chain
+/// that is not valid.
+#[cfg(feature = "cbf")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CbfSource {
+	/// The Bitcoin P2P network, through kyoto: the trusted peers configured with the chain
+	/// source, or the DNS seeds.
+	#[default]
+	P2p,
+	/// Only the filter source given to [`NodeBuilder::set_cbf_filter_source`] — typically
+	/// another Node device serving raw BIP157 data. Kyoto is never built and the node opens no
+	/// Bitcoin P2P connection. Building without a filter source fails.
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	Node,
+	/// The filter source first; if it stays unavailable for five minutes, the node falls back
+	/// to the P2P network for the rest of the run. Building without a filter source fails.
+	NodeThenP2p,
+}
+
+#[cfg(feature = "cbf")]
+impl CbfSource {
+	/// Whether this source needs the filter source given to
+	/// [`NodeBuilder::set_cbf_filter_source`].
+	///
+	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
+	pub fn uses_node_source(&self) -> bool {
+		matches!(self, Self::Node | Self::NodeThenP2p)
 	}
 }
 

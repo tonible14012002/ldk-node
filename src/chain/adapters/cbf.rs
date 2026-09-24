@@ -1139,6 +1139,8 @@ mod tests {
 			Vec::new(),
 			1,
 			None,
+			crate::config::CbfSource::P2p,
+			None,
 			None,
 			wallet,
 			kv_store,
