@@ -33,7 +33,8 @@ use bdk_chain::local_chain::CheckPoint;
 use bdk_chain::BlockId;
 
 use bitcoin::block::Header;
-use bitcoin::Txid;
+use bitcoin::blockdata::constants::genesis_block;
+use bitcoin::{Network, Txid};
 
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::BestBlock;
@@ -262,15 +263,49 @@ pub(crate) fn choose_resume_anchor(
 	}
 }
 
+/// Lets a wallet on a test network with nothing to anchor on resume from genesis.
+///
+/// The "never genesis" rule exists because a mainnet filter scan from block 1 takes days on a
+/// small device, and mainnet has compiled birthday anchors to stand in. No other network has
+/// any ([`birthday_checkpoint`] is mainnet-only), so without this a fresh regtest, signet or
+/// testnet wallet — whose chain is rooted at genesis and whose birthday resolves to nothing —
+/// could never start at all. Those chains are short or cheap to scan, and correctness wins
+/// there; mainnet keeps refusing.
+///
+/// [`birthday_checkpoint`]: birthday::birthday_checkpoint
+pub(crate) fn genesis_off_mainnet(
+	chosen: Result<HashCheckpoint, ResumeRefusal>, network: Network,
+) -> Result<HashCheckpoint, ResumeRefusal> {
+	match chosen {
+		Err(ResumeRefusal::NoAnchor { .. }) if network != Network::Bitcoin => {
+			Ok(HashCheckpoint::new(0, genesis_block(network).block_hash()))
+		},
+		other => other,
+	}
+}
+
 /// The checkpoint kyoto resumes from: the wallet's own anchor, lifted to the birthday when
-/// that is higher, and never genesis — see [`choose_resume_anchor`].
+/// that is higher, and never genesis on mainnet — see [`choose_resume_anchor`] and
+/// [`genesis_off_mainnet`].
 pub(crate) fn resume_checkpoint(
 	logger: &Logger, chain_listener: &ChainListener, birthday: Option<HashCheckpoint>,
+	network: Network,
 ) -> Result<HashCheckpoint, ResumeRefusal> {
 	let min_best_block = chain_listener.get_best_block();
 	let bdk_cp = chain_listener.onchain_wallet.latest_checkpoint();
 	let derived = derived_resume_anchor(logger, bdk_cp, &min_best_block);
-	let chosen = choose_resume_anchor(derived, birthday, min_best_block.height)?;
+	let chosen = genesis_off_mainnet(
+		choose_resume_anchor(derived, birthday, min_best_block.height),
+		network,
+	)?;
+	if chosen.height == 0 {
+		log_info!(
+			logger,
+			"CBF resume: nothing to anchor on and no birthday on {}; scanning from genesis.",
+			network,
+		);
+		return Ok(chosen);
+	}
 	if derived != Some(chosen) {
 		log_info!(
 			logger,
@@ -554,6 +589,34 @@ mod tests {
 		assert_eq!(
 			choose_resume_anchor(None, None, 900_000),
 			Err(ResumeRefusal::NoAnchor { listener_height: 900_000 })
+		);
+	}
+
+	#[test]
+	fn a_fresh_wallet_off_mainnet_resumes_from_genesis() {
+		// Regtest, signet and testnet have no compiled birthday anchors, so a fresh wallet
+		// there has nothing but genesis; it scans from it rather than never starting.
+		for network in [Network::Regtest, Network::Signet, Network::Testnet, Network::Testnet4] {
+			let genesis = HashCheckpoint::new(0, genesis_block(network).block_hash());
+			assert_eq!(
+				genesis_off_mainnet(choose_resume_anchor(None, None, 0), network),
+				Ok(genesis)
+			);
+			// An anchor the wallet does offer is still used.
+			assert_eq!(
+				genesis_off_mainnet(choose_resume_anchor(Some(cp(50)), None, 100), network),
+				Ok(cp(50))
+			);
+		}
+		// Mainnet keeps refusing: a scan from genesis there takes days.
+		assert_eq!(
+			genesis_off_mainnet(choose_resume_anchor(None, None, 0), Network::Bitcoin),
+			Err(ResumeRefusal::NoAnchor { listener_height: 0 })
+		);
+		// A birthday above the listener is a configuration error on any network.
+		assert_eq!(
+			genesis_off_mainnet(choose_resume_anchor(None, Some(cp(90)), 10), Network::Regtest),
+			Err(ResumeRefusal::BirthdayAboveListener { birthday_height: 90, listener_height: 10 })
 		);
 	}
 

@@ -163,7 +163,8 @@ struct KyotoParams {
 
 impl KyotoParams {
 	fn build(&self, listener: &ChainListener) -> Result<(KyotoNode, Client), ResumeRefusal> {
-		let checkpoint = resume_checkpoint(&self.logger, listener, self.birthday)?;
+		let checkpoint =
+			resume_checkpoint(&self.logger, listener, self.birthday, self.config.network)?;
 
 		let data_dir = PathBuf::from(&self.config.storage_dir_path).join("bip157_data");
 		let mut kyoto_builder =
@@ -329,7 +330,12 @@ impl CbfSyncEngine {
 	/// the log says what to configure.
 	fn launch(&self, runtime: Arc<tokio::runtime::Runtime>, listener: Arc<ChainListener>) {
 		if self.source_mode.uses_node_source() {
-			let anchor = match resume_checkpoint(&self.logger, &listener, self.kyoto.birthday) {
+			let anchor = match resume_checkpoint(
+				&self.logger,
+				&listener,
+				self.kyoto.birthday,
+				self.config.network,
+			) {
 				Ok(checkpoint) => BlockId { height: checkpoint.height, hash: checkpoint.hash },
 				Err(refusal) => {
 					log_error!(self.logger, "CBF sync cannot start: {}", refusal);
