@@ -30,7 +30,7 @@ use bdk_electrum::BdkElectrumClient;
 
 use electrum_client::Client as ElectrumClient;
 use electrum_client::ConfigBuilder as ElectrumConfigBuilder;
-use electrum_client::{Batch, ElectrumApi};
+use electrum_client::{Batch, ElectrumApi, GetHistoryRes};
 
 use bitcoin::{BlockHash, FeeRate, Network, OutPoint, Script, ScriptBuf, Transaction, Txid};
 
@@ -45,11 +45,79 @@ use crate::chain::wire_convert::{
 	sync_response_to_wire, tx_to_wire, txid_from_wire, wire_to_sync_request,
 };
 
-use std::collections::HashMap;
+use bdk_chain::BlockId;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BDK_ELECTRUM_CLIENT_BATCH_SIZE: usize = 5;
+
+/// How many scripts one `blockchain.scripthash.get_history` batch carries when a mempool
+/// view is read. A served question may carry thousands; a batch this size is one JSON-RPC
+/// round trip a server with a batch cap (Fulcrum's default is 100) still takes whole.
+const ELECTRUM_MEMPOOL_BATCH_SIZE: usize = 100;
+
+/// The mempool as an Electrum server shows it for a set of scripts, plus the fate of the
+/// asker's own unconfirmed transactions, taken at `tip`.
+pub(crate) struct ElectrumMempoolView {
+	/// Every unconfirmed transaction paying to or spending from one of the scripts.
+	pub(crate) unconfirmed: Vec<Transaction>,
+	/// Asker-known unconfirmed transactions the server no longer shows anywhere.
+	pub(crate) evicted: Vec<Txid>,
+	/// The server's header tip when the view was taken.
+	pub(crate) tip: BlockId,
+}
+
+/// The unconfirmed and the confirmed transactions across the histories of the requested
+/// scripts, deduplicated: a transaction paying two watched scripts is listed under both.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MempoolHistory {
+	/// In first-seen order across the histories.
+	pub(crate) unconfirmed: Vec<Txid>,
+	pub(crate) confirmed: HashSet<Txid>,
+}
+
+/// Split script histories into their unconfirmed and confirmed transactions.
+///
+/// `blockchain.scripthash.get_history` returns both — the protocol defines it as "the
+/// confirmed and unconfirmed history of a script hash" — so one call answers the mempool
+/// question and the eviction rule together. Electrum reports height 0 for unconfirmed and -1
+/// for unconfirmed with unconfirmed parents; both are the mempool.
+pub(crate) fn split_histories<'a>(
+	entries: impl IntoIterator<Item = &'a GetHistoryRes>,
+) -> MempoolHistory {
+	let mut history = MempoolHistory::default();
+	let mut seen_unconfirmed = HashSet::new();
+	for entry in entries {
+		if entry.height <= 0 {
+			if seen_unconfirmed.insert(entry.tx_hash) {
+				history.unconfirmed.push(entry.tx_hash);
+			}
+		} else {
+			history.confirmed.insert(entry.tx_hash);
+		}
+	}
+	history
+}
+
+/// The asker's known-unconfirmed transactions the server shows neither in the mempool nor
+/// confirmed, for the requested scripts, in the asker's order.
+///
+/// A transaction that confirmed is not evicted: it left the mempool by the front door, and
+/// the asker's own chain sync reports the block. A transaction still in the mempool is not
+/// evicted. Anything else — replaced, expired, never accepted — is gone, and the asker's
+/// wallet should have its inputs back.
+pub(crate) fn evicted_txids(
+	known_unconfirmed: &[Txid], unconfirmed: &[Txid], confirmed: &HashSet<Txid>,
+) -> Vec<Txid> {
+	let in_mempool: HashSet<&Txid> = unconfirmed.iter().collect();
+	known_unconfirmed
+		.iter()
+		.filter(|txid| !in_mempool.contains(txid) && !confirmed.contains(*txid))
+		.copied()
+		.collect()
+}
 pub(crate) const ELECTRUM_CLIENT_NUM_RETRIES: u8 = 3;
 pub(crate) const ELECTRUM_CLIENT_TIMEOUT_SECS: u8 = 20;
 
@@ -438,6 +506,27 @@ impl ElectrumRuntimeClient {
 		Ok(new_fee_rate_cache)
 	}
 
+	/// The mempool for `scripts`, and the fate of `known_unconfirmed`, as the server shows
+	/// them now: the MEMPOOL slot's answer over this client.
+	///
+	/// Electrum indexes the mempool by script, which is exactly the shape of the question,
+	/// so the whole answer is a batched history read per script chunk plus one transaction
+	/// fetch for what turned up unconfirmed. Assembled on one `spawn_blocking` thread, like
+	/// the served answers, since every Electrum call blocks.
+	pub(crate) async fn mempool_view(
+		&self, scripts: Vec<ScriptBuf>, known_unconfirmed: Vec<Txid>,
+	) -> Result<ElectrumMempoolView, Error> {
+		let electrum_client = Arc::clone(&self.electrum_client);
+		let logger = Arc::clone(&self.logger);
+		let spawn_fut = self.runtime.spawn_blocking(move || {
+			mempool_view_blocking(&electrum_client, &logger, scripts, known_unconfirmed)
+		});
+		spawn_fut.await.map_err(|e| {
+			log_error!(self.logger, "Reading a mempool view could not run: {}", e);
+			Error::WalletOperationFailed
+		})?
+	}
+
 	// ── serving a Dependent node ─────────────────────────────────────────────
 
 	/// Run a Dependent node's on-chain scan against this node's Electrum
@@ -700,11 +789,103 @@ fn confirmed_tx_entry(
 	}))
 }
 
+/// The blocking half of [`ElectrumRuntimeClient::mempool_view`].
+///
+/// The tip first, so everything else is reported relative to a tip that is not ahead of it.
+/// Then the histories, chunked so a served question of thousands of scripts is several
+/// round trips rather than one a server may refuse. Then the unconfirmed transactions
+/// themselves, in one batch: the mempool relevant to one asker is a handful. A transaction
+/// that left the mempool between the two reads fails the fetch and the whole view with it —
+/// the next tick asks again — rather than answering with a hole in it.
+fn mempool_view_blocking(
+	electrum_client: &ElectrumClient, logger: &Logger, scripts: Vec<ScriptBuf>,
+	known_unconfirmed: Vec<Txid>,
+) -> Result<ElectrumMempoolView, Error> {
+	let chain_failed = |what: &str, e: electrum_client::Error| {
+		log_error!(logger, "Reading a mempool view failed ({}): {}", what, e);
+		Error::WalletOperationFailed
+	};
+
+	let tip = electrum_client
+		.block_headers_subscribe()
+		.map_err(|e| chain_failed("reading the tip", e))?;
+	let tip = BlockId { height: tip.height as u32, hash: tip.header.block_hash() };
+
+	let mut histories = Vec::with_capacity(scripts.len());
+	for chunk in scripts.chunks(ELECTRUM_MEMPOOL_BATCH_SIZE) {
+		histories.extend(
+			electrum_client
+				.batch_script_get_history(chunk.iter().map(|s| s.as_script()))
+				.map_err(|e| chain_failed("reading script histories", e))?,
+		);
+	}
+	let MempoolHistory { unconfirmed, confirmed } = split_histories(histories.iter().flatten());
+	let evicted = evicted_txids(&known_unconfirmed, &unconfirmed, &confirmed);
+
+	let unconfirmed = if unconfirmed.is_empty() {
+		Vec::new()
+	} else {
+		electrum_client
+			.batch_transaction_get(unconfirmed.iter())
+			.map_err(|e| chain_failed("fetching unconfirmed transactions", e))?
+	};
+
+	Ok(ElectrumMempoolView { unconfirmed, evicted, tip })
+}
+
 impl Filter for ElectrumRuntimeClient {
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
 		self.tx_sync.register_tx(txid, script_pubkey)
 	}
 	fn register_output(&self, output: WatchedOutput) {
 		self.tx_sync.register_output(output)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use bitcoin::hashes::Hash;
+
+	fn txid(seed: u8) -> Txid {
+		Txid::from_byte_array([seed; 32])
+	}
+
+	fn entry(height: i32, seed: u8) -> GetHistoryRes {
+		GetHistoryRes { height, tx_hash: txid(seed), fee: None }
+	}
+
+	/// The protocol's one history call carries both halves of the answer: 0 and -1 are the
+	/// mempool, anything positive is confirmed, and a transaction under two watched scripts
+	/// is listed once.
+	#[test]
+	fn split_histories_separates_the_mempool_from_the_chain_and_deduplicates() {
+		let script_a = vec![entry(0, 1), entry(-1, 2), entry(800_000, 3)];
+		let script_b = vec![entry(0, 1), entry(800_001, 4), entry(-1, 5)];
+		let histories = vec![script_a, script_b];
+
+		let history = split_histories(histories.iter().flatten());
+
+		assert_eq!(history.unconfirmed, vec![txid(1), txid(2), txid(5)], "first-seen order, once");
+		assert_eq!(history.confirmed, [txid(3), txid(4)].into_iter().collect());
+
+		let empty: Vec<Vec<GetHistoryRes>> = Vec::new();
+		assert_eq!(split_histories(empty.iter().flatten()), MempoolHistory::default());
+	}
+
+	/// Evicted is what the asker knows and the server no longer shows at all: not in the
+	/// mempool, not confirmed.
+	#[test]
+	fn evicted_is_known_and_absent_from_both_mempool_and_chain() {
+		let known = [txid(1), txid(2), txid(3), txid(4)];
+		let unconfirmed = [txid(2), txid(9)];
+		let confirmed: HashSet<Txid> = [txid(3)].into_iter().collect();
+
+		let evicted = evicted_txids(&known, &unconfirmed, &confirmed);
+
+		assert_eq!(evicted, vec![txid(1), txid(4)], "still in the mempool or confirmed: kept");
+		assert!(evicted_txids(&[], &unconfirmed, &confirmed).is_empty());
+		assert_eq!(evicted_txids(&known, &[], &HashSet::new()), known.to_vec());
 	}
 }

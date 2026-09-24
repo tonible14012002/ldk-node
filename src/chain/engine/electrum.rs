@@ -247,6 +247,16 @@ impl SyncEngine for ElectrumSyncEngine {
 		Some(&self.onchain_wallet)
 	}
 
+	/// The MEMPOOL chain over this engine is its own Electrum server, whose
+	/// script index carries the mempool: an answer from it is this node's own
+	/// view, not a forwarded one, so another node may be served from it. The
+	/// engine's own sync never asks the chain — the transaction sync carries
+	/// unconfirmed transactions itself — so serving costs the local sync
+	/// nothing.
+	fn serves_mempool(&self) -> bool {
+		true
+	}
+
 	fn start(&self, runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
 		self.electrum_runtime_status.write().unwrap().start(
 			self.server_url.clone(),

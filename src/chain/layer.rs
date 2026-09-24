@@ -333,8 +333,13 @@ impl ChainLayer {
 		});
 
 		// Electrum exposes no UTXO-set lookup, so channel announcements cannot
-		// be verified against one. Its sync carries the mempool itself.
-		let slots = Self::slots_for_single_adapter(adapter, Vec::new(), None, &logger);
+		// be verified against one. Its sync carries the mempool itself, so the
+		// MEMPOOL chain is never run for this node — it is filled so the node
+		// can *serve* mempool views to one that follows the chain by filters
+		// and has none: the server indexes the mempool by script, which is the
+		// shape of the question.
+		let mempool = vec![Arc::clone(&adapter) as Arc<dyn MempoolAction>];
+		let slots = Self::slots_for_single_adapter(adapter, mempool, None, &logger);
 
 		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
 	}
@@ -2008,5 +2013,43 @@ mod tests {
 			.err()
 			.expect("a peer without a port is refused");
 		assert_eq!(err, Error::InvalidSocketAddress);
+	}
+
+	/// The Electrum preset fills MEMPOOL with its own server and says it may
+	/// be served from, so a filter-following node can borrow the view. Its
+	/// engine never runs the chain itself, and serving before the chain
+	/// source is started is a failure, never an empty answer.
+	#[tokio::test]
+	async fn new_electrum_serves_its_own_mempool() {
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
+		let layer = ChainLayer::new_electrum(
+			"tcp://127.0.0.1:1".into(),
+			ElectrumSyncConfig::default(),
+			wallet,
+			fee_estimator,
+			broadcaster,
+			kv_store,
+			config,
+			logger,
+			Arc::new(RwLock::new(NodeMetrics::default())),
+		);
+
+		let slots = layer.slot_adapters();
+		assert_eq!(slots.engine, "electrum-tx-sync");
+		assert_eq!(slots.mempool, vec!["electrum"]);
+		assert!(layer.engine.serves_mempool());
+		assert!(!layer.engine.tracks_own_broadcasts(), "its sync sees its own transactions");
+
+		let req = WireMempoolRequest {
+			version: CHAIN_WIRE_VERSION,
+			spks: vec![script_to_wire(&someone_elses_script())],
+			known_unconfirmed: Vec::new(),
+		};
+		assert!(matches!(layer.serve_mempool(&req).await, Err(Error::ChainServeFailed)));
 	}
 }

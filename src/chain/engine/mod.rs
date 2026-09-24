@@ -204,9 +204,11 @@ pub(crate) trait SyncEngine: Send + Sync {
 	///
 	/// Defaults to refusing, for the reason [`SyncEngine::serve_wallet_sync`]
 	/// does: a chain filled from a provider would forward another node's
-	/// question to a third node. Only the block-polling engine, whose chain
-	/// is its own bitcoind, answers `true`; a transaction-based engine's
-	/// chain is empty and a Dependent node's is its provider.
+	/// question to a third node. The engines whose chain is their own chain
+	/// source answer `true`: the block-polling engine over its bitcoind, and
+	/// the Electrum engine over its server, which indexes the mempool by
+	/// script. The Esplora engine's chain is empty and a Dependent node's is
+	/// its provider.
 	fn serves_mempool(&self) -> bool {
 		false
 	}
