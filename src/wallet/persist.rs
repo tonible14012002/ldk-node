@@ -13,7 +13,6 @@ use crate::io::utils::{
 use crate::logger::{log_error, LdkLogger, Logger};
 use crate::types::DynStore;
 
-use bdk_chain::local_chain::ChangeSet as LocalChainChangeSet;
 use bdk_chain::Merge;
 use bdk_wallet::{ChangeSet, WalletPersister};
 
@@ -26,9 +25,14 @@ pub(crate) struct KVStoreWalletPersister {
 	/// While set, `local_chain` changes are merged into the in-memory aggregate but not written
 	/// to the KV store. See [`Self::set_defer_local_chain`].
 	defer_local_chain: bool,
-	/// The `local_chain` changes merged into `latest_change_set` while deferred and not yet
-	/// written. Non-empty exactly when the persisted chain lags the in-memory one.
-	pending_local_chain: LocalChainChangeSet,
+	/// Whether a `local_chain` change was merged into `latest_change_set` while deferred and
+	/// has not been written since. Set exactly when the persisted chain lags the in-memory one.
+	///
+	/// A flag, not the deferred changes themselves: what gets written is always the full
+	/// aggregate in `latest_change_set`, so the changes need not be kept a second time — and a
+	/// scan of the whole chain would otherwise accumulate every checkpoint it applied in memory
+	/// until the next flush.
+	local_chain_dirty: bool,
 }
 
 impl KVStoreWalletPersister {
@@ -38,7 +42,7 @@ impl KVStoreWalletPersister {
 			kv_store,
 			logger,
 			defer_local_chain: false,
-			pending_local_chain: LocalChainChangeSet::default(),
+			local_chain_dirty: false,
 		}
 	}
 
@@ -71,14 +75,14 @@ impl KVStoreWalletPersister {
 	/// Whether `local_chain` changes are being held back from the KV store.
 	#[cfg(test)]
 	pub(crate) fn has_pending_local_chain(&self) -> bool {
-		!self.pending_local_chain.is_empty()
+		self.local_chain_dirty
 	}
 
 	/// Writes the in-memory `local_chain` aggregate once if any change was deferred.
 	// Reached through `Wallet::flush_chain_persistence` from the filter-driven engine.
 	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn flush_local_chain(&mut self) -> Result<(), std::io::Error> {
-		if self.pending_local_chain.is_empty() {
+		if !self.local_chain_dirty {
 			return Ok(());
 		}
 
@@ -94,7 +98,7 @@ impl KVStoreWalletPersister {
 			Arc::clone(&self.kv_store),
 			Arc::clone(&self.logger),
 		)?;
-		self.pending_local_chain = LocalChainChangeSet::default();
+		self.local_chain_dirty = false;
 		Ok(())
 	}
 }
@@ -247,7 +251,7 @@ impl WalletPersister for KVStoreWalletPersister {
 				// Merged in memory only; `flush_local_chain` writes the aggregate later. A crash
 				// before that flush leaves an older persisted chain tip behind a fully persisted
 				// transaction graph, which the next sync heals by replaying the missing blocks.
-				persister.pending_local_chain.merge(change_set.local_chain.clone());
+				persister.local_chain_dirty = true;
 			} else {
 				write_bdk_wallet_local_chain(
 					&latest_change_set.local_chain,
@@ -255,7 +259,7 @@ impl WalletPersister for KVStoreWalletPersister {
 					Arc::clone(&persister.logger),
 				)?;
 				// The aggregate just written includes anything deferred earlier.
-				persister.pending_local_chain = LocalChainChangeSet::default();
+				persister.local_chain_dirty = false;
 			}
 		}
 

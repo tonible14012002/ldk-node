@@ -1032,10 +1032,15 @@ impl ChainLayer {
 		self.observe_tx(txid, script_pubkey).await
 	}
 
-	/// The shared on-chain fee estimator (Peerswap native primitive B6).
-	#[cfg(feature = "swaps")]
+	/// The shared on-chain fee estimator (Peerswap native primitive B6; also what a chain
+	/// listener hands a channel monitor it rewinds on its own).
 	pub(crate) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
 		&self.shared.fee_estimator
+	}
+
+	/// The shared transaction broadcaster, for the same listener use.
+	pub(crate) fn tx_broadcaster(&self) -> &Arc<Broadcaster> {
+		&self.shared.tx_broadcaster
 	}
 }
 

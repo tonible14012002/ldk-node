@@ -5,14 +5,15 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use crate::fee_estimator::OnchainFeeEstimator;
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, Sweeper, Wallet};
+use crate::types::{Broadcaster, ChainMonitor, ChannelManager, Sweeper, Wallet};
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use bitcoin::block::Header;
 use bitcoin::{BlockHash, FeeRate, Transaction, Txid};
-use lightning::chain::transaction::TransactionData;
+use lightning::chain::transaction::{OutPoint, TransactionData};
 use lightning::chain::{BestBlock, Listen};
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_block_sync::http::{HttpEndpoint, JsonResponse};
@@ -972,11 +973,21 @@ impl Cache for BoundedHeaderCache {
 /// way. The `gated_*` methods are for a filter-driven engine that resumes from the minimum
 /// listener height and therefore replays blocks to listeners already ahead; they decide per
 /// listener whether a block may be handed over, and record what they could not decide.
+///
+/// The channel monitors are gated one by one, not as the `ChainMonitor` they live in: the
+/// `ChainMonitor` has no tip of its own, and after a restart its monitors sit at different
+/// heights by design (chain-sync persistence is staggered per channel). See
+/// [`MonitorGate`] for the connect side and [`Self::gated_block_disconnected`] for the rewind.
 pub(crate) struct ChainListener {
 	pub(crate) onchain_wallet: Arc<Wallet>,
 	pub(crate) channel_manager: Arc<ChannelManager>,
 	pub(crate) chain_monitor: Arc<ChainMonitor>,
 	pub(crate) output_sweeper: Arc<Sweeper>,
+	/// What a channel monitor rewound on its own (rather than through the `ChainMonitor`) needs
+	/// to re-evaluate its claims: the same broadcaster and fee estimator the `ChainMonitor`
+	/// would hand it.
+	pub(crate) tx_broadcaster: Arc<Broadcaster>,
+	pub(crate) fee_estimator: Arc<OnchainFeeEstimator>,
 	pub(crate) logger: Arc<Logger>,
 	/// Records the first listener divergence seen since the last drain.
 	///
@@ -991,7 +1002,112 @@ pub(crate) struct ChainListener {
 	/// *reconnects* to the chain (benign — the resume-from-minimum design), and a listener the
 	/// replay can never reach at all (stranded on a fork). See
 	/// [`ChainListener::record_stranded_listeners`].
-	pub(crate) replay_batch: Arc<Mutex<BTreeMap<&'static str, ReplayTally>>>,
+	///
+	/// Keyed by listener name; channel monitors are named by funding outpoint, so each one is
+	/// judged on its own.
+	pub(crate) replay_batch: Arc<Mutex<BTreeMap<String, ReplayTally>>>,
+	/// Every channel monitor's persisted tip as it stood when this gated fan-out was created,
+	/// each held until the replay proves or refutes it. Empty on the ungated `Listen` path.
+	pub(crate) monitor_gate: Mutex<MonitorGate>,
+}
+
+/// One channel monitor's tip as it was persisted, held until the replay reaches it.
+///
+/// The `ChainMonitor` hands every block to every monitor it holds and each monitor overwrites
+/// its own tip with it, whatever the monitor's tip was. So once the first replayed block is
+/// delivered, a monitor's live tip says nothing about where it had actually got to — only a
+/// copy taken before the first delivery does. That copy is what the replay is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonitorSnapshot {
+	/// The name the monitor is tallied and reported under.
+	pub(crate) name: String,
+	/// The monitor's persisted tip at the time of the snapshot.
+	pub(crate) best: BestBlock,
+}
+
+/// What one replayed block proved about one snapshotted monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonitorDecision {
+	pub(crate) snapshot: MonitorSnapshot,
+	pub(crate) action: ListenerAction,
+}
+
+/// The per-monitor half of the `ChainMonitor` connect gate, over plain data so it can be
+/// driven without a `ChannelMonitor`.
+///
+/// Holds a [`MonitorSnapshot`] per channel monitor that existed when the fan-out was created.
+/// Each replayed block is classified against every live snapshot with [`listener_action`]: a
+/// block at the snapshot's own height with a different hash, or at the next height with a
+/// different parent, refutes the snapshot (`Diverged`); a block at its height with the same
+/// hash, or at the next height with it as the parent, proves it, and the snapshot is retired —
+/// from then on the monitor moves in lockstep with the `ChainMonitor` and its live tip is the
+/// truth again. A block below the snapshot cannot be checked ([`ListenerAction::ReplayUnprovable`])
+/// and is tallied for the tip-boundary verdict like any other listener's.
+///
+/// A monitor added while the engine runs (a channel opened after start) takes its tip from the
+/// `ChannelManager` at creation, which this fan-out is already proving through the manager's own
+/// gate, and it receives every block from then on: it needs no snapshot, and none is taken.
+///
+/// A rewind can also retire a snapshot, see [`Self::note_rewound`].
+#[derive(Debug, Default)]
+pub(crate) struct MonitorGate {
+	snapshots: BTreeMap<OutPoint, MonitorSnapshot>,
+}
+
+// Driven by the gated fan-out below, which only the filter-driven engine calls.
+#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
+impl MonitorGate {
+	/// A gate over the given persisted tips, keyed by funding outpoint.
+	pub(crate) fn new(tips: impl IntoIterator<Item = (OutPoint, BestBlock)>) -> Self {
+		let snapshots = tips
+			.into_iter()
+			.map(|(funding_txo, best)| {
+				let name = format!("ChannelMonitor {}", funding_txo);
+				(funding_txo, MonitorSnapshot { name, best })
+			})
+			.collect();
+		Self { snapshots }
+	}
+
+	/// Snapshots the replay has neither proven nor refuted yet.
+	#[cfg(test)]
+	pub(crate) fn live(&self) -> usize {
+		self.snapshots.len()
+	}
+
+	/// Classifies one replayed block against every live snapshot, retiring the ones it proves.
+	///
+	/// Returns one decision per snapshot that was live when the block arrived, so the caller can
+	/// tally and report each one; a refuted snapshot is returned as `Diverged` and kept, because
+	/// the engine halts on it and the snapshot is the evidence.
+	pub(crate) fn judge_block(
+		&mut self, block_hash: BlockHash, prev_blockhash: BlockHash, height: u32,
+	) -> Vec<MonitorDecision> {
+		let mut decisions = Vec::with_capacity(self.snapshots.len());
+		self.snapshots.retain(|_, snapshot| {
+			let action = listener_action(&snapshot.best, block_hash, prev_blockhash, height);
+			decisions.push(MonitorDecision { snapshot: snapshot.clone(), action });
+			match action {
+				// Proven at its own tip or as the parent of the next block: retired.
+				ListenerAction::Deliver | ListenerAction::AlreadyApplied => false,
+				ListenerAction::ReplayUnprovable | ListenerAction::Diverged => true,
+			}
+		});
+		decisions
+	}
+
+	/// The monitor at `funding_txo` was just rewound below `height`: it no longer holds
+	/// anything at or above it, so a snapshot claiming a tip there is moot and is retired.
+	///
+	/// Keeping it would guarantee a false refutation later — the chain being replayed after
+	/// the reorg is a different branch from the one the snapshot was taken on, so the block at
+	/// the snapshot's height can never match it again. A snapshot below the rewound height is
+	/// untouched: the monitor still holds that state, and the replay still has to prove it.
+	pub(crate) fn note_rewound(&mut self, funding_txo: &OutPoint, height: u32) {
+		if self.snapshots.get(funding_txo).map_or(false, |s| s.best.height >= height) {
+			self.snapshots.remove(funding_txo);
+		}
+	}
 }
 
 /// What one listener decided about the blocks of the replay batch currently in flight.
@@ -1154,19 +1270,72 @@ pub(crate) fn disconnect_action(
 // method and of the divergence ledger; nothing on the bitcoind path touches them.
 #[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 impl ChainListener {
+	/// The ungated fan-out the bitcoind engine drives through `SpvClient`. Takes no monitor
+	/// snapshots: the `Listen` path delivers everything to everyone and gates nothing.
 	pub(crate) fn new(
 		onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
-		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>, logger: Arc<Logger>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
+		tx_broadcaster: Arc<Broadcaster>, fee_estimator: Arc<OnchainFeeEstimator>,
+		logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			onchain_wallet,
 			channel_manager,
 			chain_monitor,
 			output_sweeper,
+			tx_broadcaster,
+			fee_estimator,
 			logger,
 			divergence: Arc::new(Mutex::new(None)),
 			replay_batch: Arc::new(Mutex::new(BTreeMap::new())),
+			monitor_gate: Mutex::new(MonitorGate::default()),
 		}
+	}
+
+	/// The gated fan-out a filter-driven engine replays into.
+	///
+	/// Snapshots every channel monitor's persisted tip NOW, before any block is delivered:
+	/// the first delivery overwrites every monitor's live tip (see [`MonitorSnapshot`]), so this
+	/// is the only moment the monitors can be read truthfully. The engine's resume height is
+	/// taken from the same state right after, so the two agree.
+	pub(crate) fn new_gated(
+		onchain_wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
+		tx_broadcaster: Arc<Broadcaster>, fee_estimator: Arc<OnchainFeeEstimator>,
+		logger: Arc<Logger>,
+	) -> Self {
+		let listener = Self::new(
+			onchain_wallet,
+			channel_manager,
+			chain_monitor,
+			output_sweeper,
+			tx_broadcaster,
+			fee_estimator,
+			logger,
+		);
+		let tips = listener
+			.chain_monitor
+			.list_monitors()
+			.into_iter()
+			.flat_map(|(funding_txo, _)| {
+				listener
+					.chain_monitor
+					.get_monitor(funding_txo)
+					.map(|monitor| (funding_txo, monitor.current_best_block()))
+			})
+			.collect::<Vec<_>>();
+		for (funding_txo, best) in &tips {
+			log_debug!(
+				listener.logger,
+				"ChannelMonitor {} resumes at height {} (hash {}); it is checked against the \
+				 replay when the replay reaches it.",
+				funding_txo,
+				best.height,
+				best.block_hash,
+			);
+		}
+		*listener.monitor_gate.lock().unwrap() = MonitorGate::new(tips);
+		listener
 	}
 
 	/// The furthest-behind tip across every listener: the height a replay must resume from so
@@ -1208,9 +1377,20 @@ impl ChainListener {
 	/// listener that skipped some blocks and one that skipped *only* blocks, so a decision that
 	/// bypassed it would read as an absence of evidence.
 	fn note_decision(
-		&self, who: &'static str, best: &BestBlock, height: u32, action: ListenerAction,
+		&self, who: &str, best: &BestBlock, height: u32, action: ListenerAction,
 	) -> ListenerAction {
-		self.replay_batch.lock().unwrap().entry(who).or_default().note(best, action);
+		{
+			let mut batch = self.replay_batch.lock().unwrap();
+			match batch.get_mut(who) {
+				Some(tally) => tally.note(best, action),
+				// Only the first decision of a batch allocates the key.
+				None => {
+					let mut tally = ReplayTally::default();
+					tally.note(best, action);
+					batch.insert(who.to_owned(), tally);
+				},
+			}
+		}
 		match action {
 			ListenerAction::ReplayUnprovable => self.log_unprovable_replay(who, best, height),
 			ListenerAction::Diverged => self.log_divergence(who, best, height),
@@ -1232,6 +1412,13 @@ impl ChainListener {
 	/// A listener that skipped a stretch and then reconnected — the ordinary consequence of the
 	/// resume-from-minimum design, and the case `ReplayUnprovable` exists for — has `provable > 0`
 	/// and is merely reported, at a level that does not depend on debug logging being on.
+	///
+	/// `tip_height` MUST be the true synced tip of the chain — the height the chain source
+	/// itself reports as caught up to the network — and never an intermediate batch boundary or
+	/// the last height a block happened to arrive at. The verdict reads "the replay is not
+	/// coming back for you" into it: judged against a height the chain has not actually ended
+	/// at, a listener that is merely ahead of an unfinished replay would be recorded as stranded
+	/// and halt the engine for nothing.
 	///
 	/// Returns `true` when at least one listener was recorded as stranded.
 	pub(crate) fn record_stranded_listeners(&self, tip_height: u32) -> bool {
@@ -1359,23 +1546,59 @@ impl ChainListener {
 			| ListenerAction::Diverged => {},
 		}
 
-		// `ChainMonitor` has no chain-order assertion of its own, but `ChannelMonitor` advances its
-		// tip whenever the incoming height is greater *without validating the parent*, so replaying
-		// a different chain would silently graft a stale ancestor. Gate it on the furthest-behind
-		// monitor: monitors ahead of that point ignore heights at or below their own tip.
-		match self.min_monitor_best_block() {
-			Some(monitor_best) => {
-				let action =
-					listener_action(&monitor_best, block_hash, header.prev_blockhash, height);
-				match self.note_decision("ChainMonitor", &monitor_best, height, action) {
-					ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
-						self.chain_monitor.filtered_block_connected(header, txdata, height)
-					},
-					ListenerAction::ReplayUnprovable | ListenerAction::Diverged => {},
-				}
-			},
-			// No monitors: nothing to strand.
-			None => self.chain_monitor.filtered_block_connected(header, txdata, height),
+		// `ChainMonitor` has no chain-order assertion of its own, and `ChannelMonitor` does not
+		// validate anything on this path: `block_connected` overwrites the monitor's tip with the
+		// incoming block unconditionally, whether the block is above, at or below the tip it had,
+		// and then processes the block's transactions. So a block from a different chain would be
+		// grafted in silently, and nothing a monitor holds afterwards says where it really was.
+		//
+		// Two gates therefore stand in front of the single `ChainMonitor` call. Every snapshot
+		// taken at start (see `MonitorGate`) must NOT refute the block: a monitor proven to be on
+		// another chain must not be fed this one, so on any refutation the block is withheld from
+		// the whole `ChainMonitor` and the divergence halts the engine. And the furthest-behind
+		// monitor's live tip — the `ChainMonitor`'s effective tip, since every delivery lands
+		// on every monitor — must be able to take the block: below it nothing can be checked,
+		// at it the block is an exact replay, above it by one the block extends it.
+		//
+		// A monitor whose snapshot is still unproven receives, through the `ChainMonitor`, the
+		// blocks the replay delivers below its snapshot: an exact replay of its own blocks if it
+		// is on this chain (which `transactions_confirmed` skips as already confirmed, as it does
+		// on every restart of the transaction-based engines), or foreign blocks if it is not —
+		// which the snapshot refutes the moment the replay reaches its height. The `ChainMonitor`
+		// persists each monitor and registers its new outputs as part of that one call, which is
+		// why the monitors are not fed one by one here.
+		let monitor_decisions = self.monitor_gate.lock().unwrap().judge_block(
+			block_hash,
+			header.prev_blockhash,
+			height,
+		);
+		let mut refuted = false;
+		for decision in &monitor_decisions {
+			let noted = self.note_decision(
+				&decision.snapshot.name,
+				&decision.snapshot.best,
+				height,
+				decision.action,
+			);
+			refuted |= noted == ListenerAction::Diverged;
+		}
+
+		if !refuted {
+			match self.min_monitor_best_block() {
+				Some(monitor_best) => {
+					match listener_action(&monitor_best, block_hash, header.prev_blockhash, height)
+					{
+						ListenerAction::Deliver | ListenerAction::AlreadyApplied => {
+							self.chain_monitor.filtered_block_connected(header, txdata, height)
+						},
+						// Below every monitor's tip, or a gap: the snapshots above already said
+						// what there is to say about it.
+						ListenerAction::ReplayUnprovable | ListenerAction::Diverged => {},
+					}
+				},
+				// No monitors: nothing to strand.
+				None => self.chain_monitor.filtered_block_connected(header, txdata, height),
+			}
 		}
 
 		let sweeper_best = self.output_sweeper.current_best_block();
@@ -1395,16 +1618,32 @@ impl ChainListener {
 	///
 	/// `ChannelManager` and `OutputSweeper` assert that the disconnected header IS their current
 	/// tip, so each is rewound only while that holds; a listener that never reached this height
-	/// has nothing to rewind and is skipped. `ChannelMonitor` does not assert but resets its tip
-	/// to the header's parent unconditionally, so it is gated on the furthest-behind monitor:
-	/// monitors ahead of it are all on the same abandoned branch (they were fed by this listener)
-	/// and land on the right parent too, while a monitor that never saw the height must not be
-	/// moved forward onto a block whose transactions it never processed. The on-chain wallet is
-	/// not rewound, as on the ungated path: BDK reconnects from the point of disagreement.
+	/// has nothing to rewind and is skipped. The on-chain wallet is not rewound, as on the
+	/// ungated path: BDK reconnects from the point of disagreement.
+	///
+	/// Each channel monitor is rewound ON ITS OWN, by the same rule, never through the
+	/// `ChainMonitor`: that would rewind every monitor it holds, and after a restart the
+	/// monitors sit at different heights — chain-sync persistence is staggered per channel, so a
+	/// skew is the ordinary state, not a crash artefact. Gating the `ChainMonitor` on one
+	/// monitor's tip either rewinds a monitor that never reached the height (moving it onto a
+	/// block whose transactions it never processed) or, gated on the furthest-behind one, leaves
+	/// a monitor ahead of it untouched: its events from the abandoned branch then mature on the
+	/// new one. `ChainMonitor::block_disconnected` is a plain loop over its monitors with no
+	/// persistence of its own, so rewinding a monitor directly is the same operation, one
+	/// monitor at a time. A rewind retires the monitor's start-of-replay snapshot when it
+	/// reaches below it, see [`MonitorGate::note_rewound`].
 	///
 	/// A listener at this height on a different block, or still above a height every listener
 	/// should have matched by now, is recorded as diverged: it is on a chain this sequence of
-	/// disconnects cannot rewind along.
+	/// disconnects cannot rewind along. Disconnects arrive descending from the tip, so a
+	/// listener that was at that tip has been rewound to `height` by the time the header at
+	/// `height` is processed; one still above it was never at the tip of this branch, and a
+	/// `BestBlock` carries no ancestry that could tell which branch it IS on. That includes a
+	/// monitor persisted ahead of the resume height that the replay had not reached when the
+	/// reorg arrived: its claim above the fork cannot be checked against either branch, so the
+	/// engine halts rather than guess — silently purging the claim by height would accept state
+	/// nothing can verify. The halt is transient: a restart resumes from the persisted heights,
+	/// and the monitor is proven or refuted at its own height by the replay.
 	pub(crate) fn gated_block_disconnected(&self, header: &Header, height: u32) {
 		self.onchain_wallet.block_disconnected(header, height);
 
@@ -1417,13 +1656,30 @@ impl ChainListener {
 			},
 		}
 
-		if let Some(monitor_best) = self.min_monitor_best_block() {
+		for (funding_txo, _) in self.chain_monitor.list_monitors() {
+			let Ok(monitor) = self.chain_monitor.get_monitor(funding_txo) else {
+				// Removed between the listing and the lookup: nothing left to rewind.
+				continue;
+			};
+			let monitor_best = monitor.current_best_block();
 			match disconnect_action(&monitor_best, header, height) {
-				DisconnectAction::Rewind => self.chain_monitor.block_disconnected(header, height),
-				DisconnectAction::NotReached => {},
-				DisconnectAction::Diverged => {
-					self.log_disconnect_divergence("ChainMonitor", &monitor_best, header, height)
+				DisconnectAction::Rewind => {
+					monitor.block_disconnected(
+						header,
+						height,
+						&*self.tx_broadcaster,
+						&*self.fee_estimator,
+						&self.logger,
+					);
+					self.monitor_gate.lock().unwrap().note_rewound(&funding_txo, height);
 				},
+				DisconnectAction::NotReached => {},
+				DisconnectAction::Diverged => self.log_disconnect_divergence(
+					&format!("ChannelMonitor {}", funding_txo),
+					&monitor_best,
+					header,
+					height,
+				),
 			}
 		}
 
@@ -1753,6 +2009,144 @@ mod tests {
 		// have failed to match at its own height already: it is not on this chain.
 		let still_ahead = best(103, 103);
 		assert_eq!(disconnect_action(&still_ahead, &tip, 100), DisconnectAction::Diverged);
+	}
+
+	fn funding(seed: u8) -> OutPoint {
+		OutPoint { txid: Txid::from_byte_array([seed; 32]), index: 0 }
+	}
+
+	fn monitor_name(seed: u8) -> String {
+		format!("ChannelMonitor {}", funding(seed))
+	}
+
+	#[test]
+	fn skewed_monitors_are_rewound_each_on_its_own_tip() {
+		// The disconnect gate, applied per monitor. Chain-sync persistence is staggered per
+		// channel, so after a restart monitors sit at different heights as a matter of course.
+		// Gated on the furthest-behind monitor, this reorg would have been `NotReached` for the
+		// whole `ChainMonitor`, and the monitor at 105 would have kept the abandoned block.
+		let block_105 = header_with(hash(104), 105);
+		let behind = best(104, 104);
+		let at_tip = BestBlock::new(block_105.block_hash(), 105);
+		assert_eq!(disconnect_action(&behind, &block_105, 105), DisconnectAction::NotReached);
+		assert_eq!(disconnect_action(&at_tip, &block_105, 105), DisconnectAction::Rewind);
+
+		// The same height on a different block, or above the height being disconnected —
+		// including a monitor persisted ahead of the replay that a reorg reaches before the
+		// replay does — cannot be rewound along this branch and fails closed.
+		let other_105 = best(105, 0xbb);
+		assert_eq!(disconnect_action(&other_105, &block_105, 105), DisconnectAction::Diverged);
+		let ahead_unfed = best(110, 110);
+		assert_eq!(disconnect_action(&ahead_unfed, &block_105, 105), DisconnectAction::Diverged);
+	}
+
+	#[test]
+	fn a_snapshot_is_unprovable_below_its_height_and_kept() {
+		let mut gate = MonitorGate::new([(funding(1), best(110, 110))]);
+		let decisions = gate.judge_block(hash(105), hash(104), 105);
+		assert_eq!(decisions.len(), 1);
+		assert_eq!(decisions[0].action, ListenerAction::ReplayUnprovable);
+		assert_eq!(decisions[0].snapshot.best, best(110, 110));
+		assert_eq!(decisions[0].snapshot.name, monitor_name(1));
+		assert_eq!(gate.live(), 1, "still waiting for the replay to reach 110");
+	}
+
+	#[test]
+	fn a_snapshot_is_proven_at_its_own_height_and_retired() {
+		// An ahead monitor on the same chain: its own block replays as an exact match. Proven,
+		// and never decided again — the next block is delivered to it in lockstep, not judged.
+		let mut gate = MonitorGate::new([(funding(1), best(110, 110))]);
+		let decisions = gate.judge_block(hash(110), hash(109), 110);
+		assert_eq!(decisions[0].action, ListenerAction::AlreadyApplied);
+		assert_eq!(gate.live(), 0);
+		assert!(gate.judge_block(hash(111), hash(110), 111).is_empty());
+	}
+
+	#[test]
+	fn a_snapshot_is_proven_as_the_parent_of_the_next_block_and_retired() {
+		// The resume floor is the furthest-behind monitor, so ITS snapshot is proven by the very
+		// first replayed block, which extends it.
+		let mut gate = MonitorGate::new([(funding(1), best(104, 104))]);
+		let decisions = gate.judge_block(hash(105), hash(104), 105);
+		assert_eq!(decisions[0].action, ListenerAction::Deliver);
+		assert_eq!(gate.live(), 0);
+	}
+
+	#[test]
+	fn a_snapshot_on_another_chain_is_refuted_at_its_own_height_and_kept_as_evidence() {
+		let mut gate = MonitorGate::new([(funding(1), best(110, 0xbb))]);
+		let decisions = gate.judge_block(hash(110), hash(109), 110);
+		assert_eq!(decisions[0].action, ListenerAction::Diverged);
+		assert_eq!(decisions[0].snapshot.name, monitor_name(1));
+		assert_eq!(gate.live(), 1);
+	}
+
+	#[test]
+	fn a_snapshot_with_the_wrong_parent_or_a_gap_is_refuted() {
+		let mut gate =
+			MonitorGate::new([(funding(1), best(110, 110)), (funding(2), best(110, 110))]);
+		// Next height, but the parent is not the snapshot: another chain.
+		let decisions = gate.judge_block(hash(111), hash(0xaa), 111);
+		assert_eq!(decisions.len(), 2);
+		assert!(decisions.iter().all(|d| d.action == ListenerAction::Diverged));
+		// A gap: the replay skipped a block, which a lockstep listener cannot absorb.
+		let decisions = gate.judge_block(hash(113), hash(112), 113);
+		assert!(decisions.iter().all(|d| d.action == ListenerAction::Diverged));
+		assert_eq!(gate.live(), 2);
+	}
+
+	#[test]
+	fn snapshots_are_judged_independently() {
+		// Three monitors at three heights, the ordinary post-restart skew: one block proves the
+		// monitor it extends, replays the one at its height, and cannot yet say anything about
+		// the third.
+		let mut gate = MonitorGate::new([
+			(funding(1), best(104, 104)),
+			(funding(2), best(105, 105)),
+			(funding(3), best(107, 107)),
+		]);
+		let decisions = gate.judge_block(hash(105), hash(104), 105);
+		let action_of = |seed: u8| {
+			decisions.iter().find(|d| d.snapshot.name == monitor_name(seed)).unwrap().action
+		};
+		assert_eq!(action_of(1), ListenerAction::Deliver);
+		assert_eq!(action_of(2), ListenerAction::AlreadyApplied);
+		assert_eq!(action_of(3), ListenerAction::ReplayUnprovable);
+		assert_eq!(gate.live(), 1, "only the monitor at 107 is still unproven");
+
+		// ... and it is proven two blocks later.
+		gate.judge_block(hash(106), hash(105), 106);
+		let decisions = gate.judge_block(hash(107), hash(106), 107);
+		assert_eq!(decisions.len(), 1);
+		assert_eq!(decisions[0].snapshot.name, monitor_name(3));
+		assert_eq!(decisions[0].action, ListenerAction::AlreadyApplied);
+		assert_eq!(gate.live(), 0);
+	}
+
+	#[test]
+	fn a_rewind_retires_the_snapshots_it_reaches_below() {
+		let mut gate =
+			MonitorGate::new([(funding(1), best(110, 110)), (funding(2), best(103, 103))]);
+		// Rewound below its snapshot: the claim at 110 is moot — the chain replayed after the
+		// reorg is another branch, so a block at 110 could never match it again.
+		gate.note_rewound(&funding(1), 105);
+		assert_eq!(gate.live(), 1);
+		// Rewound above its snapshot: the monitor still holds the state the snapshot describes.
+		gate.note_rewound(&funding(2), 105);
+		assert_eq!(gate.live(), 1);
+		// At exactly the snapshot height: nothing at or above it is left.
+		gate.note_rewound(&funding(2), 103);
+		assert_eq!(gate.live(), 0);
+		// A monitor the gate never knew about is ignored.
+		gate.note_rewound(&funding(9), 1);
+		assert_eq!(gate.live(), 0);
+	}
+
+	#[test]
+	fn an_empty_gate_decides_nothing() {
+		let mut gate = MonitorGate::default();
+		assert!(gate.judge_block(hash(1), hash(0), 1).is_empty());
+		assert_eq!(gate.live(), 0);
 	}
 
 	fn txid(seed: u8) -> Txid {

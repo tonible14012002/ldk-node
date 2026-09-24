@@ -117,6 +117,8 @@ impl SyncEngine for BitcoindSyncEngine {
 			Arc::clone(&channel_manager),
 			chain_monitor,
 			output_sweeper,
+			Arc::clone(layer.tx_broadcaster()),
+			Arc::clone(layer.fee_estimator()),
 			Arc::clone(&logger),
 		);
 		let mut spv_client =

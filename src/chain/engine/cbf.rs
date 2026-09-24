@@ -482,11 +482,15 @@ impl SyncEngine for CbfSyncEngine {
 			return;
 		};
 
-		let listener = Arc::new(ChainListener::new(
+		// Snapshots the channel monitors before the first block is delivered; the resume height
+		// `launch` derives is read from the same, still untouched, state.
+		let listener = Arc::new(ChainListener::new_gated(
 			Arc::clone(&self.onchain_wallet),
 			channel_manager,
 			chain_monitor,
 			output_sweeper,
+			Arc::clone(layer.tx_broadcaster()),
+			Arc::clone(layer.fee_estimator()),
 			Arc::clone(&self.logger),
 		));
 		self.launch(runtime, listener);

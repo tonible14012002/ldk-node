@@ -393,23 +393,34 @@ impl<F: ChainFanout> BlockApplicator<F> {
 #[cfg(test)]
 mod tests {
 	//! The applicator driven through a fake fan-out: one Lightning-shaped listener that keeps a
-	//! `BestBlock` and applies the same disconnect gate the real listeners do, so the ops the
-	//! applicator emits can be checked for order and for what they did to the tip.
+	//! `BestBlock` and applies the same gates the real listeners do, plus channel monitors
+	//! handled the way the real fan-out handles the `ChainMonitor` — through the real
+	//! `MonitorGate` and the real per-monitor decision functions — so the ops the applicator
+	//! emits can be checked for order and for what they did to each tip.
 	use super::*;
 
+	use std::collections::BTreeMap;
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::Mutex;
+	use std::time::Duration;
 
 	use bitcoin::hashes::Hash;
-	use bitcoin::BlockHash;
+	use bitcoin::{BlockHash, Txid};
+	use lightning::chain::transaction::OutPoint;
 	use lightning::chain::BestBlock;
 	use lightning::util::test_utils::TestStore;
 
-	use crate::chain::bitcoind::{disconnect_action, DisconnectAction};
+	use crate::chain::bitcoind::{
+		disconnect_action, listener_action, DisconnectAction, ListenerAction, MonitorGate,
+	};
 	use crate::chain::cbf::fee::new_block_fee_cache;
 
 	fn hash(byte: u8) -> BlockHash {
 		BlockHash::from_byte_array([byte; 32])
+	}
+
+	fn funding(seed: u8) -> OutPoint {
+		OutPoint { txid: Txid::from_byte_array([seed; 32]), index: 0 }
 	}
 
 	fn header_with(prev_blockhash: BlockHash, nonce: u32) -> Header {
@@ -423,9 +434,20 @@ mod tests {
 		}
 	}
 
-	/// A single Lightning-shaped listener behind the fan-out seam.
+	/// A single Lightning-shaped listener behind the fan-out seam, plus channel monitors.
+	///
+	/// The monitors are modelled as the `ChainMonitor` holds them: one delivery lands on every
+	/// monitor and overwrites its tip, whatever it was (`ChannelMonitor::block_connected`), while
+	/// a rewind is applied per monitor on its own tip. The start-of-replay snapshots in `gate`
+	/// are the real [`MonitorGate`].
 	struct FakeFanout {
 		tip: Mutex<BestBlock>,
+		monitors: Mutex<BTreeMap<OutPoint, BestBlock>>,
+		gate: Mutex<MonitorGate>,
+		/// The heights handed to the single `ChainMonitor` delivery, in order.
+		monitor_deliveries: Mutex<Vec<u32>>,
+		/// Snapshots the replay refuted, by name.
+		refuted: Mutex<Vec<String>>,
 		disconnects: Mutex<Vec<(BlockHash, u32)>>,
 		divergence: Mutex<Option<String>>,
 		flushes: AtomicUsize,
@@ -433,8 +455,21 @@ mod tests {
 
 	impl FakeFanout {
 		fn at(tip: BestBlock) -> Arc<Self> {
+			Self::with_monitors(tip, [])
+		}
+
+		/// A fan-out whose monitors were persisted at the given tips, snapshotted the way
+		/// `ChainListener::new_gated` snapshots them: before any block is delivered.
+		fn with_monitors(
+			tip: BestBlock, monitors: impl IntoIterator<Item = (OutPoint, BestBlock)>,
+		) -> Arc<Self> {
+			let monitors: BTreeMap<_, _> = monitors.into_iter().collect();
 			Arc::new(Self {
 				tip: Mutex::new(tip),
+				gate: Mutex::new(MonitorGate::new(monitors.clone())),
+				monitors: Mutex::new(monitors),
+				monitor_deliveries: Mutex::new(Vec::new()),
+				refuted: Mutex::new(Vec::new()),
 				disconnects: Mutex::new(Vec::new()),
 				divergence: Mutex::new(None),
 				flushes: AtomicUsize::new(0),
@@ -444,6 +479,29 @@ mod tests {
 		fn tip(&self) -> BestBlock {
 			*self.tip.lock().unwrap()
 		}
+
+		fn monitor_tip(&self, funding_txo: OutPoint) -> BestBlock {
+			self.monitors.lock().unwrap()[&funding_txo]
+		}
+
+		fn monitor_deliveries(&self) -> Vec<u32> {
+			self.monitor_deliveries.lock().unwrap().clone()
+		}
+
+		fn live_snapshots(&self) -> usize {
+			self.gate.lock().unwrap().live()
+		}
+
+		/// The height the engine resumes from: the furthest-behind listener, monitors included,
+		/// as `ChainListener::get_best_block` computes it.
+		fn resume_height(&self) -> u32 {
+			let monitors = self.monitors.lock().unwrap();
+			monitors
+				.values()
+				.map(|b| b.height)
+				.min()
+				.map_or(self.tip().height, |monitor_min| monitor_min.min(self.tip().height))
+		}
 	}
 
 	impl ChainFanout for FakeFanout {
@@ -452,27 +510,81 @@ mod tests {
 		}
 
 		fn connect_filtered(&self, header: &Header, height: u32) {
-			let mut tip = self.tip.lock().unwrap();
-			if tip.height + 1 == height && tip.block_hash == header.prev_blockhash {
-				*tip = BestBlock::new(header.block_hash(), height);
-			} else {
-				*self.divergence.lock().unwrap() = Some(format!("connect at {}", height));
+			let block_hash = header.block_hash();
+			{
+				let mut tip = self.tip.lock().unwrap();
+				if tip.height + 1 == height && tip.block_hash == header.prev_blockhash {
+					*tip = BestBlock::new(block_hash, height);
+				} else {
+					*self.divergence.lock().unwrap() = Some(format!("connect at {}", height));
+				}
+			}
+
+			// The monitors, as `ChainListener::gated_lightning_block_connected` treats them:
+			// every live snapshot is judged first, a refutation withholds the block from the
+			// whole `ChainMonitor`, and otherwise the furthest-behind monitor's gate decides.
+			let decisions =
+				self.gate.lock().unwrap().judge_block(block_hash, header.prev_blockhash, height);
+			let mut refuted = false;
+			for decision in decisions {
+				if decision.action == ListenerAction::Diverged {
+					refuted = true;
+					self.refuted.lock().unwrap().push(decision.snapshot.name.clone());
+					*self.divergence.lock().unwrap() =
+						Some(format!("{} refuted the block at {}", decision.snapshot.name, height));
+				}
+			}
+			if refuted {
+				return;
+			}
+			let mut monitors = self.monitors.lock().unwrap();
+			let deliver = match monitors.values().min_by_key(|b| b.height) {
+				Some(min) => matches!(
+					listener_action(min, block_hash, header.prev_blockhash, height),
+					ListenerAction::Deliver | ListenerAction::AlreadyApplied
+				),
+				None => true,
+			};
+			if deliver {
+				self.monitor_deliveries.lock().unwrap().push(height);
+				for best in monitors.values_mut() {
+					*best = BestBlock::new(block_hash, height);
+				}
 			}
 		}
 
 		fn disconnect(&self, header: &Header, height: u32) {
 			self.disconnects.lock().unwrap().push((header.block_hash(), height));
-			let mut tip = self.tip.lock().unwrap();
-			// The real listeners' gate, verbatim: rewind only while this header IS the tip.
-			match disconnect_action(&tip, header, height) {
-				DisconnectAction::Rewind => {
-					*tip = BestBlock::new(header.prev_blockhash, height - 1)
-				},
-				DisconnectAction::NotReached => {},
-				DisconnectAction::Diverged => {
-					*self.divergence.lock().unwrap() =
-						Some(format!("disconnect at {} is not the tip", height));
-				},
+			{
+				let mut tip = self.tip.lock().unwrap();
+				// The real listeners' gate, verbatim: rewind only while this header IS the tip.
+				match disconnect_action(&tip, header, height) {
+					DisconnectAction::Rewind => {
+						*tip = BestBlock::new(header.prev_blockhash, height - 1)
+					},
+					DisconnectAction::NotReached => {},
+					DisconnectAction::Diverged => {
+						*self.divergence.lock().unwrap() =
+							Some(format!("disconnect at {} is not the tip", height));
+					},
+				}
+			}
+			// Each monitor on its own tip, as `ChainListener::gated_block_disconnected` does.
+			let mut monitors = self.monitors.lock().unwrap();
+			for (funding_txo, best) in monitors.iter_mut() {
+				match disconnect_action(best, header, height) {
+					DisconnectAction::Rewind => {
+						*best = BestBlock::new(header.prev_blockhash, height - 1);
+						self.gate.lock().unwrap().note_rewound(funding_txo, height);
+					},
+					DisconnectAction::NotReached => {},
+					DisconnectAction::Diverged => {
+						*self.divergence.lock().unwrap() = Some(format!(
+							"ChannelMonitor {} cannot be rewound at {}",
+							funding_txo, height
+						));
+					},
+				}
 			}
 		}
 
@@ -502,15 +614,16 @@ mod tests {
 
 	fn spawn(fanout: Arc<FakeFanout>) -> Harness {
 		let (ops_tx, ops_rx) = mpsc::channel(CBF_CHAIN_OP_QUEUE_DEPTH);
+		let resume_height = fanout.resume_height();
 		let (sync_state_tx, _) = watch::channel(CbfSyncState::Active {
-			applied_tip: Some(fanout.tip().height),
+			applied_tip: Some(resume_height),
 			synced_to_tip: false,
 		});
 		let ledger = Arc::new(WatchLedger::new());
 		let applicator = BlockApplicator::new(
 			Arc::clone(&fanout),
 			ops_rx,
-			fanout.tip().height + 1,
+			resume_height + 1,
 			sync_state_tx.clone(),
 			new_block_fee_cache(),
 			Arc::clone(&ledger),
@@ -522,26 +635,73 @@ mod tests {
 		Harness { fanout, ops_tx, sync_state_tx, ledger, task }
 	}
 
-	/// Three blocks 101..=103 on top of the fan-out's tip at 100, connected through the
-	/// applicator so the listener's tip and the ledger agree on the chain before a reorg.
-	async fn connect_101_to_103(h: &Harness) -> Vec<Header> {
-		let mut prev = h.fanout.tip().block_hash;
+	/// How long any single wait on the applicator may take before the test fails.
+	const WAIT: Duration = Duration::from_secs(10);
+
+	/// Waits for the sync state to satisfy `pred`, bounded.
+	///
+	/// The harness keeps a clone of the state sender, so a receiver never errors when the
+	/// applicator has stopped, or when the ops sent will never publish the awaited state: without
+	/// a bound such a test would sit forever instead of failing.
+	async fn wait_for_state(h: &Harness, pred: impl FnMut(&CbfSyncState) -> bool) -> CbfSyncState {
+		let mut rx = h.sync_state_tx.subscribe();
+		let state = tokio::time::timeout(WAIT, rx.wait_for(pred))
+			.await
+			.expect("the applicator did not publish the awaited sync state in time")
+			.expect("the sync state channel is open");
+		*state
+	}
+
+	/// Joins the applicator task, bounded, and propagates its panic if it had one.
+	async fn join(task: tokio::task::JoinHandle<()>) {
+		tokio::time::timeout(WAIT, task)
+			.await
+			.expect("the applicator did not stop in time")
+			.expect("the applicator panicked");
+	}
+
+	/// The headers of blocks 101..=103 on top of `prev` at 100, built ahead of time so a monitor
+	/// can be persisted at one of them.
+	fn headers_101_to_103(prev: BlockHash) -> Vec<Header> {
+		let mut prev = prev;
 		let mut headers = Vec::new();
 		for height in 101..=103u32 {
 			let header = header_with(prev, height);
-			h.ops_tx.send(ChainOp::ConnectFiltered { header, height }).await.unwrap();
 			prev = header.block_hash();
 			headers.push(header);
 		}
-		// `Synced` is the observable boundary: once it is published the ops before it landed.
-		h.ops_tx.send(ChainOp::Synced { tip_height: 103 }).await.unwrap();
-		let mut rx = h.sync_state_tx.subscribe();
-		rx.wait_for(|s| matches!(s, CbfSyncState::Active { synced_to_tip: true, .. }))
-			.await
-			.unwrap();
+		headers
+	}
+
+	/// Three blocks 101..=103 on top of the fan-out's tip at 100, connected through the
+	/// applicator so the listener's tip and the ledger agree on the chain before a reorg.
+	async fn connect_101_to_103(h: &Harness) -> Vec<Header> {
+		let headers = headers_101_to_103(h.fanout.tip().block_hash);
+		assert!(connect_and_sync(h, 101, &headers, 103).await);
 		assert_eq!(h.fanout.tip().height, 103);
 		assert_eq!(h.ledger.tip().map(|b| b.height), Some(103));
 		headers
+	}
+
+	/// Connects `headers` at consecutive heights from `first_height` and waits for the `Synced`
+	/// at `tip_height` to publish: `Synced` is the observable boundary, so once it is published
+	/// the ops before it landed. Returns `false` if the applicator failed instead.
+	async fn connect_and_sync(
+		h: &Harness, first_height: u32, headers: &[Header], tip_height: u32,
+	) -> bool {
+		for (i, header) in headers.iter().enumerate() {
+			let height = first_height + i as u32;
+			h.ops_tx.send(ChainOp::ConnectFiltered { header: *header, height }).await.unwrap();
+		}
+		h.ops_tx.send(ChainOp::Synced { tip_height }).await.unwrap();
+		let state = wait_for_state(h, |s| match s {
+			CbfSyncState::Active { applied_tip, synced_to_tip } => {
+				*synced_to_tip && *applied_tip == Some(tip_height)
+			},
+			CbfSyncState::Failed(_) => true,
+		})
+		.await;
+		matches!(state, CbfSyncState::Active { .. })
 	}
 
 	#[tokio::test]
@@ -552,11 +712,9 @@ mod tests {
 		// Kyoto reorganises 102 and 103 out. The event loop hands them over tip first.
 		let reorg = vec![(headers[2], 103), (headers[1], 102)];
 		h.ops_tx.send(ChainOp::Disconnect { headers: reorg }).await.unwrap();
-		let mut rx = h.sync_state_tx.subscribe();
-		let state = *rx
-			.wait_for(|s| matches!(s, CbfSyncState::Active { synced_to_tip: false, .. }))
-			.await
-			.unwrap();
+		let state =
+			wait_for_state(&h, |s| matches!(s, CbfSyncState::Active { synced_to_tip: false, .. }))
+				.await;
 
 		// Each header was the listener's tip when it arrived, so each one rewound it: 103 first,
 		// then 102, landing on the fork point 101.
@@ -574,15 +732,14 @@ mod tests {
 		let new_102 = header_with(headers[0].block_hash(), 0xbeef);
 		h.ops_tx.send(ChainOp::ConnectFiltered { header: new_102, height: 102 }).await.unwrap();
 		h.ops_tx.send(ChainOp::Synced { tip_height: 102 }).await.unwrap();
-		let state = *rx
-			.wait_for(|s| matches!(s, CbfSyncState::Active { synced_to_tip: true, .. }))
-			.await
-			.unwrap();
+		let state =
+			wait_for_state(&h, |s| matches!(s, CbfSyncState::Active { synced_to_tip: true, .. }))
+				.await;
 		assert!(matches!(state, CbfSyncState::Active { applied_tip: Some(102), .. }));
 		assert_eq!(h.fanout.tip(), BestBlock::new(new_102.block_hash(), 102));
 
 		drop(h.ops_tx);
-		h.task.await.unwrap();
+		join(h.task).await;
 		assert!(h.fanout.flushes.load(Ordering::SeqCst) >= 1, "a clean stop flushes");
 	}
 
@@ -598,14 +755,116 @@ mod tests {
 		assert_ne!(other_103.block_hash(), headers[2].block_hash());
 		h.ops_tx.send(ChainOp::Disconnect { headers: vec![(other_103, 103)] }).await.unwrap();
 
-		let mut rx = h.sync_state_tx.subscribe();
-		rx.wait_for(|s| matches!(s, CbfSyncState::Failed(Error::TxSyncFailed))).await.unwrap();
-		h.task.await.unwrap();
+		wait_for_state(&h, |s| matches!(s, CbfSyncState::Failed(Error::TxSyncFailed))).await;
+		join(h.task).await;
 		assert_eq!(h.fanout.tip().height, 103, "the listener was left untouched");
 		assert!(
 			h.ops_tx.send(ChainOp::Synced { tip_height: 103 }).await.is_err(),
 			"nothing is applied after a halt"
 		);
+	}
+
+	#[tokio::test]
+	async fn a_reorg_rewinds_only_the_monitor_that_reached_it() {
+		// The crash-skew geometry: monitor A was persisted at 104, monitor B at 105, and the
+		// block at 105 is reorganised out before the replay (which resumes from A's 104) gets to
+		// re-deliver it. Gated on the furthest-behind monitor the reorg was `NotReached` for the
+		// whole `ChainMonitor`, so B kept the abandoned block and its events matured on the new
+		// branch. Per monitor, B is rewound and A — which never reached 105 — is left alone.
+		let block_105 = header_with(hash(104), 105);
+		let (a, b) = (funding(1), funding(2));
+		let h = spawn(FakeFanout::with_monitors(
+			BestBlock::new(hash(104), 104),
+			[(a, BestBlock::new(hash(104), 104)), (b, BestBlock::new(block_105.block_hash(), 105))],
+		));
+		assert_eq!(h.fanout.resume_height(), 104);
+
+		h.ops_tx.send(ChainOp::Disconnect { headers: vec![(block_105, 105)] }).await.unwrap();
+		// A `Synced` at the fork point is the observable boundary: the applicator processes it
+		// after the disconnect and publishes 104 as the synced tip.
+		h.ops_tx.send(ChainOp::Synced { tip_height: 104 }).await.unwrap();
+		wait_for_state(&h, |s| {
+			matches!(s, CbfSyncState::Active { applied_tip: Some(104), synced_to_tip: true })
+		})
+		.await;
+
+		assert_eq!(h.fanout.monitor_tip(b), BestBlock::new(hash(104), 104), "B rewound to 104");
+		assert_eq!(h.fanout.monitor_tip(a), BestBlock::new(hash(104), 104), "A untouched");
+		assert!(h.fanout.take_divergence().is_none(), "a rewind on its own tip is not a fork");
+		assert_eq!(h.fanout.live_snapshots(), 1, "B's snapshot at 105 is moot; A's at 104 stands");
+
+		// The new branch: both monitors take 105 in lockstep, and A's snapshot is proven by it.
+		let new_105 = header_with(hash(104), 0xbeef);
+		assert!(connect_and_sync(&h, 105, &[new_105], 105).await);
+		assert_eq!(h.fanout.monitor_deliveries(), vec![105]);
+		assert_eq!(h.fanout.monitor_tip(a), BestBlock::new(new_105.block_hash(), 105));
+		assert_eq!(h.fanout.monitor_tip(b), BestBlock::new(new_105.block_hash(), 105));
+		assert_eq!(h.fanout.live_snapshots(), 0);
+
+		drop(h.ops_tx);
+		join(h.task).await;
+	}
+
+	#[tokio::test]
+	async fn an_ahead_monitor_on_another_chain_halts_the_replay_at_its_own_height() {
+		// Monitor B was persisted at 102 on a block the chain does not have. Nothing below 102
+		// can tell (its live tip is overwritten by the first delivery, which is exactly why the
+		// snapshot exists), but at 102 the snapshot compares by hash and refutes it: the block
+		// is withheld from the `ChainMonitor` and the applicator halts rather than feed a
+		// monitor that is on another chain.
+		let (a, b) = (funding(1), funding(2));
+		let h = spawn(FakeFanout::with_monitors(
+			BestBlock::new(hash(100), 100),
+			[(a, BestBlock::new(hash(100), 100)), (b, BestBlock::new(hash(0xbb), 102))],
+		));
+		let headers = headers_101_to_103(hash(100));
+		assert!(!connect_and_sync(&h, 101, &headers, 103).await, "the replay failed");
+		join(h.task).await;
+
+		assert_eq!(h.fanout.monitor_deliveries(), vec![101], "102 was withheld");
+		assert_eq!(
+			*h.fanout.refuted.lock().unwrap(),
+			vec![format!("ChannelMonitor {}", b)],
+			"named by funding outpoint"
+		);
+		assert_eq!(h.fanout.live_snapshots(), 1, "kept as the evidence");
+		assert!(
+			h.ops_tx.send(ChainOp::Synced { tip_height: 103 }).await.is_err(),
+			"nothing is applied after a halt"
+		);
+	}
+
+	#[tokio::test]
+	async fn an_ahead_monitor_on_the_same_chain_is_proven_at_its_tip_and_then_moves_in_lockstep() {
+		// The same skew, but B's persisted block at 102 IS the chain's. The replay below 102
+		// cannot prove it; at 102 the snapshot matches and is retired; nothing about B ever halts
+		// the engine; and the `ChainMonitor` is handed each height exactly once. From then on B
+		// moves with the others: the reorg of 103 rewinds both monitors on their (now common)
+		// tip.
+		let headers = headers_101_to_103(hash(100));
+		let (a, b) = (funding(1), funding(2));
+		let h = spawn(FakeFanout::with_monitors(
+			BestBlock::new(hash(100), 100),
+			[
+				(a, BestBlock::new(hash(100), 100)),
+				(b, BestBlock::new(headers[1].block_hash(), 102)),
+			],
+		));
+		assert!(connect_and_sync(&h, 101, &headers, 103).await);
+		assert_eq!(h.fanout.monitor_deliveries(), vec![101, 102, 103]);
+		assert!(h.fanout.refuted.lock().unwrap().is_empty());
+		assert!(h.fanout.take_divergence().is_none());
+		assert_eq!(h.fanout.live_snapshots(), 0, "both proven: A by 101, B at 102");
+
+		h.ops_tx.send(ChainOp::Disconnect { headers: vec![(headers[2], 103)] }).await.unwrap();
+		wait_for_state(&h, |s| matches!(s, CbfSyncState::Active { applied_tip: Some(102), .. }))
+			.await;
+		assert_eq!(h.fanout.monitor_tip(a), BestBlock::new(headers[1].block_hash(), 102));
+		assert_eq!(h.fanout.monitor_tip(b), BestBlock::new(headers[1].block_hash(), 102));
+		assert!(h.fanout.take_divergence().is_none());
+
+		drop(h.ops_tx);
+		join(h.task).await;
 	}
 
 	#[tokio::test]
@@ -617,5 +876,8 @@ mod tests {
 		connect_101_to_103(&h).await;
 		assert_eq!(h.fanout.tip().height, 103);
 		assert!(h.fanout.take_divergence().is_none());
+
+		drop(h.ops_tx);
+		join(h.task).await;
 	}
 }
