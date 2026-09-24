@@ -16,6 +16,7 @@
 //! same error code and message into the same [`TxBroadcastOutcome`].
 
 pub(crate) mod bitcoind;
+pub(crate) mod bitcoind_raw;
 #[cfg(feature = "cbf")]
 pub(crate) mod cbf;
 pub(crate) mod dependent;

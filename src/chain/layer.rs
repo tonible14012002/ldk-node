@@ -34,16 +34,19 @@ use crate::chain::adapters::dependent::DependentChainAdapter;
 use crate::chain::adapters::electrum::ElectrumChainAdapter;
 use crate::chain::adapters::esplora::EsploraChainAdapter;
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache};
+use crate::chain::cbf::source::FilterSource;
 use crate::chain::engine::bitcoind::BitcoindSyncEngine;
 use crate::chain::engine::dependent::DependentSyncEngine;
 use crate::chain::engine::electrum::ElectrumSyncEngine;
 use crate::chain::engine::esplora::EsploraSyncEngine;
 use crate::chain::engine::SyncEngine;
 use crate::chain::provider::{
-	ChainDataProvider, WireFeeEstimates, WireFeeTarget, WireLightningSyncRequest,
-	WireLightningSyncResponse, WireMempoolRequest, WireMempoolResponse, WireSyncRequest,
-	WireUpdate, CHAIN_WIRE_VERSION,
+	ChainDataProvider, WireBlockChunk, WireBlockRequest, WireChainTip, WireFeeEstimates,
+	WireFeeTarget, WireFilterHeaders, WireFilterHeadersRequest, WireFilters, WireFiltersRequest,
+	WireHeaders, WireHeadersRequest, WireLightningSyncRequest, WireLightningSyncResponse,
+	WireMempoolRequest, WireMempoolResponse, WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
 };
+use crate::chain::raw_serve::RawChainServer;
 use crate::chain::seam::{
 	accepted_txids, package_result, ActionChain, ActionResult, Anchored, Answered, BroadcastAction,
 	BroadcastRejection, ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer,
@@ -284,6 +287,9 @@ pub(crate) struct ChainLayer {
 	/// accepting an unverifiable answer is logged once per tip rather than
 	/// once per pass.
 	last_unverifiable_tip: Mutex<Option<BlockId>>,
+	/// Raw BIP157/158 serving, on a node configured with a raw source.
+	/// Independent of `engine`; see [`RawChainServer`].
+	raw: Option<RawChainServer>,
 }
 
 impl ChainLayer {
@@ -304,7 +310,17 @@ impl ChainLayer {
 			},
 			recent_own_broadcasts: Mutex::new(RecentOwnBroadcasts::default()),
 			last_unverifiable_tip: Mutex::new(None),
+			raw: None,
 		}
+	}
+
+	/// Serve raw BIP157/158 data to other nodes from `source`.
+	///
+	/// Set once, at build time, before the layer is shared. Independent of
+	/// the sync engine: whatever this node follows the chain with, the raw
+	/// serves read `source` alone.
+	pub(crate) fn set_raw_source(&mut self, source: Arc<dyn FilterSource>) {
+		self.raw = Some(RawChainServer::new(source, Arc::clone(&self.shared.logger)));
 	}
 
 	/// Slots for a backend whose single adapter fills every action slot on
@@ -1493,6 +1509,52 @@ impl ChainLayer {
 	) -> Result<WireLightningSyncResponse, Error> {
 		self.refuse_unless_serving()?;
 		self.engine.serve_lightning_sync(req).await
+	}
+
+	// ── raw BIP157/158 serving ───────────────────────────────────────────
+	//
+	// Refused — [`Error::ChainServeUnsupported`] — unless a raw source is
+	// configured, and only then: raw data carries its own proof, so these
+	// do not ask `refuse_unless_serving`. A filter-following or Dependent
+	// node with a raw source serves just as well as a Pro one.
+
+	fn raw_server(&self) -> Result<&RawChainServer, Error> {
+		self.raw.as_ref().ok_or(Error::ChainServeUnsupported)
+	}
+
+	/// The raw source's best block.
+	pub(crate) async fn serve_tip(&self) -> Result<WireChainTip, Error> {
+		self.raw_server()?.serve_tip().await
+	}
+
+	/// Consecutive best-chain headers, at most [`MAX_HEADERS_PER_REQUEST`].
+	///
+	/// [`MAX_HEADERS_PER_REQUEST`]: crate::chain::provider::MAX_HEADERS_PER_REQUEST
+	pub(crate) async fn serve_headers(
+		&self, req: &WireHeadersRequest,
+	) -> Result<WireHeaders, Error> {
+		self.raw_server()?.serve_headers(req).await
+	}
+
+	/// Filter headers for a span ending at a block hash.
+	pub(crate) async fn serve_filter_headers(
+		&self, req: &WireFilterHeadersRequest,
+	) -> Result<WireFilterHeaders, Error> {
+		self.raw_server()?.serve_filter_headers(req).await
+	}
+
+	/// Basic filters for a span ending at a block hash.
+	pub(crate) async fn serve_filters(
+		&self, req: &WireFiltersRequest,
+	) -> Result<WireFilters, Error> {
+		self.raw_server()?.serve_filters(req).await
+	}
+
+	/// One chunk of a block.
+	pub(crate) async fn serve_block_chunk(
+		&self, req: &WireBlockRequest,
+	) -> Result<WireBlockChunk, Error> {
+		self.raw_server()?.serve_block_chunk(req).await
 	}
 
 	/// Reorg-aware status of a watched transaction (Peerswap native primitive B5).
@@ -3313,5 +3375,82 @@ mod tests {
 				));
 			}
 		}
+	}
+
+	/// The raw serves answer only on a node with a raw source, whatever its
+	/// engine — a Dependent node included — and through the wire they hand
+	/// a consuming `FilterSource` exactly what the raw source holds.
+	#[tokio::test]
+	async fn raw_serves_follow_the_raw_source_not_the_engine() {
+		use crate::chain::provider::{
+			WireBlockRequest, WireFilterHeadersRequest, WireFiltersRequest, WireHeadersRequest,
+		};
+		use crate::chain::raw_serve::{MockFilterSource, ServedFilterSource};
+
+		let headers_req =
+			WireHeadersRequest { version: CHAIN_WIRE_VERSION, from_height: 0, count: 1 };
+		let zero = BlockHash::all_zeros().to_string();
+		let fh_req = WireFilterHeadersRequest {
+			version: CHAIN_WIRE_VERSION,
+			start_height: 0,
+			stop_hash: zero.clone(),
+		};
+		let filters_req = WireFiltersRequest {
+			version: CHAIN_WIRE_VERSION,
+			start_height: 0,
+			stop_hash: zero.clone(),
+		};
+		let block_req = WireBlockRequest { version: CHAIN_WIRE_VERSION, hash: zero, chunk: 0 };
+
+		for layer in [esplora_preset(), bitcoind_rpc_preset(), dependent_preset()] {
+			assert!(matches!(layer.serve_tip().await, Err(Error::ChainServeUnsupported)));
+			assert!(matches!(
+				layer.serve_headers(&headers_req).await,
+				Err(Error::ChainServeUnsupported)
+			));
+			assert!(matches!(
+				layer.serve_filter_headers(&fh_req).await,
+				Err(Error::ChainServeUnsupported)
+			));
+			assert!(matches!(
+				layer.serve_filters(&filters_req).await,
+				Err(Error::ChainServeUnsupported)
+			));
+			assert!(matches!(
+				layer.serve_block_chunk(&block_req).await,
+				Err(Error::ChainServeUnsupported)
+			));
+		}
+
+		// A Dependent node serves nothing indexed, but with a raw source it
+		// serves raw data.
+		let source = Arc::new(MockFilterSource::new(30, 1_300_000));
+		let mut layer = dependent_preset();
+		assert!(!layer.engine.serves_peers());
+		layer.set_raw_source(Arc::clone(&source) as Arc<dyn FilterSource>);
+		let served = ServedFilterSource { layer: Arc::new(layer) };
+
+		let tip = served.tip().await.unwrap();
+		assert_eq!(tip, BlockId { height: 29, hash: source.blocks[29].block_hash() });
+
+		let headers = served.headers(10, 5).await.unwrap();
+		let expected: Vec<_> = source.blocks[10..15].iter().map(|b| b.header).collect();
+		assert_eq!(headers, expected);
+
+		let filters = served.filters(25, tip.hash).await.unwrap();
+		assert_eq!(filters.len(), 5);
+		assert_eq!(filters[0].filter, source.filter(25));
+		assert_eq!(filters[4].block_hash, tip.hash);
+
+		let fh = served.filter_headers(25, tip.hash).await.unwrap();
+		let mut prev = fh.previous;
+		for (f, h) in filters.iter().zip(&fh.headers) {
+			prev = f.filter.filter_header(&prev);
+			assert_eq!(prev, *h, "the filter-header chain commits to the served filters");
+		}
+
+		let block = served.block(tip.hash).await.unwrap();
+		assert_eq!(block, source.blocks[29]);
+		assert_eq!(source.calls("block"), 1);
 	}
 }

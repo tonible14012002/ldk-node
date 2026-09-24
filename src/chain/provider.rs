@@ -446,6 +446,149 @@ pub struct WireLightningSyncResponse {
 	pub unconfirmed: Vec<String>,
 }
 
+// ── RAW BIP157 DATA ──────────────────────────────────────────────────────────
+//
+// Raw consensus data a filter-following node verifies itself, served by a
+// Pro node that has a raw source (see `chain_filter_source`). Unlike every
+// message above, nothing here is an answer to be trusted: headers carry their
+// proof of work, filter headers chain to one another, a block carries its
+// merkle root. These are not part of `ChainDataProvider`; the consuming side
+// is a `FilterSource`.
+
+/// Most headers one [`WireHeadersRequest`] may ask for — BIP157's
+/// `getheaders` batch.
+pub const MAX_HEADERS_PER_REQUEST: u32 = 2000;
+
+/// Most filters one [`WireFiltersRequest`] may span. Filters run to tens of
+/// KiB on mainnet, so this keeps a reply around a few MiB at worst; BIP157's
+/// `getcfilters` allows 1000, which is too large for one relayed message.
+pub const MAX_FILTERS_PER_REQUEST: u32 = 100;
+
+/// Most filter headers one [`WireFilterHeadersRequest`] may span — BIP157's
+/// `getcfheaders` batch.
+pub const MAX_FILTER_HEADERS_PER_REQUEST: u32 = 2000;
+
+/// Raw bytes per [`WireBlockChunk`]. Hex doubles it, so a chunk reply stays
+/// near 1.5 MiB — well under the 2 MiB a relayed message may carry.
+pub const BLOCK_CHUNK_BYTES: usize = 768 * 1024;
+
+/// The serving node's raw source's best block — where a filter-following
+/// node learns how far to ask.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireChainTip {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// The best block.
+	pub tip: WireBlockId,
+}
+
+/// "Give me `count` best-chain headers from `from_height` up."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireHeadersRequest {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Height of the first header wanted.
+	pub from_height: u32,
+	/// How many, at most [`MAX_HEADERS_PER_REQUEST`].
+	pub count: u32,
+}
+
+/// Consecutive best-chain headers, ascending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireHeaders {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Consensus-encoded 80-byte headers, hex. Fewer than asked when the
+	/// serving node's tip came first.
+	pub headers: Vec<String>,
+}
+
+/// "Give me the filter headers from `start_height` up to `stop_hash`."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFilterHeadersRequest {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Height of the first block in the span.
+	pub start_height: u32,
+	/// Hash of the last block in the span, hex, RPC byte order. At most
+	/// [`MAX_FILTER_HEADERS_PER_REQUEST`] blocks above `start_height - 1`.
+	pub stop_hash: String,
+}
+
+/// Filter headers for a span, as BIP157's `cfheaders`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFilterHeaders {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// The filter header below the span, hex, RPC byte order; all zeros
+	/// when the span starts at genesis.
+	pub previous: String,
+	/// One filter header per block of the span, ascending, hex.
+	pub headers: Vec<String>,
+}
+
+/// "Give me the basic filters from `start_height` up to `stop_hash`."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFiltersRequest {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Height of the first block in the span.
+	pub start_height: u32,
+	/// Hash of the last block in the span, hex. At most
+	/// [`MAX_FILTERS_PER_REQUEST`] blocks.
+	pub stop_hash: String,
+}
+
+/// One block's basic filter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireIndexedFilter {
+	/// Height of the block.
+	pub height: u32,
+	/// Hash of the block, hex, RPC byte order.
+	pub block_hash: String,
+	/// The BIP158 filter as `getblockfilter` returns it, hex.
+	pub filter_hex: String,
+}
+
+/// Basic filters for a span, ascending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFilters {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// One filter per block of the span.
+	pub filters: Vec<WireIndexedFilter>,
+}
+
+/// "Give me chunk `chunk` of block `hash`."
+///
+/// A block is served in [`BLOCK_CHUNK_BYTES`] pieces so no one reply outgrows
+/// a relayed message. The first reply says how many chunks there are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireBlockRequest {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Hash of the block, hex, RPC byte order.
+	pub hash: String,
+	/// Zero-based chunk index; `0` is always valid.
+	pub chunk: u32,
+}
+
+/// One piece of a consensus-encoded block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireBlockChunk {
+	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
+	pub version: u16,
+	/// Hash of the block, hex, RPC byte order.
+	pub hash: String,
+	/// Zero-based index of this chunk.
+	pub chunk: u32,
+	/// How many chunks the whole block takes; at least 1.
+	pub total_chunks: u32,
+	/// This chunk's bytes, hex. Concatenated in index order, the chunks are
+	/// the consensus-encoded block.
+	pub bytes_hex: String,
+}
+
 // ── THE PORT ─────────────────────────────────────────────────────────────────
 
 /// A remote source of chain data.

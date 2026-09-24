@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use crate::chain::adapters::bitcoind_raw::BitcoindRpcSource;
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::birthday::birthday_checkpoint;
 use crate::chain::provider::ChainDataProvider;
@@ -124,6 +125,25 @@ enum ChainDataSourceConfig {
 		peers: Vec<String>,
 		config: CbfConfig,
 	},
+}
+
+/// Where this node reads the raw BIP157/158 data it serves to other nodes;
+/// see [`NodeBuilder::set_raw_chain_source_bitcoind_rpc`].
+#[derive(Clone)]
+struct RawChainSourceConfig {
+	url: String,
+	user: String,
+	password: String,
+	cert_sha256: Option<String>,
+}
+
+// Hand-written so the credentials never reach a log.
+impl std::fmt::Debug for RawChainSourceConfig {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RawChainSourceConfig")
+			.field("cert_pinned", &self.cert_sha256.is_some())
+			.finish_non_exhaustive()
+	}
 }
 
 /// The provider a filter-following node borrows from, kept apart from the
@@ -314,6 +334,7 @@ pub struct NodeBuilder {
 	chain_data_source_config: Option<ChainDataSourceConfig>,
 	#[cfg(feature = "cbf")]
 	chain_provider_fallback: Option<ChainProviderFallback>,
+	raw_chain_source_config: Option<RawChainSourceConfig>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -341,6 +362,7 @@ impl NodeBuilder {
 			chain_data_source_config,
 			#[cfg(feature = "cbf")]
 			chain_provider_fallback: None,
+			raw_chain_source_config: None,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
@@ -499,6 +521,33 @@ impl NodeBuilder {
 		{
 			None
 		}
+	}
+
+	/// Serve raw BIP157/158 data — headers, filter headers, filters, blocks —
+	/// to other nodes, read from a bitcoind's JSON-RPC at `url`.
+	///
+	/// Independent of the chain source: this node may follow the chain over
+	/// Electrum or anything else and still serve raw data from here, through
+	/// [`Node::chain_serve_tip`] and its siblings. Without this, those serves
+	/// are refused.
+	///
+	/// `url` is `http://` or `https://`, typically a TLS proxy in front of
+	/// the RPC port. `user`/`password` are sent as basic auth when `user` is
+	/// non-empty. `cert_sha256`, the hex SHA-256 of the server's leaf
+	/// certificate (DER), pins a self-signed certificate; it requires
+	/// `https://`. Filters need the bitcoind to run with
+	/// `-blockfilterindex=1`; without it headers and blocks are still served
+	/// and filter requests fail.
+	///
+	/// A URL or pin that does not parse fails the build with
+	/// [`BuildError::ChainSourceSetupFailed`]. Nothing is contacted until the
+	/// first request.
+	pub fn set_raw_chain_source_bitcoind_rpc(
+		&mut self, url: String, user: String, password: String, cert_sha256: Option<String>,
+	) -> &mut Self {
+		self.raw_chain_source_config =
+			Some(RawChainSourceConfig { url, user, password, cert_sha256 });
+		self
 	}
 
 	/// Configures the [`Node`] instance to connect to a Bitcoin Core node via RPC.
@@ -857,6 +906,7 @@ impl NodeBuilder {
 			config,
 			self.chain_data_source_config.as_ref(),
 			self.chain_provider_fallback(),
+			self.raw_chain_source_config.as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -881,6 +931,7 @@ impl NodeBuilder {
 			config,
 			self.chain_data_source_config.as_ref(),
 			self.chain_provider_fallback(),
+			self.raw_chain_source_config.as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1029,6 +1080,21 @@ impl ArcedNodeBuilder {
 	#[cfg(feature = "cbf")]
 	pub fn set_chain_provider_fallback(&self, provider: Arc<dyn ChainDataProvider>) {
 		self.inner.write().unwrap().set_chain_provider_fallback(provider);
+	}
+
+	/// Serve raw BIP157/158 data read from a bitcoind's JSON-RPC; see
+	/// [`NodeBuilder::set_raw_chain_source_bitcoind_rpc`].
+	///
+	/// Rust-only for now: not in the UDL.
+	pub fn set_raw_chain_source_bitcoind_rpc(
+		&self, url: String, user: String, password: String, cert_sha256: Option<String>,
+	) {
+		self.inner.write().unwrap().set_raw_chain_source_bitcoind_rpc(
+			url,
+			user,
+			password,
+			cert_sha256,
+		);
 	}
 
 	/// Configures the [`Node`] instance to source its gossip data from the Lightning peer-to-peer
@@ -1282,6 +1348,7 @@ fn seed_wallet_at_birthday(
 fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
 	chain_provider_fallback: Option<Arc<dyn ChainDataProvider>>,
+	raw_chain_source_config: Option<&RawChainSourceConfig>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
@@ -1559,6 +1626,27 @@ fn build_with_store_internal(
 			"A chain provider fallback ({}) is set, but the configured chain source scans its own backend and never consults one; ignoring it.",
 			provider.name()
 		);
+	}
+
+	let mut chain_source = chain_source;
+	if let Some(raw) = raw_chain_source_config {
+		let source = BitcoindRpcSource::new(
+			&raw.url,
+			Some(raw.user.clone()),
+			Some(raw.password.clone()),
+			raw.cert_sha256.as_deref(),
+		)
+		.map_err(|e| {
+			log_error!(logger, "Failed to set up the raw chain source: {}", e);
+			BuildError::ChainSourceSetupFailed
+		})?;
+		log_info!(
+			logger,
+			"Serving raw BIP157 data from bitcoind RPC at {}{}",
+			source.endpoint(),
+			if raw.cert_sha256.is_some() { " (certificate pinned)" } else { "" }
+		);
+		chain_source.set_raw_source(Arc::new(source));
 	}
 
 	let chain_source = Arc::new(chain_source);

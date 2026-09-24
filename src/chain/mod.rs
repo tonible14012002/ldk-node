@@ -9,10 +9,20 @@ pub(crate) mod adapters;
 pub(crate) mod bitcoind;
 #[cfg(feature = "cbf")]
 pub(crate) mod cbf;
+/// Without the `cbf` feature only the [`FilterSource`] port is compiled: a Pro
+/// node serves raw BIP157 data from its RPC source without following the chain
+/// by filters itself.
+///
+/// [`FilterSource`]: cbf::source::FilterSource
+#[cfg(not(feature = "cbf"))]
+pub(crate) mod cbf {
+	pub mod source;
+}
 pub(crate) mod electrum;
 pub(crate) mod engine;
 mod layer;
 pub mod provider;
+pub(crate) mod raw_serve;
 pub(crate) mod seam;
 pub(crate) mod wire_convert;
 

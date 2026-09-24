@@ -108,6 +108,16 @@ mod wallet;
 /// business; this crate never learns what it is.
 pub use crate::chain::provider as chain_provider;
 
+/// The raw BIP157/158 filter source port.
+///
+/// [`chain_filter_source::FilterSource`] is what a compact-block-filter node
+/// reads headers, filter headers, filters and blocks through, verifying all
+/// of it. A Pro node with a raw source (see
+/// [`Builder::set_raw_chain_source_bitcoind_rpc`]) serves that data through
+/// [`Node::chain_serve_headers`] and its siblings; an app implements the trait
+/// over its own transport to consume it.
+pub use crate::chain::cbf::source as chain_filter_source;
+
 pub use bip39;
 pub use bitcoin;
 pub use lightning;
@@ -1813,6 +1823,81 @@ impl Node {
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
 		runtime.block_on(async move { chain_source.serve_mempool(&req).await })
+	}
+
+	/// Serve this node's raw source's best block to another node.
+	///
+	/// The raw serves — this and [`Node::chain_serve_headers`],
+	/// [`Node::chain_serve_filter_headers`], [`Node::chain_serve_filters`],
+	/// [`Node::chain_serve_block`] — hand out BIP157/158 consensus data that
+	/// the asking node verifies itself, read from the raw source set through
+	/// [`Builder::set_raw_chain_source_bitcoind_rpc`]. They do not depend on
+	/// how this node follows the chain itself.
+	///
+	/// Errors with [`Error::ChainServeUnsupported`] when no raw source is
+	/// configured, and with [`Error::ChainServeFailed`] when the request is
+	/// malformed or over its limit, or the raw source could not answer.
+	pub fn chain_serve_tip(&self) -> Result<chain_provider::WireChainTip, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		runtime.block_on(async move { chain_source.serve_tip().await })
+	}
+
+	/// Serve up to [`chain_provider::MAX_HEADERS_PER_REQUEST`] consecutive
+	/// best-chain headers; see [`Node::chain_serve_tip`].
+	pub fn chain_serve_headers(
+		&self, req: &chain_provider::WireHeadersRequest,
+	) -> Result<chain_provider::WireHeaders, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_headers(&req).await })
+	}
+
+	/// Serve the filter headers of a span of at most
+	/// [`chain_provider::MAX_FILTER_HEADERS_PER_REQUEST`] blocks; see
+	/// [`Node::chain_serve_tip`].
+	pub fn chain_serve_filter_headers(
+		&self, req: &chain_provider::WireFilterHeadersRequest,
+	) -> Result<chain_provider::WireFilterHeaders, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_filter_headers(&req).await })
+	}
+
+	/// Serve the basic filters of a span of at most
+	/// [`chain_provider::MAX_FILTERS_PER_REQUEST`] blocks; see
+	/// [`Node::chain_serve_tip`].
+	pub fn chain_serve_filters(
+		&self, req: &chain_provider::WireFiltersRequest,
+	) -> Result<chain_provider::WireFilters, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_filters(&req).await })
+	}
+
+	/// Serve one [`chain_provider::BLOCK_CHUNK_BYTES`] chunk of a block; see
+	/// [`Node::chain_serve_tip`]. The block is fetched once and cached, so
+	/// asking for its chunks in turn costs one fetch.
+	pub fn chain_serve_block(
+		&self, req: &chain_provider::WireBlockRequest,
+	) -> Result<chain_provider::WireBlockChunk, Error> {
+		let rt_lock = self.runtime.read().unwrap();
+		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+
+		let chain_source = Arc::clone(&self.chain_source);
+		let req = req.clone();
+		runtime.block_on(async move { chain_source.serve_block_chunk(&req).await })
 	}
 
 	/// Close a previously opened channel.

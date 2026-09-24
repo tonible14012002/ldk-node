@@ -40,18 +40,22 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use bitcoin::bip158::{BlockFilter, FilterHeader};
+use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::{DisplayHex, FromHex};
-use bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Block, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest, SyncResponse};
 use bdk_chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use bdk_wallet::{KeychainKind, Update};
 
+use crate::chain::cbf::source::{FilterHeaders, IndexedFilter};
 use crate::chain::provider::{
-	ChainProviderError, WireAnchor, WireBlockId, WireMempoolRequest, WireMempoolResponse,
+	ChainProviderError, WireAnchor, WireBlockChunk, WireBlockId, WireChainTip, WireFilterHeaders,
+	WireFilters, WireHeaders, WireIndexedFilter, WireMempoolRequest, WireMempoolResponse,
 	WireOutPoint, WireSeenAt, WireSyncRequest, WireTxOut, WireUnconfirmedTx, WireUpdate,
-	CHAIN_WIRE_VERSION,
+	BLOCK_CHUNK_BYTES, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{MempoolAnswer, MempoolQuery, MempoolScope};
 
@@ -420,6 +424,202 @@ pub(crate) fn tx_update_to_wire(
 	WireUpdate { version: CHAIN_WIRE_VERSION, txs, txouts, anchors, seen_ats, checkpoints }
 }
 
+// ── RAW BIP157 DATA (both sides) ─────────────────────────────────────────────
+//
+// Public, unlike the rest of this module: an app implementing a network-backed
+// `FilterSource` decodes these replies itself. Decoding checks shape only —
+// that a header is 80 bytes, a hash parses, a block's bytes hash to the block
+// asked for. Whether the data is *true* is for the verifying client.
+
+fn filter_header_from_wire(s: &str) -> Result<FilterHeader, ChainProviderError> {
+	s.parse::<FilterHeader>().map_err(|e| malformed("filter header", e))
+}
+
+/// A raw source's tip, projected onto the wire.
+pub fn chain_tip_to_wire(tip: &BlockId) -> WireChainTip {
+	WireChainTip { version: CHAIN_WIRE_VERSION, tip: block_id_to_wire(tip) }
+}
+
+/// A raw source's tip, decoded from the wire.
+pub fn chain_tip_from_wire(wire: &WireChainTip) -> Result<BlockId, ChainProviderError> {
+	check_version(wire.version)?;
+	block_id_from_wire(&wire.tip)
+}
+
+/// Headers, projected onto the wire.
+pub fn headers_to_wire(headers: &[Header]) -> WireHeaders {
+	WireHeaders {
+		version: CHAIN_WIRE_VERSION,
+		headers: headers.iter().map(header_to_wire).collect(),
+	}
+}
+
+/// Headers, decoded from the wire.
+pub fn headers_from_wire(wire: &WireHeaders) -> Result<Vec<Header>, ChainProviderError> {
+	check_version(wire.version)?;
+	wire.headers.iter().map(|h| header_from_wire(h)).collect()
+}
+
+/// A span's filter headers, projected onto the wire.
+pub fn filter_headers_to_wire(filter_headers: &FilterHeaders) -> WireFilterHeaders {
+	WireFilterHeaders {
+		version: CHAIN_WIRE_VERSION,
+		previous: filter_headers.previous.to_string(),
+		headers: filter_headers.headers.iter().map(|h| h.to_string()).collect(),
+	}
+}
+
+/// A span's filter headers, decoded from the wire.
+pub fn filter_headers_from_wire(
+	wire: &WireFilterHeaders,
+) -> Result<FilterHeaders, ChainProviderError> {
+	check_version(wire.version)?;
+	Ok(FilterHeaders {
+		previous: filter_header_from_wire(&wire.previous)?,
+		headers: wire
+			.headers
+			.iter()
+			.map(|h| filter_header_from_wire(h))
+			.collect::<Result<_, _>>()?,
+	})
+}
+
+/// Filters, projected onto the wire.
+pub fn filters_to_wire(filters: &[IndexedFilter]) -> WireFilters {
+	WireFilters {
+		version: CHAIN_WIRE_VERSION,
+		filters: filters
+			.iter()
+			.map(|f| WireIndexedFilter {
+				height: f.height,
+				block_hash: f.block_hash.to_string(),
+				filter_hex: f.filter.content.to_lower_hex_string(),
+			})
+			.collect(),
+	}
+}
+
+/// Filters, decoded from the wire.
+pub fn filters_from_wire(wire: &WireFilters) -> Result<Vec<IndexedFilter>, ChainProviderError> {
+	check_version(wire.version)?;
+	wire.filters
+		.iter()
+		.map(|f| {
+			let content = Vec::<u8>::from_hex(&f.filter_hex).map_err(|e| malformed("filter", e))?;
+			Ok(IndexedFilter {
+				height: f.height,
+				block_hash: block_hash_from_wire(&f.block_hash)?,
+				filter: BlockFilter { content },
+			})
+		})
+		.collect()
+}
+
+/// How many [`BLOCK_CHUNK_BYTES`] chunks a block of `len` bytes takes; at
+/// least one, so even an empty answer has a chunk 0.
+pub fn block_chunk_count(len: usize) -> u32 {
+	(len.div_ceil(BLOCK_CHUNK_BYTES)).max(1) as u32
+}
+
+/// Chunk `chunk` of the consensus-encoded block `block_bytes`, or `None` when
+/// the block has no such chunk.
+pub fn block_chunk_to_wire(
+	hash: &BlockHash, block_bytes: &[u8], chunk: u32,
+) -> Option<WireBlockChunk> {
+	let total_chunks = block_chunk_count(block_bytes.len());
+	if chunk >= total_chunks {
+		return None;
+	}
+	let start = chunk as usize * BLOCK_CHUNK_BYTES;
+	let end = (start + BLOCK_CHUNK_BYTES).min(block_bytes.len());
+	Some(WireBlockChunk {
+		version: CHAIN_WIRE_VERSION,
+		hash: hash.to_string(),
+		chunk,
+		total_chunks,
+		bytes_hex: block_bytes[start..end].to_lower_hex_string(),
+	})
+}
+
+/// The most chunks a block may claim: a consensus-valid block serialises to
+/// at most 4 MB (every byte weighs at least one unit), so anything claiming
+/// more is refused before it is buffered.
+const MAX_BLOCK_CHUNKS: u32 = (4_000_000usize.div_ceil(BLOCK_CHUNK_BYTES)) as u32;
+
+/// Reassembles a block from its [`WireBlockChunk`]s, in order.
+///
+/// Refuses — [`ChainProviderError::Malformed`] — a chunk for another block,
+/// out of order, of the wrong size, claiming a different or implausible
+/// chunk count, or a finished block whose bytes do not hash to the block
+/// asked for.
+#[derive(Debug)]
+pub struct BlockChunkAssembler {
+	hash: BlockHash,
+	total_chunks: Option<u32>,
+	next_chunk: u32,
+	bytes: Vec<u8>,
+}
+
+impl BlockChunkAssembler {
+	/// Start assembling block `hash`.
+	pub fn new(hash: BlockHash) -> Self {
+		Self { hash, total_chunks: None, next_chunk: 0, bytes: Vec::new() }
+	}
+
+	/// The chunk index to ask for next.
+	pub fn next_chunk(&self) -> u32 {
+		self.next_chunk
+	}
+
+	/// Add the next chunk. `Ok(Some(block))` once the last one is in.
+	pub fn push(&mut self, wire: &WireBlockChunk) -> Result<Option<Block>, ChainProviderError> {
+		check_version(wire.version)?;
+		if block_hash_from_wire(&wire.hash)? != self.hash {
+			return Err(ChainProviderError::Malformed("block chunk for another block".into()));
+		}
+		if wire.chunk != self.next_chunk {
+			return Err(ChainProviderError::Malformed(format!(
+				"block chunk {} out of order, expected {}",
+				wire.chunk, self.next_chunk
+			)));
+		}
+		if wire.total_chunks == 0 || wire.total_chunks > MAX_BLOCK_CHUNKS {
+			return Err(ChainProviderError::Malformed(format!(
+				"implausible block chunk count {}",
+				wire.total_chunks
+			)));
+		}
+		if *self.total_chunks.get_or_insert(wire.total_chunks) != wire.total_chunks {
+			return Err(ChainProviderError::Malformed("block chunk count changed".into()));
+		}
+		let bytes =
+			Vec::<u8>::from_hex(&wire.bytes_hex).map_err(|e| malformed("block chunk", e))?;
+		let last = wire.chunk + 1 == wire.total_chunks;
+		let size_ok = if last {
+			!bytes.is_empty() && bytes.len() <= BLOCK_CHUNK_BYTES
+		} else {
+			bytes.len() == BLOCK_CHUNK_BYTES
+		};
+		if !size_ok {
+			return Err(ChainProviderError::Malformed(format!(
+				"block chunk {} has {} bytes",
+				wire.chunk,
+				bytes.len()
+			)));
+		}
+		self.bytes.extend_from_slice(&bytes);
+		self.next_chunk += 1;
+		if !last {
+			return Ok(None);
+		}
+		let block: Block = deserialize(&self.bytes).map_err(|e| malformed("block", e))?;
+		if block.block_hash() != self.hash {
+			return Err(ChainProviderError::Malformed("block bytes hash to another block".into()));
+		}
+		Ok(Some(block))
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -576,5 +776,182 @@ mod tests {
 		assert_eq!(widened.height(), 200);
 		assert!(widened.get(150).is_some());
 		assert!(widened.get(0).is_some(), "the chain still reaches genesis");
+	}
+}
+
+/// A block of about `payload` bytes — one transaction with one output whose
+/// script is `payload` bytes — for exercising chunking. Not consensus-valid;
+/// it only has to round-trip.
+#[cfg(test)]
+pub(crate) fn synthetic_block(payload: usize, nonce: u32) -> Block {
+	use bitcoin::block::Version as BlockVersion;
+	use bitcoin::hashes::Hash;
+	use bitcoin::{absolute, transaction, Amount, CompactTarget, TxIn, TxMerkleNode};
+	Block {
+		header: Header {
+			version: BlockVersion::ONE,
+			prev_blockhash: BlockHash::all_zeros(),
+			merkle_root: TxMerkleNode::all_zeros(),
+			time: 0,
+			bits: CompactTarget::from_consensus(0x207fffff),
+			nonce,
+		},
+		txdata: vec![Transaction {
+			version: transaction::Version::ONE,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn::default()],
+			output: vec![TxOut {
+				value: Amount::ZERO,
+				script_pubkey: ScriptBuf::from_bytes(vec![0x6a; payload]),
+			}],
+		}],
+	}
+}
+
+#[cfg(test)]
+mod raw_tests {
+	use super::*;
+	use bitcoin::hashes::Hash;
+
+	fn chained_headers(n: u32) -> Vec<Header> {
+		let mut headers: Vec<Header> = Vec::new();
+		for i in 0..n {
+			let mut header = synthetic_block(1, i).header;
+			if let Some(prev) = headers.last() {
+				header.prev_blockhash = prev.block_hash();
+			}
+			headers.push(header);
+		}
+		headers
+	}
+
+	#[test]
+	fn raw_wire_types_round_trip() {
+		let headers = chained_headers(5);
+		let wire = headers_to_wire(&headers);
+		assert_eq!(wire.headers[0].len(), 160, "80 bytes, hex");
+		assert_eq!(headers_from_wire(&wire).unwrap(), headers);
+
+		let tip = BlockId { height: 812_345, hash: headers[4].block_hash() };
+		assert_eq!(chain_tip_from_wire(&chain_tip_to_wire(&tip)).unwrap(), tip);
+
+		let filters: Vec<IndexedFilter> = headers
+			.iter()
+			.enumerate()
+			.map(|(i, h)| IndexedFilter {
+				height: 100 + i as u32,
+				block_hash: h.block_hash(),
+				filter: BlockFilter::new(&[1, 2, 3, i as u8]),
+			})
+			.collect();
+		assert_eq!(filters_from_wire(&filters_to_wire(&filters)).unwrap(), filters);
+
+		let mut prev = FilterHeader::all_zeros();
+		let chain: Vec<FilterHeader> = filters
+			.iter()
+			.map(|f| {
+				prev = f.filter.filter_header(&prev);
+				prev
+			})
+			.collect();
+		let filter_headers =
+			FilterHeaders { previous: FilterHeader::from_byte_array([3u8; 32]), headers: chain };
+		let wire = filter_headers_to_wire(&filter_headers);
+		assert_eq!(filter_headers_from_wire(&wire).unwrap(), filter_headers);
+
+		// The JSON form round-trips too: this is what crosses the network.
+		let json = serde_json::to_string(&wire).unwrap();
+		assert_eq!(serde_json::from_str::<WireFilterHeaders>(&json).unwrap(), wire);
+	}
+
+	#[test]
+	fn raw_wire_refuses_other_versions_and_garbage() {
+		let mut wire = headers_to_wire(&chained_headers(1));
+		wire.version = CHAIN_WIRE_VERSION + 1;
+		assert!(matches!(
+			headers_from_wire(&wire),
+			Err(ChainProviderError::VersionMismatch { .. })
+		));
+
+		let wire = WireHeaders { version: CHAIN_WIRE_VERSION, headers: vec!["00ff".into()] };
+		assert!(matches!(headers_from_wire(&wire), Err(ChainProviderError::Malformed(_))));
+
+		let wire = WireFilters {
+			version: CHAIN_WIRE_VERSION,
+			filters: vec![WireIndexedFilter {
+				height: 1,
+				block_hash: "not a hash".into(),
+				filter_hex: "00".into(),
+			}],
+		};
+		assert!(matches!(filters_from_wire(&wire), Err(ChainProviderError::Malformed(_))));
+	}
+
+	#[test]
+	fn chunk_math() {
+		assert_eq!(block_chunk_count(0), 1);
+		assert_eq!(block_chunk_count(1), 1);
+		assert_eq!(block_chunk_count(BLOCK_CHUNK_BYTES), 1);
+		assert_eq!(block_chunk_count(BLOCK_CHUNK_BYTES + 1), 2);
+		assert_eq!(block_chunk_count(4_000_000), MAX_BLOCK_CHUNKS);
+		// A full chunk, hex, with its JSON envelope, stays well under the
+		// 2 MiB a relayed message may carry.
+		let hash = BlockHash::all_zeros();
+		let chunk = block_chunk_to_wire(&hash, &vec![0u8; BLOCK_CHUNK_BYTES], 0).unwrap();
+		assert!(serde_json::to_vec(&chunk).unwrap().len() < 1_700_000);
+	}
+
+	/// A block over 1 MiB is served in more than one chunk and reassembles to
+	/// exactly the original bytes.
+	#[test]
+	fn a_large_block_reassembles_from_its_chunks() {
+		let block = synthetic_block(1_300_000, 7);
+		let bytes = serialize(&block);
+		let hash = block.block_hash();
+		let total = block_chunk_count(bytes.len());
+		assert_eq!(total, 2);
+		assert!(block_chunk_to_wire(&hash, &bytes, total).is_none(), "no chunk past the end");
+
+		let mut assembler = BlockChunkAssembler::new(hash);
+		let mut rebuilt = None;
+		while rebuilt.is_none() {
+			let chunk = block_chunk_to_wire(&hash, &bytes, assembler.next_chunk()).unwrap();
+			assert_eq!(chunk.total_chunks, total);
+			rebuilt = assembler.push(&chunk).unwrap();
+		}
+		let rebuilt = rebuilt.unwrap();
+		assert_eq!(serialize(&rebuilt), bytes);
+		assert_eq!(rebuilt, block);
+	}
+
+	#[test]
+	fn the_assembler_refuses_what_does_not_add_up() {
+		let block = synthetic_block(1_300_000, 7);
+		let bytes = serialize(&block);
+		let hash = block.block_hash();
+		let first = block_chunk_to_wire(&hash, &bytes, 0).unwrap();
+		let second = block_chunk_to_wire(&hash, &bytes, 1).unwrap();
+
+		// Out of order.
+		assert!(BlockChunkAssembler::new(hash).push(&second).is_err());
+		// Another block's assembler.
+		let other = synthetic_block(10, 8).block_hash();
+		assert!(BlockChunkAssembler::new(other).push(&first).is_err());
+		// A chunk count that changes midway, or is implausible.
+		let mut assembler = BlockChunkAssembler::new(hash);
+		assembler.push(&first).unwrap();
+		assert!(assembler.push(&WireBlockChunk { total_chunks: 3, ..second.clone() }).is_err());
+		assert!(BlockChunkAssembler::new(hash)
+			.push(&WireBlockChunk { total_chunks: 1_000, ..first.clone() })
+			.is_err());
+		// A short middle chunk.
+		let short = WireBlockChunk { bytes_hex: "00".into(), ..first.clone() };
+		assert!(BlockChunkAssembler::new(hash).push(&short).is_err());
+		// Tampered bytes: the block no longer hashes to what was asked.
+		let tampered = synthetic_block(1_300_000, 9);
+		let tampered_bytes = serialize(&tampered);
+		let mut assembler = BlockChunkAssembler::new(hash);
+		assembler.push(&block_chunk_to_wire(&hash, &tampered_bytes, 0).unwrap()).unwrap();
+		assert!(assembler.push(&block_chunk_to_wire(&hash, &tampered_bytes, 1).unwrap()).is_err());
 	}
 }

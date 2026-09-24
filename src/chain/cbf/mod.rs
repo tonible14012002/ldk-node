@@ -19,6 +19,7 @@ pub(crate) mod applicator;
 pub(crate) mod birthday;
 pub(crate) mod fee;
 pub(crate) mod fee_sampler;
+pub mod source;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
