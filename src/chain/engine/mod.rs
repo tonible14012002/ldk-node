@@ -213,6 +213,12 @@ pub(crate) trait SyncEngine: Send + Sync {
 		false
 	}
 
+	/// The compact-block-filter sync status, for an engine that follows the
+	/// chain by filters; `None` for every other engine. Never blocks.
+	fn cbf_sync_status(&self) -> Option<crate::chain::CbfSyncStatus> {
+		None
+	}
+
 	/// Watch an arbitrary transaction — one the local wallet need not own —
 	/// for the TX_STATUS slot, with the output script it can be found by
 	/// (Peerswap B5, [`crate::Node::watch_txid`]).

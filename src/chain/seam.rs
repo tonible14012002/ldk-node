@@ -688,7 +688,6 @@ impl<A: ?Sized + Send + Sync + SlotAdapter> ActionChain<A> {
 	///
 	/// A poisoned lock holds a plain `Option<&'static str>` that no panic can
 	/// leave half-written, so the value is taken as is.
-	#[allow(dead_code)] // read by diagnostics once every slot runs on a chain
 	pub(crate) fn last_answered(&self) -> Option<&'static str> {
 		*self.last_answered.lock().unwrap_or_else(|e| e.into_inner())
 	}

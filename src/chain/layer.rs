@@ -45,11 +45,14 @@ use crate::chain::provider::{
 use crate::chain::seam::{
 	accepted_txids, package_result, ActionChain, ActionResult, Anchored, Answered, BroadcastAction,
 	BroadcastRejection, ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer,
-	MempoolQuery, ScriptHistoryAction, UtxoCapability, UtxoVerification, BROADCAST_BUDGET,
-	FEE_BUDGET, MAX_MEMPOOL_QUERY_ITEMS, MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
+	MempoolQuery, ScriptHistoryAction, SlotAdapter, UtxoCapability, UtxoVerification,
+	BROADCAST_BUDGET, FEE_BUDGET, MAX_MEMPOOL_QUERY_ITEMS, MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
 };
 use crate::chain::wire_convert::{mempool_answer_to_wire, wire_to_mempool_query};
-use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
+use crate::chain::{
+	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
+	ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS,
+};
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
 use crate::fee_estimator::{
 	conf_target_wire_name, get_all_conf_targets, FeeEstimator, OnchainFeeEstimator,
@@ -445,11 +448,12 @@ impl ChainLayer {
 	/// * UTXO = the existence-only source over the filters when
 	///   `cbf_config.utxo_source` asks for it; none otherwise.
 	///
-	/// `wallet_birthday_height` floors the resume checkpoint here and seeds a
-	/// fresh wallet in the builder (T9).
-	// Wired by T9: the builder's `set_chain_source_cbf` preset is the caller.
+	/// `wallet_birthday_height` floors the resume checkpoint here; the builder
+	/// seeds a fresh wallet, `ChannelManager` and sweeper at the same anchor.
+	/// `fallback` is the provider a hybrid node borrows from, set through
+	/// [`crate::Builder::set_chain_provider_fallback`].
 	#[cfg(feature = "cbf")]
-	#[allow(clippy::too_many_arguments, dead_code)]
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_cbf(
 		peers: Vec<String>, cbf_config: CbfConfig, fallback: Option<Arc<dyn ChainDataProvider>>,
 		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
@@ -570,6 +574,46 @@ impl ChainLayer {
 				.and_then(|u| u.utxo_source().map(|(_, verification)| (u.name(), verification))),
 			engine: self.engine.name(),
 		}
+	}
+
+	/// The public form of [`ChainLayer::slot_adapters`], with each slot's most
+	/// recent answerer — see [`crate::Node::chain_slot_adapters`].
+	pub(crate) fn slot_status(&self) -> ChainSlotStatus {
+		fn slot<A: ?Sized + Send + Sync + SlotAdapter>(
+			chain: &ActionChain<A>,
+		) -> ChainSlotAdapterStatus {
+			ChainSlotAdapterStatus {
+				adapters: chain.names().into_iter().map(str::to_string).collect(),
+				last_answered: chain.last_answered().map(str::to_string),
+			}
+		}
+
+		ChainSlotStatus {
+			engine: self.engine.name().to_string(),
+			fee: slot(&self.slots.fee),
+			broadcast: slot(&self.slots.broadcast),
+			#[cfg(feature = "swaps")]
+			tx_status: slot(&self.slots.tx_status),
+			#[cfg(not(feature = "swaps"))]
+			tx_status: ChainSlotAdapterStatus::default(),
+			mempool: slot(&self.slots.mempool),
+			script_history: slot(&self.slots.script_history),
+			utxo: self.slots.utxo.as_ref().and_then(|u| {
+				u.utxo_source().map(|(_, verification)| ChainUtxoStatus {
+					adapter: u.name().to_string(),
+					verification: match verification {
+						UtxoVerification::Full => ChainUtxoVerification::Full,
+						UtxoVerification::ExistenceOnly => ChainUtxoVerification::ExistenceOnly,
+					},
+				})
+			}),
+		}
+	}
+
+	/// The compact-block-filter sync status; `None` unless the engine follows
+	/// the chain by filters. See [`crate::Node::cbf_sync_status`].
+	pub(crate) fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
+		self.engine.cbf_sync_status()
 	}
 
 	/// Start any runtime-dependent part of the layer (currently Electrum only).
@@ -1882,10 +1926,8 @@ mod tests {
 
 	/// A provider that answers nothing, for a preset whose shape — not whose
 	/// answers — is under test.
-	#[cfg(feature = "cbf")]
 	struct SilentProvider;
 
-	#[cfg(feature = "cbf")]
 	#[async_trait]
 	impl ChainDataProvider for SilentProvider {
 		fn name(&self) -> String {
@@ -2051,5 +2093,256 @@ mod tests {
 			known_unconfirmed: Vec::new(),
 		};
 		assert!(matches!(layer.serve_mempool(&req).await, Err(Error::ChainServeFailed)));
+	}
+
+	/// The fixtures every preset is built over. Nothing connects at
+	/// construction: the Esplora and bitcoind clients are plain HTTP clients,
+	/// the Electrum status waits for `start`, and the provider is silent.
+	struct PresetFixture {
+		wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>,
+		broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>,
+		config: Arc<Config>,
+		logger: Arc<Logger>,
+	}
+
+	fn preset_fixture() -> PresetFixture {
+		let logger = Arc::new(Logger::new_log_facade());
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
+		PresetFixture { wallet, fee_estimator, broadcaster, kv_store, config, logger }
+	}
+
+	fn metrics() -> Arc<RwLock<NodeMetrics>> {
+		Arc::new(RwLock::new(NodeMetrics::default()))
+	}
+
+	fn esplora_preset() -> ChainLayer {
+		let f = preset_fixture();
+		ChainLayer::new_esplora(
+			"http://127.0.0.1:1".into(),
+			EsploraSyncConfig::default(),
+			f.wallet,
+			f.fee_estimator,
+			f.broadcaster,
+			f.kv_store,
+			f.config,
+			f.logger,
+			metrics(),
+		)
+	}
+
+	fn electrum_preset() -> ChainLayer {
+		let f = preset_fixture();
+		ChainLayer::new_electrum(
+			"tcp://127.0.0.1:1".into(),
+			ElectrumSyncConfig::default(),
+			f.wallet,
+			f.fee_estimator,
+			f.broadcaster,
+			f.kv_store,
+			f.config,
+			f.logger,
+			metrics(),
+		)
+	}
+
+	fn bitcoind_rpc_preset() -> ChainLayer {
+		let f = preset_fixture();
+		ChainLayer::new_bitcoind_rpc(
+			"127.0.0.1".into(),
+			1,
+			"user".into(),
+			"password".into(),
+			f.wallet,
+			f.fee_estimator,
+			f.broadcaster,
+			f.kv_store,
+			f.config,
+			f.logger,
+			metrics(),
+		)
+	}
+
+	fn bitcoind_rest_preset() -> ChainLayer {
+		let f = preset_fixture();
+		ChainLayer::new_bitcoind_rest(
+			"127.0.0.1".into(),
+			1,
+			"user".into(),
+			"password".into(),
+			f.wallet,
+			f.fee_estimator,
+			f.broadcaster,
+			f.kv_store,
+			f.config,
+			BitcoindRestClientConfig { rest_host: "127.0.0.1".into(), rest_port: 2 },
+			f.logger,
+			metrics(),
+		)
+	}
+
+	fn dependent_preset() -> ChainLayer {
+		let f = preset_fixture();
+		ChainLayer::new_dependent(
+			Arc::new(SilentProvider),
+			EsploraSyncConfig::default(),
+			f.wallet,
+			f.fee_estimator,
+			f.broadcaster,
+			f.kv_store,
+			f.logger,
+			metrics(),
+		)
+	}
+
+	/// T9: the four presets that predate the CBF one keep their slot layout,
+	/// and the public status reports the same layout the startup log prints.
+	/// Each of them scans a chain source of its own and may serve peers —
+	/// except the Dependent tier, whose every slot is its provider's.
+	#[test]
+	fn the_four_old_presets_are_unchanged() {
+		let esplora = esplora_preset();
+		let slots = esplora.slot_adapters();
+		assert_eq!(slots.engine, "esplora-tx-sync");
+		assert_eq!(slots.fee, vec!["esplora"]);
+		assert_eq!(slots.broadcast, vec!["esplora"]);
+		#[cfg(feature = "swaps")]
+		assert_eq!(slots.tx_status, vec!["esplora"]);
+		assert!(slots.mempool.is_empty(), "its sync carries the mempool itself");
+		assert!(slots.script_history.is_empty());
+		assert!(slots.utxo.is_none());
+		assert!(!esplora.engine.serves_mempool());
+
+		let electrum = electrum_preset();
+		let slots = electrum.slot_adapters();
+		assert_eq!(slots.engine, "electrum-tx-sync");
+		assert_eq!(slots.fee, vec!["electrum"]);
+		assert_eq!(slots.broadcast, vec!["electrum"]);
+		#[cfg(feature = "swaps")]
+		assert_eq!(slots.tx_status, vec!["electrum"]);
+		assert_eq!(slots.mempool, vec!["electrum"], "filled to serve, never run for itself");
+		assert!(slots.script_history.is_empty());
+		assert!(slots.utxo.is_none());
+		assert!(electrum.engine.serves_mempool());
+
+		for bitcoind in [bitcoind_rpc_preset(), bitcoind_rest_preset()] {
+			let slots = bitcoind.slot_adapters();
+			assert_eq!(slots.engine, "bitcoind-block-poll");
+			assert_eq!(slots.fee, vec!["bitcoind"]);
+			assert_eq!(slots.broadcast, vec!["bitcoind"]);
+			#[cfg(feature = "swaps")]
+			assert_eq!(slots.tx_status, vec!["bitcoind"]);
+			assert_eq!(slots.mempool, vec!["bitcoind"]);
+			assert!(slots.script_history.is_empty());
+			assert_eq!(slots.utxo, Some(("bitcoind", UtxoVerification::Full)));
+			assert!(bitcoind.engine.serves_mempool());
+		}
+
+		let dependent = dependent_preset();
+		let slots = dependent.slot_adapters();
+		assert_eq!(slots.engine, "dependent-tx-sync");
+		assert_eq!(slots.fee, vec!["dependent"]);
+		assert_eq!(slots.broadcast, vec!["dependent"]);
+		#[cfg(feature = "swaps")]
+		assert_eq!(slots.tx_status, vec!["dependent"]);
+		assert!(slots.mempool.is_empty());
+		assert!(slots.script_history.is_empty());
+		assert!(slots.utxo.is_none());
+		assert!(!dependent.engine.serves_mempool(), "every slot is its provider's");
+
+		// The public status says the same, as data, and no CBF status.
+		let status = bitcoind_rpc_preset().slot_status();
+		assert_eq!(status.engine, "bitcoind-block-poll");
+		assert_eq!(status.fee.adapters, vec!["bitcoind".to_string()]);
+		assert_eq!(status.fee.last_answered, None, "nothing has been asked yet");
+		assert_eq!(status.mempool.adapters, vec!["bitcoind".to_string()]);
+		assert!(status.script_history.adapters.is_empty());
+		assert_eq!(
+			status.utxo,
+			Some(ChainUtxoStatus {
+				adapter: "bitcoind".into(),
+				verification: ChainUtxoVerification::Full
+			})
+		);
+		#[cfg(feature = "swaps")]
+		assert_eq!(status.tx_status.adapters, vec!["bitcoind".to_string()]);
+		#[cfg(not(feature = "swaps"))]
+		assert!(status.tx_status.adapters.is_empty(), "no adapter fills a slot the build lacks");
+		assert_eq!(bitcoind_rpc_preset().cbf_sync_status(), None);
+		assert_eq!(dependent_preset().cbf_sync_status(), None);
+	}
+
+	/// T9: the CBF preset with an external fee server puts it first — in
+	/// front of the provider when there is one, in front of the
+	/// coinbase-derived rates when there is not — and reports a CBF status.
+	#[cfg(feature = "cbf")]
+	#[test]
+	fn new_cbf_puts_an_external_fee_server_first() {
+		let esplora_fee = || CbfConfig {
+			external_fee: Some(CbfExternalFee::Esplora("http://127.0.0.1:1".into())),
+			..CbfConfig::default()
+		};
+
+		let hybrid = cbf_layer(Vec::new(), esplora_fee(), Some(Arc::new(SilentProvider)))
+			.expect("a well-formed preset");
+		let slots = hybrid.slot_adapters();
+		assert_eq!(slots.fee, vec!["esplora", "dependent", "cbf_derived"]);
+		assert_eq!(slots.broadcast, vec!["dependent", "cbf_p2p"]);
+		assert_eq!(slots.mempool, vec!["dependent"]);
+		assert_eq!(hybrid.cbf_sync_status(), Some(CbfSyncStatus::Syncing));
+
+		let pure = cbf_layer(Vec::new(), esplora_fee(), None).expect("a well-formed preset");
+		assert_eq!(pure.slot_adapters().fee, vec!["esplora", "cbf_derived"]);
+		assert_eq!(pure.slot_adapters().broadcast, vec!["cbf_p2p"]);
+
+		let electrum_fee = CbfConfig {
+			external_fee: Some(CbfExternalFee::Electrum("tcp://127.0.0.1:1".into())),
+			..CbfConfig::default()
+		};
+		let pure = cbf_layer(Vec::new(), electrum_fee, None).expect("a well-formed preset");
+		assert_eq!(pure.slot_adapters().fee, vec!["electrum", "cbf_derived"]);
+
+		// The public status carries the same layout.
+		let status = hybrid.slot_status();
+		assert_eq!(status.engine, "cbf");
+		assert_eq!(
+			status.fee.adapters,
+			vec!["esplora".to_string(), "dependent".to_string(), "cbf_derived".to_string()]
+		);
+		assert_eq!(status.broadcast.adapters, vec!["dependent".to_string(), "cbf_p2p".to_string()]);
+		assert_eq!(status.script_history.adapters, vec!["dependent".to_string()]);
+		assert!(status.utxo.is_none());
+	}
+
+	/// The public slot status records which adapter answered last, per slot,
+	/// as questions are asked.
+	#[tokio::test]
+	async fn slot_status_records_the_last_answerer() {
+		let tip = BlockId { height: 7, hash: BlockHash::from_byte_array([7u8; 32]) };
+		let down = FakeMempool::new("down", MempoolBehaviour::Unavailable);
+		let up = FakeMempool::new(
+			"up",
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
+		);
+		let h = mempool_harness(&[down, up], true);
+		let before = h.layer.slot_status();
+		assert_eq!(before.mempool.adapters, vec!["down".to_string(), "up".to_string()]);
+		assert_eq!(before.mempool.last_answered, None);
+
+		let query = MempoolQuery {
+			scripts: Vec::new(),
+			known_unconfirmed: Vec::new(),
+			scope: MempoolScope::Complete,
+		};
+		h.layer.mempool(&query).await.expect("the second adapter answers");
+
+		let after = h.layer.slot_status();
+		assert_eq!(after.mempool.last_answered, Some("up".to_string()));
+		assert_eq!(after.broadcast.last_answered, None, "an unasked slot has no answerer");
 	}
 }

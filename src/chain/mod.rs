@@ -61,6 +61,79 @@ pub enum CbfSyncStatus {
 	Failed,
 }
 
+/// Which adapters fill each chain ability slot, in chain order, and which one
+/// answered last — see [`crate::Node::chain_slot_adapters`].
+///
+/// A diagnostic snapshot for a status surface; nothing in this crate branches
+/// on it, and nothing outside should either. The fields are plain so an
+/// embedding application can serialise them however it likes.
+///
+/// Every slot is present whatever the crate's feature set: a slot the build
+/// cannot fill — `tx_status` without the `swaps` feature — reports no
+/// adapters, the same as a slot no preset fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSlotStatus {
+	/// The wallet sync engine's stable name, e.g. `esplora-tx-sync`,
+	/// `bitcoind-block-polling`, `dependent-tx-sync`, `cbf`.
+	pub engine: String,
+	/// FEE — fee-rate estimation.
+	pub fee: ChainSlotAdapterStatus,
+	/// BROADCAST — transaction broadcast.
+	pub broadcast: ChainSlotAdapterStatus,
+	/// TX_STATUS — reorg-aware status of an arbitrary transaction. Empty
+	/// without the `swaps` feature.
+	pub tx_status: ChainSlotAdapterStatus,
+	/// MEMPOOL — unconfirmed transactions and evictions. Empty for an engine
+	/// whose own sync carries them.
+	pub mempool: ChainSlotAdapterStatus,
+	/// SCRIPT_HISTORY — the wide wallet scan run elsewhere. Filled only on a
+	/// hybrid node.
+	pub script_history: ChainSlotAdapterStatus,
+	/// UTXO — the adapter verifying BOLT-7 channel announcements. `None`
+	/// means the routing graph carries unverified capacities.
+	pub utxo: Option<ChainUtxoStatus>,
+}
+
+/// One slot of a [`ChainSlotStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChainSlotAdapterStatus {
+	/// The adapters' stable names, in the order the slot tries them.
+	pub adapters: Vec<String>,
+	/// The adapter that produced the slot's most recent answer, if any has
+	/// since the node was built. Not persisted.
+	pub last_answered: Option<String>,
+}
+
+/// The UTXO slot of a [`ChainSlotStatus`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainUtxoStatus {
+	/// The adapter's stable name.
+	pub adapter: String,
+	/// How far it checks a `channel_announcement`.
+	pub verification: ChainUtxoVerification,
+}
+
+/// How far a UTXO adapter checks a BOLT-7 `channel_announcement`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainUtxoVerification {
+	/// The funding output is fetched and its value and script are checked.
+	Full,
+	/// Only that the output was created is checked; whether it has since been
+	/// spent is taken on trust. A closed channel can stay in the graph until
+	/// its close is gossiped or the channel times out.
+	ExistenceOnly,
+}
+
+impl ChainUtxoVerification {
+	/// Stable lowercase string form for status payloads and logs.
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Self::Full => "full",
+			Self::ExistenceOnly => "existence-only",
+		}
+	}
+}
+
 pub(crate) enum WalletSyncStatus {
 	Completed,
 	InProgress { subscribers: tokio::sync::broadcast::Sender<Result<(), Error>> },

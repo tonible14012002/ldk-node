@@ -338,6 +338,7 @@ enum BuildError {
 	"WalletSetupFailed",
 	"LoggerSetupFailed",
 	"NetworkMismatch",
+	"ChainSourceSetupFailed",
 };
 
 [Trait]

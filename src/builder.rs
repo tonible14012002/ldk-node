@@ -5,8 +5,12 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+#[cfg(feature = "cbf")]
+use crate::chain::cbf::birthday::birthday_checkpoint;
 use crate::chain::provider::ChainDataProvider;
 use crate::chain::{ChainLayer, DEFAULT_ESPLORA_SERVER_URL};
+#[cfg(feature = "cbf")]
+use crate::config::CbfConfig;
 use crate::config::{
 	default_user_config, may_announce_channel, AnnounceError, BitcoindRestClientConfig, Config,
 	ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
@@ -27,7 +31,7 @@ use crate::io::{
 use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
 };
-use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_error, log_info, log_warn, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::peer_store::PeerStore;
 use crate::tx_broadcaster::TransactionBroadcaster;
@@ -108,6 +112,34 @@ enum ChainDataSourceConfig {
 		provider: Arc<dyn ChainDataProvider>,
 		sync_config: Option<EsploraSyncConfig>,
 	},
+	/// The chain followed by compact block filters over the Bitcoin P2P
+	/// network. What the filters cannot show — a mempool, an arbitrary
+	/// transaction's status, a mempool-aware fee market — is borrowed from
+	/// the provider set through [`NodeBuilder::set_chain_provider_fallback`],
+	/// when one is.
+	#[cfg(feature = "cbf")]
+	Cbf {
+		/// Trusted peers as `host:port`; empty leaves discovery to the DNS
+		/// seeds.
+		peers: Vec<String>,
+		config: CbfConfig,
+	},
+}
+
+/// The provider a filter-following node borrows from, kept apart from the
+/// chain source so the two can be set in either order.
+///
+/// Hand-written `Debug` for the same reason [`ChainDataSourceConfig`] has one:
+/// the provider is a trait object that names itself.
+#[cfg(feature = "cbf")]
+#[derive(Clone)]
+struct ChainProviderFallback(Arc<dyn ChainDataProvider>);
+
+#[cfg(feature = "cbf")]
+impl std::fmt::Debug for ChainProviderFallback {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_tuple("ChainProviderFallback").field(&self.0.name()).finish()
+	}
 }
 
 // Hand-written because the `Dependent` variant holds a trait object, which
@@ -132,6 +164,10 @@ impl std::fmt::Debug for ChainDataSourceConfig {
 				.field("rpc_port", rpc_port)
 				.field("rest_client_config", rest_client_config)
 				.finish_non_exhaustive(),
+			#[cfg(feature = "cbf")]
+			Self::Cbf { peers, config } => {
+				f.debug_struct("Cbf").field("peers", peers).field("config", config).finish()
+			},
 			Self::Dependent { provider, sync_config } => f
 				.debug_struct("Dependent")
 				.field("provider", &provider.name())
@@ -226,6 +262,10 @@ pub enum BuildError {
 	LoggerSetupFailed,
 	/// The given network does not match the node's previously configured network.
 	NetworkMismatch,
+	/// We failed to set up the configured chain source — a trusted peer that
+	/// does not parse, or an external fee server whose client could not be
+	/// built. The log says which.
+	ChainSourceSetupFailed,
 }
 
 impl fmt::Display for BuildError {
@@ -253,6 +293,7 @@ impl fmt::Display for BuildError {
 			Self::NetworkMismatch => {
 				write!(f, "Given network does not match the node's previously configured network.")
 			},
+			Self::ChainSourceSetupFailed => write!(f, "Failed to set up the chain source."),
 		}
 	}
 }
@@ -271,6 +312,8 @@ pub struct NodeBuilder {
 	config: Config,
 	entropy_source_config: Option<EntropySourceConfig>,
 	chain_data_source_config: Option<ChainDataSourceConfig>,
+	#[cfg(feature = "cbf")]
+	chain_provider_fallback: Option<ChainProviderFallback>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -296,6 +339,8 @@ impl NodeBuilder {
 			config,
 			entropy_source_config,
 			chain_data_source_config,
+			#[cfg(feature = "cbf")]
+			chain_provider_fallback: None,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
@@ -384,6 +429,73 @@ impl NodeBuilder {
 		self.chain_data_source_config =
 			Some(ChainDataSourceConfig::Dependent { provider, sync_config });
 		self
+	}
+
+	/// Configures the [`Node`] instance to follow the chain by compact block
+	/// filters (BIP157/158) over the Bitcoin P2P network.
+	///
+	/// The node downloads headers and filters from its peers, fetches only
+	/// the blocks whose filters match its own scripts, and broadcasts over
+	/// P2P; fee rates are derived from the coinbase outputs of the blocks it
+	/// downloads unless [`CbfConfig::external_fee`] names a server. What
+	/// filters cannot show — a mempool, the status of a transaction it did
+	/// not watch before it confirmed, a mempool-aware fee market — is
+	/// borrowed from the provider set through
+	/// [`NodeBuilder::set_chain_provider_fallback`], when one is; without
+	/// one the node runs on the filters and its peers alone.
+	///
+	/// `peers` are trusted peers as `host:port`; an empty list leaves
+	/// discovery to the DNS seeds. A peer that does not parse fails the
+	/// build with [`BuildError::ChainSourceSetupFailed`].
+	///
+	/// A fresh wallet is seeded at the compiled checkpoint below
+	/// [`CbfConfig::wallet_birthday_height`], and so are a fresh
+	/// `ChannelManager` and sweeper; a wallet with a persisted block is never
+	/// rewound. A filter scan never starts from genesis: a wallet whose
+	/// persisted chain offers no usable checkpoint resumes from the birthday,
+	/// and refuses to sync at all when none is configured.
+	#[cfg(feature = "cbf")]
+	pub fn set_chain_source_cbf(&mut self, peers: Vec<String>, config: CbfConfig) -> &mut Self {
+		self.chain_data_source_config = Some(ChainDataSourceConfig::Cbf { peers, config });
+		self
+	}
+
+	/// Names the provider a filter-following node borrows from — the hybrid
+	/// node: [`NodeBuilder::set_chain_source_cbf`] for headers, filters,
+	/// blocks and P2P broadcast, this provider for the mempool, arbitrary
+	/// transaction status, fee estimates and a broadcast with a verdict,
+	/// ahead of the node's own P2P relay and coinbase-derived rates.
+	///
+	/// Consulted only by the CBF preset. Every other chain source scans its
+	/// own backend — and the Dependent tier already fills every slot from the
+	/// provider given to [`NodeBuilder::set_chain_source_dependent`] — so a
+	/// fallback set beside one of them is ignored, and the build says so in
+	/// the log. It is not an error: the two settings can be driven from
+	/// separate configuration keys, and a stale provider key must not stop a
+	/// node from coming up on a chain source that never asks for it.
+	///
+	/// As with the Dependent tier, the transport is entirely the provider's
+	/// business; this crate never learns which node is asked or how.
+	#[cfg(feature = "cbf")]
+	pub fn set_chain_provider_fallback(
+		&mut self, provider: Arc<dyn ChainDataProvider>,
+	) -> &mut Self {
+		self.chain_provider_fallback = Some(ChainProviderFallback(provider));
+		self
+	}
+
+	/// The fallback provider to hand the build, if any. Only a `cbf` build
+	/// can have one set; every other build hands over `None` and the build
+	/// consults nothing.
+	fn chain_provider_fallback(&self) -> Option<Arc<dyn ChainDataProvider>> {
+		#[cfg(feature = "cbf")]
+		{
+			self.chain_provider_fallback.as_ref().map(|fallback| Arc::clone(&fallback.0))
+		}
+		#[cfg(not(feature = "cbf"))]
+		{
+			None
+		}
 	}
 
 	/// Configures the [`Node`] instance to connect to a Bitcoin Core node via RPC.
@@ -741,6 +853,7 @@ impl NodeBuilder {
 		build_with_store_internal(
 			config,
 			self.chain_data_source_config.as_ref(),
+			self.chain_provider_fallback(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -764,6 +877,7 @@ impl NodeBuilder {
 		build_with_store_internal(
 			config,
 			self.chain_data_source_config.as_ref(),
+			self.chain_provider_fallback(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -892,6 +1006,26 @@ impl ArcedNodeBuilder {
 			rpc_user,
 			rpc_password,
 		);
+	}
+
+	/// Configures the [`Node`] instance to follow the chain by compact block
+	/// filters; see [`NodeBuilder::set_chain_source_cbf`].
+	///
+	/// Rust-only: [`CbfConfig`] is not a bindings type, so this is not in the
+	/// UDL.
+	#[cfg(feature = "cbf")]
+	pub fn set_chain_source_cbf(&self, peers: Vec<String>, config: CbfConfig) {
+		self.inner.write().unwrap().set_chain_source_cbf(peers, config);
+	}
+
+	/// Names the provider a filter-following node borrows from; see
+	/// [`NodeBuilder::set_chain_provider_fallback`].
+	///
+	/// Rust-only: a [`ChainDataProvider`] is not a bindings type, so this is
+	/// not in the UDL.
+	#[cfg(feature = "cbf")]
+	pub fn set_chain_provider_fallback(&self, provider: Arc<dyn ChainDataProvider>) {
+		self.inner.write().unwrap().set_chain_provider_fallback(provider);
 	}
 
 	/// Configures the [`Node`] instance to source its gossip data from the Lightning peer-to-peer
@@ -1105,9 +1239,46 @@ impl ArcedNodeBuilder {
 	}
 }
 
+/// Seeds a wallet whose persisted chain is still rooted at genesis with the
+/// compiled birthday checkpoint `anchor`, and persists it at once.
+///
+/// `apply_update` only stages the checkpoint; persisting it here closes the
+/// crash window between wallet creation and the first persisted block, which
+/// would otherwise resurrect a genesis-rooted wallet next to a
+/// `ChannelManager` already initialised at the anchor.
+#[cfg(feature = "cbf")]
+fn seed_wallet_at_birthday(
+	wallet: &mut bdk_wallet::PersistedWallet<KVStoreWalletPersister>,
+	persister: &mut KVStoreWalletPersister, anchor: BestBlock, logger: &Logger,
+) -> Result<(), BuildError> {
+	let block_id = bdk_chain::BlockId { height: anchor.height, hash: anchor.block_hash };
+	let chain = wallet.latest_checkpoint().insert(block_id);
+	let update = bdk_wallet::Update { chain: Some(chain), ..Default::default() };
+	wallet.apply_update(update).map_err(|e| {
+		log_error!(logger, "Failed to seed the wallet at the CBF birthday checkpoint: {}", e);
+		BuildError::WalletSetupFailed
+	})?;
+	wallet.persist(persister).map_err(|e| {
+		log_error!(logger, "Failed to persist the CBF birthday checkpoint: {}", e);
+		BuildError::WalletSetupFailed
+	})?;
+	log_info!(
+		logger,
+		"Seeded the on-chain wallet at the CBF birthday checkpoint (height {}, hash {}); the filter scan starts at height {}.",
+		anchor.height,
+		anchor.block_hash,
+		anchor.height + 1
+	);
+	Ok(())
+}
+
 /// Builds a [`Node`] instance according to the options previously configured.
+///
+/// `chain_provider_fallback` is consulted by the CBF preset alone; see
+/// [`NodeBuilder::set_chain_provider_fallback`].
 fn build_with_store_internal(
 	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
+	chain_provider_fallback: Option<Arc<dyn ChainDataProvider>>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
@@ -1189,6 +1360,40 @@ fn build_with_store_internal(
 			})?,
 	};
 
+	// The block a filter-following node's fresh components start at: the
+	// compiled checkpoint below the configured wallet birthday, or none. The
+	// engine resolves — and logs — the same anchor as its resume floor; this
+	// one seeds what the engine cannot reach from the outside.
+	#[cfg(feature = "cbf")]
+	let cbf_birthday: Option<BestBlock> = match chain_data_source_config {
+		Some(ChainDataSourceConfig::Cbf { config: cbf_config, .. }) => cbf_config
+			.wallet_birthday_height
+			.and_then(|height| birthday_checkpoint(config.network, height))
+			.map(|checkpoint| BestBlock::new(checkpoint.hash, checkpoint.height)),
+		_ => None,
+	};
+
+	// A wallet whose persisted chain is still rooted at genesis has never been
+	// scanned — created just now, or created earlier and never synced — and is
+	// seeded at the birthday so its first filter scan starts there, not at
+	// block 1. A wallet with a persisted block is never rewound: its local
+	// chain and transaction graph are already persisted and LDK state may
+	// have synced past it, so a safe rewind is an explicit recovery flow, not
+	// a configuration knob. Seeding it now also matters for the crash window
+	// between wallet creation and the first persisted block: a genesis-rooted
+	// wallet next to a `ChannelManager` initialised at the anchor is a resume
+	// the filter engine refuses.
+	#[cfg(feature = "cbf")]
+	let bdk_wallet = {
+		let mut wallet = bdk_wallet;
+		if let Some(anchor) = cbf_birthday {
+			if wallet.latest_checkpoint().height() == 0 {
+				seed_wallet_at_birthday(&mut wallet, &mut wallet_persister, anchor, &logger)?;
+			}
+		}
+		wallet
+	};
+
 	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 
@@ -1217,10 +1422,13 @@ fn build_with_store_internal(
 
 	// The chain ability seam. Every consumer below talks to `ChainLayer`; none
 	// of them knows which backend fills its slots.
-	let chain_source = match chain_data_source_config {
+	//
+	// The fallback provider goes to the one preset that consults it; every
+	// other arm hands it back untouched, to be announced as ignored below.
+	let (chain_source, unconsulted_fallback) = match chain_data_source_config {
 		Some(ChainDataSourceConfig::Esplora { server_url, sync_config }) => {
 			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
-			ChainLayer::new_esplora(
+			let layer = ChainLayer::new_esplora(
 				server_url.clone(),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1230,11 +1438,12 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			)
+			);
+			(layer, chain_provider_fallback)
 		},
 		Some(ChainDataSourceConfig::Electrum { server_url, sync_config }) => {
 			let sync_config = sync_config.unwrap_or(ElectrumSyncConfig::default());
-			ChainLayer::new_electrum(
+			let layer = ChainLayer::new_electrum(
 				server_url.clone(),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1244,7 +1453,8 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			)
+			);
+			(layer, chain_provider_fallback)
 		},
 		Some(ChainDataSourceConfig::Bitcoind {
 			rpc_host,
@@ -1252,39 +1462,42 @@ fn build_with_store_internal(
 			rpc_user,
 			rpc_password,
 			rest_client_config,
-		}) => match rest_client_config {
-			Some(rest_client_config) => ChainLayer::new_bitcoind_rest(
-				rpc_host.clone(),
-				*rpc_port,
-				rpc_user.clone(),
-				rpc_password.clone(),
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				rest_client_config.clone(),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			),
-			None => ChainLayer::new_bitcoind_rpc(
-				rpc_host.clone(),
-				*rpc_port,
-				rpc_user.clone(),
-				rpc_password.clone(),
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			),
+		}) => {
+			let layer = match rest_client_config {
+				Some(rest_client_config) => ChainLayer::new_bitcoind_rest(
+					rpc_host.clone(),
+					*rpc_port,
+					rpc_user.clone(),
+					rpc_password.clone(),
+					Arc::clone(&wallet),
+					Arc::clone(&fee_estimator),
+					Arc::clone(&tx_broadcaster),
+					Arc::clone(&kv_store),
+					Arc::clone(&config),
+					rest_client_config.clone(),
+					Arc::clone(&logger),
+					Arc::clone(&node_metrics),
+				),
+				None => ChainLayer::new_bitcoind_rpc(
+					rpc_host.clone(),
+					*rpc_port,
+					rpc_user.clone(),
+					rpc_password.clone(),
+					Arc::clone(&wallet),
+					Arc::clone(&fee_estimator),
+					Arc::clone(&tx_broadcaster),
+					Arc::clone(&kv_store),
+					Arc::clone(&config),
+					Arc::clone(&logger),
+					Arc::clone(&node_metrics),
+				),
+			};
+			(layer, chain_provider_fallback)
 		},
 
 		Some(ChainDataSourceConfig::Dependent { provider, sync_config }) => {
 			let sync_config = sync_config.clone().unwrap_or(EsploraSyncConfig::default());
-			ChainLayer::new_dependent(
+			let layer = ChainLayer::new_dependent(
 				Arc::clone(provider),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1293,14 +1506,36 @@ fn build_with_store_internal(
 				Arc::clone(&kv_store),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
+			);
+			(layer, chain_provider_fallback)
+		},
+
+		#[cfg(feature = "cbf")]
+		Some(ChainDataSourceConfig::Cbf { peers, config: cbf_config }) => {
+			let layer = ChainLayer::new_cbf(
+				peers.clone(),
+				cbf_config.clone(),
+				chain_provider_fallback,
+				Arc::clone(&wallet),
+				Arc::clone(&fee_estimator),
+				Arc::clone(&tx_broadcaster),
+				Arc::clone(&kv_store),
+				Arc::clone(&config),
+				Arc::clone(&logger),
+				Arc::clone(&node_metrics),
 			)
+			.map_err(|e| {
+				log_error!(logger, "Failed to set up the CBF chain source: {}", e);
+				BuildError::ChainSourceSetupFailed
+			})?;
+			(layer, None)
 		},
 
 		None => {
 			// Default to Esplora client.
 			let server_url = DEFAULT_ESPLORA_SERVER_URL.to_string();
 			let sync_config = EsploraSyncConfig::default();
-			ChainLayer::new_esplora(
+			let layer = ChainLayer::new_esplora(
 				server_url.clone(),
 				sync_config,
 				Arc::clone(&wallet),
@@ -1310,9 +1545,18 @@ fn build_with_store_internal(
 				Arc::clone(&config),
 				Arc::clone(&logger),
 				Arc::clone(&node_metrics),
-			)
+			);
+			(layer, chain_provider_fallback)
 		},
 	};
+
+	if let Some(provider) = unconsulted_fallback {
+		log_warn!(
+			logger,
+			"A chain provider fallback ({}) is set, but the configured chain source scans its own backend and never consults one; ignoring it.",
+			provider.name()
+		);
+	}
 
 	let chain_source = Arc::new(chain_source);
 
@@ -1464,11 +1708,17 @@ fn build_with_store_internal(
 			// We're starting a fresh node.
 			let genesis_block_hash =
 				bitcoin::blockdata::constants::genesis_block(config.network).block_hash();
+			let best_block = BestBlock::new(genesis_block_hash, 0);
 
-			let chain_params = ChainParameters {
-				network: config.network.into(),
-				best_block: BestBlock::new(genesis_block_hash, 0),
-			};
+			// A filter-following node starts a fresh `ChannelManager` — and,
+			// through `current_best_block` below, the sweeper — at the wallet
+			// birthday, where a fresh wallet was seeded above: nothing of this
+			// node's can be older, and a listener at genesis would be a resume
+			// the filter engine refuses.
+			#[cfg(feature = "cbf")]
+			let best_block = cbf_birthday.unwrap_or(best_block);
+
+			let chain_params = ChainParameters { network: config.network.into(), best_block };
 			channelmanager::ChannelManager::new(
 				Arc::clone(&fee_estimator),
 				Arc::clone(&chain_monitor),

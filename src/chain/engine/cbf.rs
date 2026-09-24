@@ -350,8 +350,6 @@ impl CbfSyncEngine {
 	}
 
 	/// A simplified, externally-consumable snapshot of the sync state. Never blocks.
-	// Wired by T9: `Node::cbf_sync_status` is its caller.
-	#[allow(dead_code)]
 	pub(crate) fn sync_status(&self) -> CbfSyncStatus {
 		simplify_sync_state(*self.sync_state_tx.borrow())
 	}
@@ -534,6 +532,10 @@ impl SyncEngine for CbfSyncEngine {
 
 	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
 		Some(&self.onchain_wallet)
+	}
+
+	fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
+		Some(self.sync_status())
 	}
 
 	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {

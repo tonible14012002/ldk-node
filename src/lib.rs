@@ -117,7 +117,11 @@ pub use lightning_types;
 pub use vss_client;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
-pub use chain::CbfSyncStatus;
+pub use chain::{
+	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
+};
+#[cfg(feature = "cbf")]
+pub use config::{CbfConfig, CbfExternalFee};
 pub use error::Error as NodeError;
 use error::Error;
 
@@ -857,6 +861,27 @@ impl Node {
 			onchain_wallet_synced_at: locked_node_metrics.latest_onchain_wallet_sync_timestamp,
 			lightning_wallet_synced_at: locked_node_metrics.latest_lightning_wallet_sync_timestamp,
 		}
+	}
+
+	/// The compact-block-filter sync status, when this node follows the chain
+	/// by filters.
+	///
+	/// `None` for every other chain source, and for a build without the `cbf`
+	/// feature, which has no such engine. Never blocks; [`Node::sync_wallets`]
+	/// is what waits for the filters to catch up.
+	pub fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
+		self.chain_source.cbf_sync_status()
+	}
+
+	/// Which adapters fill each chain ability slot, in chain order, and which
+	/// one answered each slot's most recent question.
+	///
+	/// The same layout [`Node::start`] logs as `Chain ability slots: ...`,
+	/// as data: a status surface can show that a hybrid node's fees came from
+	/// its provider this pass and its own coinbase-derived rates the last.
+	/// Diagnostic only — nothing decides anything on it.
+	pub fn chain_slot_adapters(&self) -> ChainSlotStatus {
+		self.chain_source.slot_status()
 	}
 
 	/// Returns the status of the [`Node`].
