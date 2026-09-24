@@ -25,7 +25,7 @@
 //! The fee window, the P2P handoff and its bound are DatPham's (`cycles-cbf-828`), lifted
 //! out of the upstream chain source and onto the slots.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +40,11 @@ use lightning_block_sync::{
 };
 
 use crate::chain::cbf::fee::{
-	cbf_percentile_for_target, percentile_of_sorted, CBF_MIN_FEERATE_SAT_PER_KWU, FEE_WINDOW_BLOCKS,
+	cbf_percentile_for_target, percentile_of_sorted, BlockFeeCache, CBF_MIN_FEERATE_SAT_PER_KWU,
+	FEE_WINDOW_BLOCKS,
+};
+use crate::chain::cbf::fee_sampler::{
+	canonical_window, window_samples, FeeBlockSource, SampleFailure, MIN_FEE_SAMPLES,
 };
 use crate::chain::cbf::{CBF_BLOCK_FETCH_TIMEOUT_SECS, CBF_HEADER_LOOKUP_TIMEOUT_SECS};
 use crate::chain::engine::cbf::CbfSyncEngine;
@@ -86,15 +90,12 @@ use async_trait::async_trait;
 /// completes a handshake afterwards.
 pub(crate) const CBF_P2P_BROADCAST_TIMEOUT_SECS: u64 = 10;
 
-/// FEE budget: one chain-tip lookup, then for every height of the window a header lookup
-/// and — for a block not sampled yet, or sampled on a branch that was reorged out — a block
-/// fetch, each under its own bound. Sized for the worst case, a window with nothing cached:
-/// `1 + FEE_WINDOW_BLOCKS` header lookups and `FEE_WINDOW_BLOCKS` block fetches, plus the
-/// margin. The steady state is a tip lookup, the header lookups and one block fetch per new
-/// block since the last tick; the applicator's own downloads are reused and cost nothing.
+/// FEE budget: one chain-tip lookup and a header lookup per height of the window, each under
+/// its own bound, plus the margin. No block is downloaded on this path — the fee sampler
+/// fills the cache in its own task — and the lookups are answered from kyoto's own header
+/// chain, so the steady state is milliseconds.
 const CBF_DERIVED_FEE_BUDGET: Duration = Duration::from_secs(
 	(1 + FEE_WINDOW_BLOCKS as u64) * CBF_HEADER_LOOKUP_TIMEOUT_SECS
-		+ FEE_WINDOW_BLOCKS as u64 * CBF_BLOCK_FETCH_TIMEOUT_SECS
 		+ ADAPTER_BUDGET_MARGIN.as_secs(),
 );
 
@@ -118,14 +119,18 @@ async fn bounded<T>(
 
 /// Per-target fee estimates derived from the coinbase of recent blocks.
 ///
-/// Reads the [`BlockFeeCache`] the applicator fills with every block it downloads, tops it
-/// up with the blocks of the window it has not seen, and reads one percentile per target
-/// out of the sorted window: a higher percentile for an urgent target, a lower one for a
-/// relaxed one. `Unavailable` while kyoto is not running, and while the window holds no
-/// sample at all — a chain that has just resumed and downloaded nothing yet has no fee
-/// market to report, and the estimator's own per-target fallbacks stand until it does.
+/// Reads the [`BlockFeeCache`] — filled by the engine's [`FeeSampler`] and by the applicator's
+/// own downloads — against the best chain kyoto holds now, and reads one percentile per
+/// target out of the sorted window: a higher percentile for an urgent target, a lower one
+/// for a relaxed one. Never downloads a block itself, so a refresh (and a `sync_wallets`
+/// that starts with one) costs header lookups, not a mainnet block over one peer.
+///
+/// `Unavailable` while kyoto is not running, and while the window holds fewer than
+/// [`MIN_FEE_SAMPLES`] canonical samples — a node that has just resumed has sampled nothing
+/// yet, and the chain moves on to the next FEE adapter until it has.
 ///
 /// [`BlockFeeCache`]: crate::chain::cbf::fee::BlockFeeCache
+/// [`FeeSampler`]: crate::chain::cbf::fee_sampler::FeeSampler
 pub(crate) struct CbfDerivedFee {
 	engine: Arc<CbfSyncEngine>,
 	logger: Arc<Logger>,
@@ -135,139 +140,22 @@ impl CbfDerivedFee {
 	pub(crate) fn new(engine: Arc<CbfSyncEngine>, logger: Arc<Logger>) -> Self {
 		Self { engine, logger }
 	}
-
-	/// Reconciles the block-fee cache against the canonical chain and returns the per-block
-	/// fee rates of the most recent [`FEE_WINDOW_BLOCKS`] blocks.
-	///
-	/// For each height in the window the canonical block hash is fetched; if the cached entry
-	/// still matches, its rate is reused, otherwise (a new block, or one that was reorged out)
-	/// the block is downloaded via [`Requester::average_fee_rate`]. Heights that fell out of
-	/// the window are evicted; entries the applicator recorded above the tip this pass saw are
-	/// kept, so a block that arrived mid-pass is not thrown away and downloaded again.
-	///
-	/// Best-effort within the window: a height whose header or block cannot be fetched is
-	/// skipped, so a slow or unresponsive peer can only thin the sample, not void the pass —
-	/// the window fills incrementally over successive ticks. Only the tip lookup is fatal:
-	/// without it there is no window to reconcile.
-	async fn refresh_block_fee_window(&self, requester: &Requester) -> ActionResult<Vec<FeeRate>> {
-		let tip_height = match bounded(CBF_HEADER_LOOKUP_TIMEOUT_SECS, requester.chain_tip()).await
-		{
-			Ok(Ok(tip)) => tip.height,
-			Ok(Err(e)) => {
-				log_error!(self.logger, "CBF fee update: failed to fetch the chain tip: {}", e);
-				return Err(ChainActionError::unavailable(format!(
-					"chain tip lookup failed: {}",
-					e
-				)));
-			},
-			Err(_elapsed) => {
-				log_error!(
-					self.logger,
-					"CBF fee update: the chain tip lookup timed out after {}s",
-					CBF_HEADER_LOOKUP_TIMEOUT_SECS
-				);
-				return Err(ChainActionError::timed_out("chain tip lookup timed out"));
-			},
-		};
-		let lo = tip_height.saturating_sub(FEE_WINDOW_BLOCKS - 1);
-
-		let cache = self.engine.block_fee_cache();
-		// Snapshot the cache so the std `Mutex` is never held across an `.await`.
-		let cached = cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
-
-		let mut window = BTreeMap::new();
-		for height in lo..=tip_height {
-			let canonical_hash =
-				match bounded(CBF_HEADER_LOOKUP_TIMEOUT_SECS, requester.get_header(height)).await {
-					Ok(Ok(Some(indexed))) => indexed.header.block_hash(),
-					// Height not available (yet); skip it.
-					Ok(Ok(None)) => continue,
-					Ok(Err(e)) => {
-						log_debug!(
-							self.logger,
-							"CBF fee update: failed to fetch the header at height {}, skipping: {}",
-							height,
-							e
-						);
-						continue;
-					},
-					Err(_elapsed) => {
-						log_debug!(
-							self.logger,
-							"CBF fee update: the header lookup at height {} timed out, skipping",
-							height
-						);
-						continue;
-					},
-				};
-
-			// Reuse the cached rate while the block is still canonical; otherwise download it.
-			if let Some(fee_rate) = cached_rate(&cached, height, canonical_hash) {
-				window.insert(height, (canonical_hash, fee_rate));
-				continue;
-			}
-
-			// The sample downloads a full block, so it counts against the same
-			// `CBF_FULL_BLOCK_PERMITS` bound the applicator's matched blocks do: a fee window
-			// refilled after a restart is fourteen blocks, and on a small device those must
-			// not be held in memory next to the applicator's. The wait for a permit is inside
-			// the per-block bound, so the budget above still covers it.
-			let permits = self.engine.full_block_permits();
-			let sample = bounded(CBF_BLOCK_FETCH_TIMEOUT_SECS, async {
-				let _permit = permits
-					.acquire()
-					.await
-					.map_err(|_closed| "the full-block permits were closed".to_string())?;
-				requester.average_fee_rate(canonical_hash).await.map_err(|e| e.to_string())
-			})
-			.await;
-			match sample {
-				Ok(Ok(fee_rate)) => {
-					window.insert(height, (canonical_hash, fee_rate));
-				},
-				Ok(Err(e)) => {
-					log_debug!(
-						self.logger,
-						"CBF fee update: failed to fetch the fee rate of block {}, skipping: {}",
-						canonical_hash,
-						e
-					);
-				},
-				Err(_elapsed) => {
-					log_debug!(
-						self.logger,
-						"CBF fee update: timed out fetching block {} for fee estimation, skipping",
-						canonical_hash
-					);
-				},
-			}
-		}
-
-		let samples = window.values().map(|(_, fee_rate)| *fee_rate).collect();
-		{
-			let mut current = cache.lock().unwrap_or_else(|e| e.into_inner());
-			// Blocks the applicator recorded above this pass's tip arrived while the window
-			// was being built; they are the next pass's newest samples, not stale entries.
-			for (height, entry) in current.iter() {
-				if *height > tip_height {
-					window.insert(*height, *entry);
-				}
-			}
-			// Replacing the rest wholesale evicts every entry that fell out of the window.
-			*current = window;
-		}
-		Ok(samples)
-	}
 }
 
-/// The cached rate for `height`, if the block cached there is still the canonical one.
-///
-/// A height whose cached hash differs was reorged out: its rate belongs to a block that is
-/// no longer in the chain, and the canonical block must be downloaded instead.
-fn cached_rate(
-	cached: &BTreeMap<u32, (BlockHash, FeeRate)>, height: u32, canonical_hash: BlockHash,
-) -> Option<FeeRate> {
-	cached.get(&height).filter(|(hash, _)| *hash == canonical_hash).map(|(_, fee_rate)| *fee_rate)
+/// The canonical samples of the fee window as `source` sees it, read out of `cache`.
+async fn derived_samples<S: FeeBlockSource + ?Sized>(
+	source: &S, cache: &BlockFeeCache,
+) -> ActionResult<Vec<FeeRate>> {
+	let (_tip, canonical) = canonical_window(source).await.map_err(|failure| match failure {
+		SampleFailure::LookupTimedOut => {
+			ChainActionError::timed_out("the fee window's header lookups timed out")
+		},
+		SampleFailure::NodeGone => ChainActionError::unavailable("CBF node is not running"),
+		other => ChainActionError::unavailable(format!("fee window lookup failed: {}", other)),
+	})?;
+	// Snapshot so the std `Mutex` is never held across an `.await`.
+	let cached = cache.lock().unwrap_or_else(|e| e.into_inner()).clone();
+	Ok(window_samples(&cached, &canonical))
 }
 
 /// The per-target cache read out of a window of per-block fee rates, or `None` for an empty
@@ -310,28 +198,29 @@ impl FeeAction for CbfDerivedFee {
 	}
 
 	async fn fee_rate_update(&self) -> ActionResult<FeeUpdate> {
-		let Some(requester) = self.engine.requester() else {
-			return Err(ChainActionError::unavailable("CBF node is not running"));
-		};
-		let samples = self.refresh_block_fee_window(&requester).await?;
-		match fee_cache_from_samples(&samples) {
-			Some(cache) => {
-				log_debug!(
-					self.logger,
-					"CBF fee update: derived estimates from the coinbase of {} recent block(s)",
-					samples.len()
-				);
-				Ok(FeeUpdate::Apply { cache, log_unchanged: false })
-			},
-			None => {
-				log_info!(
-					self.logger,
-					"CBF fee update: no block in the fee window could be sampled yet; the \
-					 previous estimates stand"
-				);
-				Err(ChainActionError::unavailable("no block samples in the fee window yet"))
-			},
+		let samples =
+			derived_samples(&self.engine.fee_source(), self.engine.block_fee_cache()).await?;
+		if samples.len() < MIN_FEE_SAMPLES {
+			log_debug!(
+				self.logger,
+				"CBF fee update: {} of the {} block samples needed so far; not answering yet",
+				samples.len(),
+				MIN_FEE_SAMPLES
+			);
+			return Err(ChainActionError::unavailable(format!(
+				"fee window warming up: {} of {} block samples",
+				samples.len(),
+				MIN_FEE_SAMPLES
+			)));
 		}
+		let cache = fee_cache_from_samples(&samples)
+			.expect("a window with at least MIN_FEE_SAMPLES samples has an answer");
+		log_debug!(
+			self.logger,
+			"CBF fee update: derived estimates from the coinbase of {} recent block(s)",
+			samples.len()
+		);
+		Ok(FeeUpdate::Apply { cache, log_unchanged: false })
 	}
 }
 
@@ -1094,24 +983,68 @@ mod tests {
 		assert!(fee_cache_from_samples(&[]).is_none());
 	}
 
-	#[test]
-	fn cached_rate_is_reused_only_while_the_block_is_canonical() {
-		let canonical = BlockHash::from_byte_array([0xaa; 32]);
-		let reorged_out = BlockHash::from_byte_array([0xbb; 32]);
-		let rate = FeeRate::from_sat_per_kwu(1_234);
-		let mut cached = BTreeMap::new();
-		cached.insert(100, (canonical, rate));
-		cached.insert(101, (reorged_out, rate));
+	/// A header chain from `floor` to `tip`, for the FEE adapter's reads.
+	struct Headers {
+		floor: u32,
+		tip: u32,
+		seed: u8,
+		stalls: bool,
+	}
 
-		assert_eq!(cached_rate(&cached, 100, canonical), Some(rate), "still canonical: reused");
-		assert_eq!(cached_rate(&cached, 101, canonical), None, "reorged out: downloaded again");
-		assert_eq!(cached_rate(&cached, 102, canonical), None, "never sampled: downloaded");
+	#[async_trait]
+	impl FeeBlockSource for Headers {
+		async fn tip_height(&self) -> Result<u32, SampleFailure> {
+			Ok(self.tip)
+		}
+		async fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, SampleFailure> {
+			if self.stalls {
+				return Err(SampleFailure::LookupTimedOut);
+			}
+			let mut bytes = [self.seed; 32];
+			bytes[..4].copy_from_slice(&height.to_le_bytes());
+			Ok((self.floor..=self.tip).contains(&height).then(|| BlockHash::from_byte_array(bytes)))
+		}
+		fn can_fetch(&self) -> bool {
+			unreachable!("the FEE adapter never downloads")
+		}
+		fn request_block(
+			&self, _hash: BlockHash,
+		) -> Result<crate::chain::cbf::fee_sampler::BlockFetch, SampleFailure> {
+			unreachable!("the FEE adapter never downloads")
+		}
+	}
+
+	#[tokio::test]
+	async fn the_fee_adapter_reads_only_canonical_cached_samples() {
+		use crate::chain::cbf::fee::{new_block_fee_cache, record_block_fee};
+
+		let chain = Headers { floor: 95, tip: 100, seed: 0xaa, stalls: false };
+		let reorged = Headers { floor: 95, tip: 100, seed: 0xbb, stalls: false };
+		let cache = new_block_fee_cache();
+		for height in 98..=100 {
+			let hash = chain.block_hash_at(height).await.unwrap().unwrap();
+			record_block_fee(&cache, height, hash, FeeRate::from_sat_per_kwu(height as u64));
+		}
+		// Below the header floor: never counted, even if cached.
+		record_block_fee(&cache, 90, BlockHash::all_zeros(), FeeRate::from_sat_per_kwu(1));
+
+		let samples = derived_samples(&chain, &cache).await.unwrap();
+		assert_eq!(samples.len(), 3);
+		assert!(samples.len() >= MIN_FEE_SAMPLES);
+		// Every cached block was reorged out: nothing to answer from.
+		assert!(derived_samples(&reorged, &cache).await.unwrap().is_empty());
+		// A stalled header chain is a timeout, so the chain moves on and says why.
+		let stalled = Headers { stalls: true, ..chain };
+		assert!(matches!(
+			derived_samples(&stalled, &cache).await,
+			Err(ChainActionError::Unavailable { timed_out: true, .. })
+		));
 	}
 
 	#[test]
 	fn budgets_cover_the_worst_case_of_their_bounded_requests() {
-		// 15 header lookups and 14 block fetches of 10 s each, plus the margin.
-		assert_eq!(CBF_DERIVED_FEE_BUDGET, Duration::from_secs(15 * 10 + 14 * 10 + 1));
+		// A tip and 14 header lookups of 10 s each, plus the margin; no block download.
+		assert_eq!(CBF_DERIVED_FEE_BUDGET, Duration::from_secs(15 * 10 + 1));
 		// The largest package, one 10 s handoff per transaction, plus the margin.
 		assert_eq!(CBF_P2P_BROADCAST_BUDGET, Duration::from_secs(25 * 10 + 1));
 	}

@@ -48,6 +48,9 @@ use crate::chain::cbf::applicator::{
 };
 use crate::chain::cbf::birthday::resolve_birthday;
 use crate::chain::cbf::fee::{new_block_fee_cache, BlockFeeCache};
+use crate::chain::cbf::fee_sampler::{
+	BlockFetch, FeeBlockSource, FeeSampler, SampleFailure, CBF_FEE_SAMPLE_INTERVAL,
+};
 use crate::chain::cbf::{
 	mark_syncing, parse_trusted_peer, resume_checkpoint, simplify_sync_state, CbfSyncState,
 	ResumeRefusal, WatchLedger, CBF_BLOCK_FETCH_TIMEOUT_SECS, CBF_HEADER_LOOKUP_TIMEOUT_SECS,
@@ -135,16 +138,9 @@ impl KyotoParams {
 	fn build(&self, listener: &ChainListener) -> Result<(KyotoNode, Client), ResumeRefusal> {
 		let checkpoint = resume_checkpoint(&self.logger, listener, self.birthday)?;
 
-		let mut kyoto_builder = KyotoBuilder::new(self.config.network);
 		let data_dir = PathBuf::from(&self.config.storage_dir_path).join("bip157_data");
-		kyoto_builder = kyoto_builder.data_dir(data_dir);
-		if !self.trusted_peers.is_empty() {
-			kyoto_builder = kyoto_builder.add_peers(self.trusted_peers.iter().cloned());
-		}
-		kyoto_builder = kyoto_builder
-			.required_peers(self.required_peers)
-			.fetch_witness_data()
-			.response_timeout(Duration::from_secs(DEFAULT_RESPONSE_TIMEOUT_SECS));
+		let mut kyoto_builder =
+			kyoto_builder(self.config.network, data_dir, &self.trusted_peers, self.required_peers);
 
 		log_debug!(
 			self.logger,
@@ -156,6 +152,20 @@ impl KyotoParams {
 
 		Ok(kyoto_builder.build())
 	}
+}
+
+/// Kyoto as the engine configures it, short of the resume checkpoint.
+fn kyoto_builder(
+	network: bitcoin::Network, data_dir: PathBuf, trusted_peers: &[TrustedPeer], required_peers: u8,
+) -> KyotoBuilder {
+	let mut kyoto_builder = KyotoBuilder::new(network).data_dir(data_dir);
+	if !trusted_peers.is_empty() {
+		kyoto_builder = kyoto_builder.add_peers(trusted_peers.iter().cloned());
+	}
+	kyoto_builder
+		.required_peers(required_peers)
+		.fetch_witness_data()
+		.response_timeout(Duration::from_secs(DEFAULT_RESPONSE_TIMEOUT_SECS))
 }
 
 pub(crate) struct CbfSyncEngine {
@@ -437,6 +447,97 @@ impl FeeCadence {
 	}
 }
 
+/// Kyoto as a [`FeeBlockSource`]: the live requester of whichever node the restart loop runs,
+/// the engine's sync state, and the shared full-block permits.
+pub(crate) struct KyotoFeeSource {
+	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
+	sync_state_rx: watch::Receiver<CbfSyncState>,
+	full_block_permits: Arc<Semaphore>,
+}
+
+impl KyotoFeeSource {
+	fn requester(&self) -> Result<Requester, SampleFailure> {
+		match &*self.runtime_status.lock().unwrap_or_else(|e| e.into_inner()) {
+			CbfRuntimeStatus::Started { requester, .. } => Ok(requester.clone()),
+			CbfRuntimeStatus::Stopped => Err(SampleFailure::NodeGone),
+		}
+	}
+}
+
+#[async_trait]
+impl FeeBlockSource for KyotoFeeSource {
+	async fn tip_height(&self) -> Result<u32, SampleFailure> {
+		let requester = self.requester()?;
+		match tokio::time::timeout(
+			Duration::from_secs(CBF_HEADER_LOOKUP_TIMEOUT_SECS),
+			requester.chain_tip(),
+		)
+		.await
+		{
+			Ok(Ok(tip)) => Ok(tip.height),
+			Ok(Err(_)) => Err(SampleFailure::NodeGone),
+			Err(_elapsed) => Err(SampleFailure::LookupTimedOut),
+		}
+	}
+
+	async fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>, SampleFailure> {
+		let requester = self.requester()?;
+		match tokio::time::timeout(
+			Duration::from_secs(CBF_HEADER_LOOKUP_TIMEOUT_SECS),
+			requester.get_header(height),
+		)
+		.await
+		{
+			Ok(Ok(header)) => Ok(header.map(|indexed| indexed.header.block_hash())),
+			Ok(Err(_)) => Err(SampleFailure::NodeGone),
+			Err(_elapsed) => Err(SampleFailure::LookupTimedOut),
+		}
+	}
+
+	fn can_fetch(&self) -> bool {
+		matches!(*self.sync_state_rx.borrow(), CbfSyncState::Active { synced_to_tip: true, .. })
+	}
+
+	/// Takes a full-block permit without waiting — the applicator's matched blocks come
+	/// first — and holds it until the download is dropped, so a sample kept across passes
+	/// still counts against the bound.
+	fn request_block(&self, hash: BlockHash) -> Result<BlockFetch, SampleFailure> {
+		let permit = Arc::clone(&self.full_block_permits)
+			.try_acquire_owned()
+			.map_err(|_| SampleFailure::NoPermit)?;
+		let receiver =
+			self.requester()?.request_block(hash).map_err(|_| SampleFailure::NodeGone)?;
+		Ok(Box::pin(async move {
+			let _permit = permit;
+			match receiver.await {
+				Ok(Ok(indexed)) => Ok((indexed.height, indexed.block)),
+				Ok(Err(e)) => Err(SampleFailure::FetchFailed(e.to_string())),
+				// The node that took the request was shut down or rebuilt.
+				Err(_) => Err(SampleFailure::NodeGone),
+			}
+		}))
+	}
+}
+
+/// Keeps the block-fee cache warm until `stop` fires; see [`FeeSampler`]. A pass is raced
+/// against the stop, so shutting down never waits out a block download.
+async fn run_fee_sampler(
+	mut sampler: FeeSampler<KyotoFeeSource>, mut stop: tokio::sync::watch::Receiver<()>,
+) {
+	let mut tick = tokio::time::interval(CBF_FEE_SAMPLE_INTERVAL);
+	tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	loop {
+		tokio::select! {
+			_ = stop.changed() => return,
+			_ = tick.tick() => {},
+		}
+		tokio::select! {
+			_ = stop.changed() => return,
+			_ = sampler.pass_logged() => {},
+		}
+	}
+}
+
 /// The interval on which the background loop borrows a mempool view: the on-chain wallet sync
 /// interval every other engine polls its chain source on. [`crate::config::CbfConfig`] carries
 /// no background-sync configuration, so this is the default one, floored like everywhere else.
@@ -464,9 +565,14 @@ impl CbfSyncEngine {
 		&self.block_fee_cache
 	}
 
-	/// The bound on full blocks held in memory at once, for the FEE adapter's samples.
-	pub(crate) fn full_block_permits(&self) -> &Arc<Semaphore> {
-		&self.full_block_permits
+	/// The chain as the fee sampler and the FEE adapter read it: kyoto's header chain, and
+	/// block downloads under one of the full-block permits.
+	pub(crate) fn fee_source(&self) -> KyotoFeeSource {
+		KyotoFeeSource {
+			runtime_status: Arc::clone(&self.runtime_status),
+			sync_state_rx: self.sync_state_tx.subscribe(),
+			full_block_permits: Arc::clone(&self.full_block_permits),
+		}
 	}
 
 	/// Where watched transactions were seen confirmed, and the block the applicator most
@@ -596,7 +702,16 @@ impl SyncEngine for CbfSyncEngine {
 			Arc::clone(layer.fee_estimator()),
 			Arc::clone(&self.logger),
 		));
-		self.launch(runtime, listener);
+		self.launch(Arc::clone(&runtime), listener);
+
+		// Samples the fee window's blocks in its own task: a block download takes seconds
+		// to minutes on one mainnet peer, and must hold up neither tick below.
+		let sampler = FeeSampler::new(
+			self.fee_source(),
+			Arc::clone(&self.block_fee_cache),
+			Arc::clone(&self.logger),
+		);
+		runtime.spawn(run_fee_sampler(sampler, stop_sync_receiver.clone()));
 
 		let mut fee_rate_update_interval =
 			tokio::time::interval(Duration::from_secs(DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS));
@@ -611,22 +726,39 @@ impl SyncEngine for CbfSyncEngine {
 		let mut mempool_interval = tokio::time::interval(mempool_borrow_interval());
 		mempool_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+		// The fee refresh runs as its own task, one at a time: its chain may fall through to a
+		// provider that takes its whole budget, and the mempool tick must not wait on that.
+		let mut fee_refresh: Option<tokio::task::JoinHandle<bool>> = None;
+
 		loop {
 			tokio::select! {
 				_ = stop_sync_receiver.changed() => {
 					log_trace!(self.logger, "Stopping CBF background loop.");
+					if let Some(refresh) = fee_refresh.take() {
+						refresh.abort();
+					}
 					return;
 				}
-				_ = fee_rate_update_interval.tick() => {
-					let refreshed = layer.update_fee_rate_estimates().await;
-					if let Err(e) = &refreshed {
-						log_debug!(
-							self.logger,
-							"CBF fee-rate refresh failed this tick; the cached rates stand: {}",
-							e
-						);
-					}
-					if let Some(retry) = fee_cadence.after(refreshed.is_ok()) {
+				_ = fee_rate_update_interval.tick(), if fee_refresh.is_none() => {
+					let layer = Arc::clone(&layer);
+					let logger = Arc::clone(&self.logger);
+					fee_refresh = Some(runtime.spawn(async move {
+						let refreshed = layer.update_fee_rate_estimates().await;
+						if let Err(e) = &refreshed {
+							log_debug!(
+								logger,
+								"CBF fee-rate refresh failed this tick; the cached rates stand: {}",
+								e
+							);
+						}
+						refreshed.is_ok()
+					}));
+				}
+				finished = async { fee_refresh.as_mut().expect("guarded").await }, if fee_refresh.is_some() => {
+					fee_refresh = None;
+					// A refresh that panicked or was cancelled did not fill the cache.
+					let ok = finished.unwrap_or(false);
+					if let Some(retry) = fee_cadence.after(ok) {
 						fee_rate_update_interval.reset_after(retry);
 					}
 				}
@@ -1487,5 +1619,136 @@ mod tests {
 		assert_eq!(policy.decide(RunEnd::Shutdown), RestartDecision::Stop);
 		assert_eq!(policy.decide(RunEnd::ApplicatorGone), RestartDecision::Stop);
 		assert_eq!(policy.failures(), 0, "neither counts against the failure budget");
+	}
+
+	/// Live mainnet probe of the fee sampler, through the engine's own kyoto settings and
+	/// [`KyotoFeeSource`]: resumes seven blocks below the tip like a node restarted at its
+	/// wallet's tip, waits for the filters, then runs sampler passes on their real bounds and
+	/// prints each pass's summary and the resulting estimates. Needs the network; ignored by
+	/// default. Run with:
+	///
+	/// `cargo test --features cbf --lib cbf_fee_sampler_mainnet_probe -- --ignored --nocapture`
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	#[ignore = "needs mainnet P2P and mempool.space; run by hand"]
+	async fn cbf_fee_sampler_mainnet_probe() {
+		use std::str::FromStr;
+
+		use crate::chain::adapters::cbf::fee_cache_from_samples;
+		use crate::chain::cbf::fee::FEE_WINDOW_BLOCKS;
+		use crate::chain::cbf::fee_sampler::{canonical_window, window_samples, MIN_FEE_SAMPLES};
+		use crate::chain::cbf::REORG_SAFETY_BLOCKS;
+
+		const PROBE_BOUND: Duration = Duration::from_secs(9 * 60);
+		let started = std::time::Instant::now();
+		let curl = |url: &str| {
+			let out = std::process::Command::new("curl").args(["-sf", url]).output().unwrap();
+			String::from_utf8(out.stdout).unwrap().trim().to_string()
+		};
+		let tip: u32 = curl("https://mempool.space/api/blocks/tip/height").parse().unwrap();
+		let height = tip - REORG_SAFETY_BLOCKS;
+		let hash = BlockHash::from_str(&curl(&format!(
+			"https://mempool.space/api/block-height/{}",
+			height
+		)))
+		.unwrap();
+		println!("probe: network tip {}, resuming kyoto at {} {}", tip, height, hash);
+
+		let data_dir = std::env::temp_dir().join(format!("cbf-fee-probe-{}", std::process::id()));
+		let (node, client) = kyoto_builder(bitcoin::Network::Bitcoin, data_dir.clone(), &[], 1)
+			.chain_state(ChainState::Checkpoint(HashCheckpoint::new(height, hash)))
+			.build();
+		let Client { requester, info_rx, warn_rx: _warn_rx, mut event_rx } = client;
+		tokio::spawn(node.run());
+		drop(info_rx);
+
+		let (sync_state_tx, sync_state_rx) =
+			watch::channel(CbfSyncState::Active { applied_tip: None, synced_to_tip: false });
+		let synced = tokio::time::timeout(Duration::from_secs(180), async {
+			while let Some(event) = event_rx.recv().await {
+				if let KyotoEvent::FiltersSynced(update) = event {
+					return Some(update.tip().height);
+				}
+			}
+			None
+		})
+		.await
+		.expect("kyoto synced within 3 minutes")
+		.expect("kyoto kept running");
+		println!("probe: kyoto synced to {} after {:.1}s", synced, started.elapsed().as_secs_f32());
+		sync_state_tx
+			.send_replace(CbfSyncState::Active { applied_tip: Some(synced), synced_to_tip: true });
+		tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+
+		let source = KyotoFeeSource {
+			runtime_status: Arc::new(Mutex::new(CbfRuntimeStatus::Started {
+				requester: requester.clone(),
+				generation: 1,
+			})),
+			sync_state_rx,
+			full_block_permits: Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS)),
+		};
+		let cache = new_block_fee_cache();
+		let logger = Arc::new(Logger::new_log_facade());
+		let mut sampler = FeeSampler::new(
+			KyotoFeeSource {
+				runtime_status: Arc::clone(&source.runtime_status),
+				sync_state_rx: source.sync_state_rx.clone(),
+				full_block_permits: Arc::clone(&source.full_block_permits),
+			},
+			Arc::clone(&cache),
+			logger,
+		);
+
+		let mut answered_after = None;
+		let mut pass_no = 0;
+		while started.elapsed() < PROBE_BOUND {
+			pass_no += 1;
+			let report = sampler.pass().await;
+			println!(
+				"probe: pass {} at {:.1}s — {}",
+				pass_no,
+				started.elapsed().as_secs_f32(),
+				report
+			);
+			let (_, canonical) = canonical_window(&source).await.unwrap();
+			let samples = window_samples(&cache.lock().unwrap(), &canonical);
+			if samples.len() >= MIN_FEE_SAMPLES && answered_after.is_none() {
+				answered_after = Some(started.elapsed());
+			}
+			if samples.len() == canonical.len() {
+				break;
+			}
+			tokio::time::sleep(Duration::from_secs(5)).await;
+		}
+
+		let (_, canonical) = canonical_window(&source).await.unwrap();
+		for (height, (hash, rate)) in cache.lock().unwrap().iter() {
+			println!(
+				"probe: sample h={} {} {} sat/vB ({} sat/kwu)",
+				height,
+				hash,
+				rate.to_sat_per_vb_floor(),
+				rate.to_sat_per_kwu()
+			);
+		}
+		let samples = window_samples(&cache.lock().unwrap(), &canonical);
+		println!(
+			"probe: {} of {} window heights held by kyoto sampled (window {}); first answer after \
+			 {:?}",
+			samples.len(),
+			canonical.len(),
+			FEE_WINDOW_BLOCKS,
+			answered_after
+		);
+		if let Some(estimates) = fee_cache_from_samples(&samples) {
+			let mut estimates: Vec<_> = estimates.into_iter().collect();
+			estimates.sort_by_key(|(_, rate)| rate.to_sat_per_kwu());
+			for (target, rate) in estimates {
+				println!("probe: estimate {:?} = {} sat/kwu", target, rate.to_sat_per_kwu());
+			}
+		}
+		let _ = requester.shutdown();
+		let _ = std::fs::remove_dir_all(data_dir);
+		assert!(samples.len() >= MIN_FEE_SAMPLES, "the sampler landed too few mainnet samples");
 	}
 }
