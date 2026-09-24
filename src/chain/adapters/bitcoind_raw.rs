@@ -41,8 +41,29 @@
 //! the `RAW_RPC_*` constants). A serve call makes at most three requests in
 //! sequence (resolve the span, fetch its hashes, fetch its data), except that
 //! filter data is fetched in batches of [`FILTER_RPC_BATCH`]; the whole serve
-//! call is therefore bounded by those budgets summed, which the relaying
-//! app's own timeout must exceed.
+//! call is therefore bounded by those budgets summed.
+//!
+//! A per-request timeout runs from the start of the connect until the body
+//! has been read, so [`RAW_RPC_CONNECT_TIMEOUT_SECS`] sits inside it; the
+//! table counts it on top anyway, as the conservative bound.
+//!
+//! Each route is relayed to a remote node as one unary peer call, and the
+//! peer carrier (node-app-iroh) caps every outbound unary call at 60 s. So
+//! per route: this source's budget < the host serve timeout < the client
+//! wait < 60 s, each step with a margin:
+//!
+//! | route                     | per request here | host serve | client wait | carrier |
+//! |---------------------------|------------------|------------|-------------|---------|
+//! | `chain.block`             | 40 (+10) s       | 54 s       | 58 s        | 60 s    |
+//! | `chain.filters`           | 30 (+10) s       | 45 s       | 50 s        | 60 s    |
+//! | `chain.tip` / `headers` / `filter_headers` | 20 (+10) s | 35 s | 40 s  | 60 s    |
+//!
+//! `chain.block` is a single `getblock`, so its row is the whole serve call.
+//! The other routes chain several requests; their typical total is well
+//! under the host timeout, and a pathological one is cut by the host serve
+//! timeout rather than by the carrier. Raising a budget here means raising
+//! the host serve timeout and the client wait with it, and none of them may
+//! reach the carrier's 60 s.
 //!
 //! # Credentials
 //!
@@ -81,8 +102,11 @@ pub(crate) const RAW_RPC_CALL_TIMEOUT_SECS: u64 = 20;
 /// One batch of [`FILTER_RPC_BATCH`] `getblockfilter` calls: a few MiB of hex
 /// on mainnet.
 pub(crate) const RAW_RPC_FILTER_BATCH_TIMEOUT_SECS: u64 = 30;
-/// One `getblock`: up to 4 MB of block, 8 MB of hex.
-pub(crate) const RAW_RPC_BLOCK_TIMEOUT_SECS: u64 = 60;
+/// One `getblock`: up to 4 MB of block, 8 MB of hex. A block from a local or
+/// well-connected node takes 1-2 s; 40 s is generous and, with the connect
+/// budget, keeps the host's 54 s `chain.block` serve timeout (and the
+/// carrier's 60 s peer-call cap above it) out of reach — see the module docs.
+pub(crate) const RAW_RPC_BLOCK_TIMEOUT_SECS: u64 = 40;
 
 /// `getblockfilter` calls per HTTP request. `getblockfilter` returns the whole
 /// filter with the header, so this bounds what one reply holds in memory.
