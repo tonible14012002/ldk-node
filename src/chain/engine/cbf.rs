@@ -21,27 +21,31 @@
 //! the fee/broadcast hooks became slot adapters.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bip157::chain::BlockHeaderChanges;
 use bip157::{
 	Builder as KyotoBuilder, ChainState, Client, Event as KyotoEvent, HashCheckpoint, Info,
-	Node as KyotoNode, Requester, TrustedPeer, Warning,
+	Node as KyotoNode, NodeError, Requester, TrustedPeer, Warning,
 };
 
 use bitcoin::block::Header;
-use bitcoin::{Script, ScriptBuf, Txid};
+use bitcoin::{BlockHash, Script, ScriptBuf, Txid};
 
 use bdk_chain::BlockId;
 
 use lightning::chain::WatchedOutput;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 use crate::chain::bitcoind::ChainListener;
-use crate::chain::cbf::applicator::{BlockApplicator, ChainOp, CBF_CHAIN_OP_QUEUE_DEPTH};
+use crate::chain::cbf::applicator::{
+	BlockApplicator, ChainOp, CBF_CHAIN_OP_QUEUE_DEPTH, CBF_FULL_BLOCK_PERMITS,
+};
 use crate::chain::cbf::birthday::resolve_birthday;
 use crate::chain::cbf::fee::{new_block_fee_cache, BlockFeeCache};
 use crate::chain::cbf::{
@@ -53,7 +57,7 @@ use crate::chain::seam::{MempoolAnswer, MempoolQuery, MempoolScope};
 use crate::chain::{CbfSyncStatus, ChainLayer, ElectrumRuntimeStatus};
 use crate::config::{Config, DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS};
 use crate::io::utils::write_node_metrics;
-use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
+use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogger, Logger};
 use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
@@ -62,13 +66,14 @@ use async_trait::async_trait;
 /// Peer response timeout passed to kyoto's `Builder::response_timeout`.
 const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 30;
 
-/// Maximum consecutive `node.run()` failures before the restart loop gives up.
+/// Maximum consecutive failed runs — `node.run()` erroring, or the event loop giving up on the
+/// node — before the restart loop gives up. Reset once a run catches up to the tip.
 const MAX_RESTART_RETRIES: u32 = 5;
 
 /// Initial backoff delay between restart attempts; doubles each failure.
 const INITIAL_BACKOFF_MS: u64 = 500;
 
-/// Retry matched block downloads before surfacing a CBF sync failure.
+/// Retry matched block downloads before giving up on the node and rebuilding it.
 const CBF_BLOCK_FETCH_RETRIES: u8 = 3;
 
 /// Per-attempt timeout when downloading a matched block from a peer. Kyoto queues the request
@@ -77,6 +82,11 @@ const CBF_BLOCK_FETCH_RETRIES: u8 = 3;
 /// retried rather than stalling.
 const CBF_BLOCK_FETCH_TIMEOUT_SECS: u64 = 10;
 
+/// How long the restart loop waits for a node it asked to shut down before dropping it. A node
+/// takes the shutdown on its next loop iteration, so this is only ever reached by one wedged
+/// in a peer handshake or a database write.
+const CBF_NODE_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
 /// Bound on the header lookup [`SyncEngine::is_on_chain`] makes, for the same reason.
 // Reached only through `is_on_chain`, whose first caller is the hybrid check (T10).
 #[allow(dead_code)]
@@ -84,7 +94,14 @@ const CBF_HEADER_LOOKUP_TIMEOUT_SECS: u64 = 10;
 
 /// Runtime status of the underlying kyoto node.
 enum CbfRuntimeStatus {
-	Started { requester: Requester },
+	Started {
+		requester: Requester,
+		/// Which [`CbfSyncEngine::launch`] this node belongs to. The restart loop writes the
+		/// status only while it still carries its own generation: after a `stop()` and a fresh
+		/// `start()` the status belongs to the new launch, and the old loop's exit — which
+		/// arrives whenever kyoto gets round to the shutdown — must not clobber it.
+		generation: u64,
+	},
 	Stopped,
 }
 
@@ -146,6 +163,8 @@ pub(crate) struct CbfSyncEngine {
 	block_fee_cache: BlockFeeCache,
 	/// Whether kyoto is running, and the live requester if so.
 	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
+	/// Counts [`Self::launch`] calls; each stamps its generation into the runtime status.
+	launch_generation: AtomicU64,
 	/// Where the engine is between "started" and "caught up".
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	/// The runtime handed over by [`SyncEngine::start`]; the background tasks are spawned on it.
@@ -195,6 +214,7 @@ impl CbfSyncEngine {
 			watch_ledger: Arc::new(WatchLedger::new()),
 			block_fee_cache: new_block_fee_cache(),
 			runtime_status: Arc::new(Mutex::new(CbfRuntimeStatus::Stopped)),
+			launch_generation: AtomicU64::new(0),
 			sync_state_tx,
 			runtime: Mutex::new(None),
 			external_electrum,
@@ -228,6 +248,7 @@ impl CbfSyncEngine {
 		};
 		let Client { requester, info_rx, warn_rx, event_rx } = client;
 
+		let generation = self.launch_generation.fetch_add(1, Ordering::AcqRel) + 1;
 		{
 			let mut status = self.runtime_status.lock().unwrap_or_else(|e| e.into_inner());
 			if matches!(*status, CbfRuntimeStatus::Started { .. }) {
@@ -235,10 +256,11 @@ impl CbfSyncEngine {
 				let _ = requester.shutdown();
 				return;
 			}
-			*status = CbfRuntimeStatus::Started { requester };
+			*status = CbfRuntimeStatus::Started { requester, generation };
 		}
 
 		let (ops_tx, ops_rx) = mpsc::channel(CBF_CHAIN_OP_QUEUE_DEPTH);
+		let full_block_permits = Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS));
 		let best_block_height = listener.get_best_block().height;
 		self.sync_state_tx.send_replace(CbfSyncState::Active {
 			applied_tip: Some(best_block_height),
@@ -261,11 +283,13 @@ impl CbfSyncEngine {
 
 		let kyoto_loop = KyotoLoop {
 			kyoto: self.kyoto.clone(),
+			generation,
 			listener,
 			registered_scripts: Arc::clone(&self.registered_scripts),
 			runtime_status: Arc::clone(&self.runtime_status),
 			sync_state_tx: self.sync_state_tx.clone(),
 			ops_tx,
+			full_block_permits,
 			logger: Arc::clone(&self.logger),
 		};
 		runtime.spawn(kyoto_loop.run(node, info_rx, warn_rx, event_rx));
@@ -320,7 +344,7 @@ impl CbfSyncEngine {
 	/// The live kyoto requester, or `None` while kyoto is not running.
 	pub(crate) fn requester(&self) -> Option<Requester> {
 		match &*self.runtime_status.lock().unwrap_or_else(|e| e.into_inner()) {
-			CbfRuntimeStatus::Started { requester } => Some(requester.clone()),
+			CbfRuntimeStatus::Started { requester, .. } => Some(requester.clone()),
 			CbfRuntimeStatus::Stopped => None,
 		}
 	}
@@ -380,7 +404,7 @@ impl SyncEngine for CbfSyncEngine {
 		let requester = {
 			let mut status = self.runtime_status.lock().unwrap_or_else(|e| e.into_inner());
 			match std::mem::replace(&mut *status, CbfRuntimeStatus::Stopped) {
-				CbfRuntimeStatus::Started { requester } => Some(requester),
+				CbfRuntimeStatus::Started { requester, .. } => Some(requester),
 				CbfRuntimeStatus::Stopped => None,
 			}
 		};
@@ -508,7 +532,13 @@ impl SyncEngine for CbfSyncEngine {
 					return;
 				}
 				_ = fee_rate_update_interval.tick() => {
-					let _ = layer.update_fee_rate_estimates().await;
+					if let Err(e) = layer.update_fee_rate_estimates().await {
+						log_debug!(
+							self.logger,
+							"CBF fee-rate refresh failed this tick; the cached rates stand: {}",
+							e
+						);
+					}
 				}
 			}
 		}
@@ -575,136 +605,408 @@ impl SyncEngine for CbfSyncEngine {
 /// backoff, and turns its events into [`ChainOp`]s for the applicator.
 struct KyotoLoop {
 	kyoto: KyotoParams,
+	/// The launch this loop belongs to; see [`CbfRuntimeStatus::Started`].
+	generation: u64,
 	listener: Arc<ChainListener>,
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
 	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	ops_tx: mpsc::Sender<ChainOp>,
+	/// The [`CBF_FULL_BLOCK_PERMITS`] bound; shared by every node this loop runs, since a
+	/// permit lives in its op until the applicator drops it, whichever node fetched the block.
+	full_block_permits: Arc<Semaphore>,
 	logger: Arc<Logger>,
 }
+
+/// How one run of the kyoto node ended, as the restart loop judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunEnd {
+	/// `node.run()` returned `Ok`: it was asked to shut down.
+	Shutdown,
+	/// `node.run()` returned an error, or its event stream ended under a running node.
+	NodeFailed,
+	/// The event task gave up on this node — a matched block could not be fetched after every
+	/// retry, or the requester was gone — while the node itself kept running. Before this was
+	/// a distinct end the failure was reported and the node left running: a permanent stall,
+	/// since nothing else ever restarted it.
+	EventLoopFailed,
+	/// The applicator halted on a divergence. Nothing can take blocks until the node process is
+	/// restarted, so there is nothing to rebuild kyoto for.
+	ApplicatorGone,
+}
+
+/// What the restart loop does once a run has ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartDecision {
+	/// Rebuild the node after this delay.
+	Restart { backoff: Duration },
+	/// The budget of consecutive failures is spent: publish a failed sync.
+	GiveUp,
+	/// Nothing to restart: the node was stopped on purpose, or a restart cannot help.
+	Stop,
+}
+
+/// The restart budget: how many runs in a row may fail before the engine gives up, and how long
+/// to wait before each attempt.
+///
+/// Kept apart from the loop that acts on it so the decision that matters — an event-loop
+/// failure rebuilds the node exactly like a node failure, and a run that caught up refills the
+/// budget — can be checked without a node.
+struct RestartPolicy {
+	retries: u32,
+	backoff_ms: u64,
+}
+
+impl RestartPolicy {
+	fn new() -> Self {
+		Self { retries: 0, backoff_ms: INITIAL_BACKOFF_MS }
+	}
+
+	/// The run that just ended caught up to the tip at least once: it was a healthy node that
+	/// failed later, not a failed restart, so the budget starts over.
+	fn note_progress(&mut self) {
+		self.retries = 0;
+		self.backoff_ms = INITIAL_BACKOFF_MS;
+	}
+
+	fn decide(&mut self, end: RunEnd) -> RestartDecision {
+		match end {
+			RunEnd::Shutdown | RunEnd::ApplicatorGone => RestartDecision::Stop,
+			RunEnd::NodeFailed | RunEnd::EventLoopFailed => {
+				self.retries += 1;
+				if self.retries > MAX_RESTART_RETRIES {
+					return RestartDecision::GiveUp;
+				}
+				let backoff = Duration::from_millis(self.backoff_ms);
+				self.backoff_ms = self.backoff_ms.saturating_mul(2);
+				RestartDecision::Restart { backoff }
+			},
+		}
+	}
+
+	/// How many runs in a row have failed.
+	fn failures(&self) -> u32 {
+		self.retries
+	}
+}
+
+/// Which side of a run finished first.
+enum Turn {
+	Node(Result<(), NodeError>),
+	Events(Result<EventLoopEnd, tokio::task::JoinError>),
+}
+
+/// A node with the receivers its client came with.
+type NodeRun = (
+	KyotoNode,
+	mpsc::Receiver<Info>,
+	mpsc::UnboundedReceiver<Warning>,
+	mpsc::UnboundedReceiver<KyotoEvent>,
+);
 
 impl KyotoLoop {
 	async fn run(
 		self, node: KyotoNode, info_rx: mpsc::Receiver<Info>,
 		warn_rx: mpsc::UnboundedReceiver<Warning>, event_rx: mpsc::UnboundedReceiver<KyotoEvent>,
 	) {
-		let mut current_node = node;
-		let mut current_info_rx = info_rx;
-		let mut current_warn_rx = warn_rx;
-		let mut current_event_rx = event_rx;
-		let mut retries = 0u32;
-		let mut backoff_ms = INITIAL_BACKOFF_MS;
+		let mut current: NodeRun = (node, info_rx, warn_rx, event_rx);
+		let mut policy = RestartPolicy::new();
+		// Set by the event loop on `FiltersSynced`, read once per run end.
+		let synced_this_run = Arc::new(AtomicBool::new(false));
 
 		loop {
+			let (node, info_rx, warn_rx, event_rx) = current;
 			let info_handle =
-				tokio::spawn(process_info_messages(current_info_rx, Arc::clone(&self.logger)));
+				tokio::spawn(process_info_messages(info_rx, Arc::clone(&self.logger)));
 			let warn_handle =
-				tokio::spawn(process_warn_messages(current_warn_rx, Arc::clone(&self.logger)));
-			let event_handle = tokio::spawn(process_kyoto_events(
-				Arc::clone(&self.logger),
-				current_event_rx,
-				Arc::clone(&self.registered_scripts),
-				Arc::clone(&self.runtime_status),
-				self.ops_tx.clone(),
-				Arc::clone(&self.listener.onchain_wallet),
-				self.sync_state_tx.clone(),
-			));
+				tokio::spawn(process_warn_messages(warn_rx, Arc::clone(&self.logger)));
+			let mut event_handle =
+				tokio::spawn(self.event_loop(Arc::clone(&synced_this_run)).run(event_rx));
+			let mut node_run = Box::pin(node.run());
 
-			match current_node.run().await {
-				Ok(()) => {
+			// The node and its event consumer are raced: either one ending ends the run. Before,
+			// only the node was awaited, so an event loop that gave up left the node running —
+			// healthy as far as `run()` could tell — and nothing ever restarted it.
+			let turn = tokio::select! {
+				biased;
+				result = &mut node_run => Turn::Node(result),
+				joined = &mut event_handle => Turn::Events(joined),
+			};
+			let end = match turn {
+				Turn::Node(Ok(())) => {
 					log_info!(self.logger, "CBF node shut down cleanly.");
-					*self.runtime_status.lock().unwrap_or_else(|e| e.into_inner()) =
-						CbfRuntimeStatus::Stopped;
-					self.sync_state_tx.send_replace(CbfSyncState::Failed(Error::NotRunning));
-					break;
-				},
-				Err(e) => {
-					retries += 1;
-					if retries > MAX_RESTART_RETRIES {
-						log_error!(
-							self.logger,
-							"CBF node failed {} times, giving up: {:?}",
-							retries,
-							e,
-						);
-						*self.runtime_status.lock().unwrap_or_else(|e| e.into_inner()) =
-							CbfRuntimeStatus::Stopped;
-						self.sync_state_tx.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
-						break;
-					}
-					log_error!(
-						self.logger,
-						"CBF node exited with error (attempt {}/{}): {:?}. Restarting in {}ms.",
-						retries,
-						MAX_RESTART_RETRIES,
-						e,
-						backoff_ms,
-					);
-
-					// Abort the old consumers before rebuilding.
-					info_handle.abort();
-					warn_handle.abort();
 					event_handle.abort();
-
-					tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-					backoff_ms = backoff_ms.saturating_mul(2);
-					let (new_node, new_client) = match self.kyoto.build(&self.listener) {
-						Ok(built) => built,
-						Err(refusal) => {
-							log_error!(self.logger, "CBF restart aborted: {}", refusal);
-							*self.runtime_status.lock().unwrap_or_else(|e| e.into_inner()) =
-								CbfRuntimeStatus::Stopped;
-							self.sync_state_tx
-								.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
-							break;
+					RunEnd::Shutdown
+				},
+				Turn::Node(Err(e)) => {
+					log_error!(self.logger, "CBF node exited with error: {:?}", e);
+					event_handle.abort();
+					RunEnd::NodeFailed
+				},
+				Turn::Events(joined) => {
+					let end = match joined {
+						Ok(EventLoopEnd::ApplicatorGone) => RunEnd::ApplicatorGone,
+						Ok(EventLoopEnd::Failed(e)) => {
+							log_error!(self.logger, "CBF event loop gave up on the node: {}", e);
+							RunEnd::EventLoopFailed
+						},
+						Ok(EventLoopEnd::EventsClosed) => {
+							log_error!(
+								self.logger,
+								"CBF event stream ended while the node was still running."
+							);
+							RunEnd::NodeFailed
+						},
+						Err(e) => {
+							log_error!(
+								self.logger,
+								"CBF event loop task ended abnormally: {:?}",
+								e
+							);
+							RunEnd::EventLoopFailed
 						},
 					};
-					let Client {
-						requester: new_requester,
-						info_rx: new_info_rx,
-						warn_rx: new_warn_rx,
-						event_rx: new_event_rx,
-					} = new_client;
+					// The node is still running with nobody consuming it: stop it before deciding
+					// anything, so a rebuild never has two nodes on one data directory.
+					self.stop_node(node_run).await;
+					end
+				},
+			};
+			info_handle.abort();
+			warn_handle.abort();
 
-					{
-						let mut status =
-							self.runtime_status.lock().unwrap_or_else(|e| e.into_inner());
-						if matches!(*status, CbfRuntimeStatus::Stopped) {
-							let _ = new_requester.shutdown();
-							self.sync_state_tx
-								.send_replace(CbfSyncState::Failed(Error::NotRunning));
-							log_info!(
-								self.logger,
-								"CBF restart aborted: stop() called during backoff."
-							);
-							break;
-						}
-						*status = CbfRuntimeStatus::Started { requester: new_requester };
-						self.sync_state_tx.send_replace(CbfSyncState::Active {
-							applied_tip: Some(self.listener.get_best_block().height),
-							synced_to_tip: false,
-						});
+			if synced_this_run.swap(false, Ordering::AcqRel) {
+				policy.note_progress();
+			}
+			match policy.decide(end) {
+				RestartDecision::Stop => {
+					// A `stop()` settled the status and state itself, and a halted applicator
+					// published its failure; this only lands for an exit nobody asked for.
+					let error = match end {
+						RunEnd::ApplicatorGone => Error::TxSyncFailed,
+						_ => Error::NotRunning,
+					};
+					self.settle(CbfSyncState::Failed(error));
+					break;
+				},
+				RestartDecision::GiveUp => {
+					log_error!(
+						self.logger,
+						"CBF node failed {} times in a row without catching up; giving up.",
+						policy.failures()
+					);
+					self.settle(CbfSyncState::Failed(Error::TxSyncFailed));
+					break;
+				},
+				RestartDecision::Restart { backoff } => {
+					log_error!(
+						self.logger,
+						"Restarting the CBF node in {}ms (attempt {}/{}).",
+						backoff.as_millis(),
+						policy.failures(),
+						MAX_RESTART_RETRIES,
+					);
+					tokio::time::sleep(backoff).await;
+					match self.rebuild() {
+						Some(next) => current = next,
+						None => break,
 					}
-
-					current_node = new_node;
-					current_info_rx = new_info_rx;
-					current_warn_rx = new_warn_rx;
-					current_event_rx = new_event_rx;
 				},
 			}
 		}
 	}
-}
 
-async fn process_info_messages(mut info_rx: mpsc::Receiver<Info>, logger: Arc<Logger>) {
-	while let Some(info) = info_rx.recv().await {
-		log_debug!(logger, "CBF node info: {}", info);
+	/// The consumer of one node's events.
+	fn event_loop(&self, synced: Arc<AtomicBool>) -> EventLoop {
+		EventLoop {
+			generation: self.generation,
+			registered_scripts: Arc::clone(&self.registered_scripts),
+			runtime_status: Arc::clone(&self.runtime_status),
+			ops_tx: self.ops_tx.clone(),
+			onchain_wallet: Arc::clone(&self.listener.onchain_wallet),
+			sync_state_tx: self.sync_state_tx.clone(),
+			full_block_permits: Arc::clone(&self.full_block_permits),
+			synced,
+			logger: Arc::clone(&self.logger),
+		}
+	}
+
+	/// This launch's requester, or `None` once `stop()` took it or a later launch replaced it.
+	fn own_requester(&self) -> Option<Requester> {
+		own_requester(&self.runtime_status, self.generation)
+	}
+
+	/// Asks the running node to shut down and waits, bounded, for its `run()` to return. A node
+	/// that does not stop in time is dropped: its future is cancelled, and its peer tasks end as
+	/// the channels they report into close.
+	async fn stop_node(&self, node_run: impl Future<Output = Result<(), NodeError>>) {
+		if let Some(requester) = self.own_requester() {
+			if requester.shutdown().is_err() {
+				log_debug!(self.logger, "CBF node was already gone when asked to shut down.");
+			}
+		}
+		match tokio::time::timeout(Duration::from_secs(CBF_NODE_SHUTDOWN_TIMEOUT_SECS), node_run)
+			.await
+		{
+			Ok(Ok(())) => log_debug!(self.logger, "CBF node shut down for a rebuild."),
+			Ok(Err(e)) => log_debug!(
+				self.logger,
+				"CBF node exited with error while shutting down for a rebuild: {:?}",
+				e
+			),
+			Err(_elapsed) => log_warn!(
+				self.logger,
+				"CBF node did not shut down within {}s; dropping it.",
+				CBF_NODE_SHUTDOWN_TIMEOUT_SECS
+			),
+		}
+	}
+
+	/// Marks kyoto stopped and publishes `state` — unless the runtime status no longer belongs
+	/// to this launch. A `stop()` since has settled both already, and a `stop()` followed by a
+	/// fresh `start()` owns them: a late write from this loop would clobber the new node's
+	/// `Started` and fail the sync it is running.
+	fn settle(&self, state: CbfSyncState) {
+		let mut status = self.runtime_status.lock().unwrap_or_else(|e| e.into_inner());
+		let owned = matches!(
+			&*status,
+			CbfRuntimeStatus::Started { generation, .. } if *generation == self.generation
+		);
+		if !owned {
+			log_debug!(
+				self.logger,
+				"CBF launch {} ended after the runtime status moved on; leaving it alone.",
+				self.generation
+			);
+			return;
+		}
+		*status = CbfRuntimeStatus::Stopped;
+		drop(status);
+		self.sync_state_tx.send_replace(state);
+	}
+
+	/// Builds the next node, re-anchored on the listeners' current state, and hands its
+	/// requester to the runtime status. `None` when the launch no longer owns the runtime or
+	/// the resume is refused; the latter settles the sync state as failed.
+	fn rebuild(&self) -> Option<NodeRun> {
+		if self.own_requester().is_none() {
+			log_info!(self.logger, "CBF restart aborted: stop() was called during the backoff.");
+			return None;
+		}
+		let (node, client) = match self.kyoto.build(&self.listener) {
+			Ok(built) => built,
+			Err(refusal) => {
+				log_error!(self.logger, "CBF restart aborted: {}", refusal);
+				self.settle(CbfSyncState::Failed(Error::TxSyncFailed));
+				return None;
+			},
+		};
+		let Client { requester, info_rx, warn_rx, event_rx } = client;
+
+		{
+			let mut status = self.runtime_status.lock().unwrap_or_else(|e| e.into_inner());
+			let owned = matches!(
+				&*status,
+				CbfRuntimeStatus::Started { generation, .. } if *generation == self.generation
+			);
+			if !owned {
+				drop(status);
+				let _ = requester.shutdown();
+				log_info!(
+					self.logger,
+					"CBF restart aborted: stop() was called while the node was being rebuilt."
+				);
+				return None;
+			}
+			*status = CbfRuntimeStatus::Started { requester, generation: self.generation };
+		}
+		self.sync_state_tx.send_replace(CbfSyncState::Active {
+			applied_tip: Some(self.listener.get_best_block().height),
+			synced_to_tip: false,
+		});
+		Some((node, info_rx, warn_rx, event_rx))
 	}
 }
 
+/// The requester of launch `generation`, if the runtime status still belongs to it. Copied
+/// out under the lock so no caller holds a `std::sync::Mutex` guard across an `.await`.
+fn own_requester(runtime_status: &Mutex<CbfRuntimeStatus>, generation: u64) -> Option<Requester> {
+	match &*runtime_status.lock().unwrap_or_else(|e| e.into_inner()) {
+		CbfRuntimeStatus::Started { requester, generation: owner } if *owner == generation => {
+			Some(requester.clone())
+		},
+		_ => None,
+	}
+}
+
+/// Kyoto reports progress on every filter batch and a handshake per peer. On a device whose
+/// log is the only window into "syncing" versus "no peers", one line per peer and one per ten
+/// percent of a catch-up is the signal without the noise.
+async fn process_info_messages(mut info_rx: mpsc::Receiver<Info>, logger: Arc<Logger>) {
+	let mut handshakes = 0usize;
+	// Progress restarts from zero on every batch after the first, and the `FiltersSynced` line
+	// already marks each of those; only a rising decile is worth a line.
+	let mut last_decile: Option<u32> = None;
+	while let Some(info) = info_rx.recv().await {
+		match info {
+			Info::SuccessfulHandshake => {
+				handshakes += 1;
+				log_info!(logger, "CBF peer connected ({} handshakes this run).", handshakes);
+			},
+			Info::ConnectionsMet => log_info!(logger, "CBF required peer connections met."),
+			Info::Progress(progress) => {
+				let percent = progress.percentage_complete().clamp(0.0, 100.0);
+				let decile = percent as u32 / 10;
+				let rising = match last_decile {
+					Some(last) => decile > last,
+					None => true,
+				};
+				if rising {
+					last_decile = Some(decile);
+					log_info!(
+						logger,
+						"CBF filter sync {:.0}% complete; header chain at height {}.",
+						percent,
+						progress.chain_height()
+					);
+				}
+			},
+			Info::BlockReceived(hash) => log_debug!(logger, "CBF received block {}", hash),
+		}
+	}
+}
+
+/// Kyoto's warnings, at the level each one deserves: a peer problem the node handles itself is
+/// operator information, a rejected broadcast or a peer without filters is a warning, and a
+/// sync error nobody expected is an error.
 async fn process_warn_messages(mut warn_rx: mpsc::UnboundedReceiver<Warning>, logger: Arc<Logger>) {
+	// `NeedConnections` is re-sent on every iteration of kyoto's 10ms loop for as long as the
+	// node is under-connected; it is logged when the counts change and dropped otherwise.
+	let mut last_need: Option<(usize, usize)> = None;
 	while let Some(warning) = warn_rx.recv().await {
-		log_debug!(logger, "CBF node warning: {}", warning);
+		match &warning {
+			Warning::NeedConnections { connected, required } => {
+				if last_need != Some((*connected, *required)) {
+					last_need = Some((*connected, *required));
+					log_info!(
+						logger,
+						"CBF node is looking for peers: {} connected, {} required.",
+						connected,
+						required
+					);
+				}
+			},
+			Warning::CouldNotConnect | Warning::PeerTimedOut | Warning::PotentialStaleTip => {
+				log_info!(logger, "CBF node: {}", warning)
+			},
+			Warning::TransactionRejected { .. } | Warning::NoCompactFilters => {
+				log_warn!(logger, "CBF node: {}", warning)
+			},
+			Warning::UnexpectedSyncError { .. } => log_error!(logger, "CBF node: {}", warning),
+			Warning::UnsolicitedMessage | Warning::EvaluatingFork | Warning::ChannelDropped => {
+				log_debug!(logger, "CBF node: {}", warning)
+			},
+		}
 	}
 }
 
@@ -740,138 +1042,227 @@ impl MatchSet {
 	}
 }
 
-async fn process_kyoto_events(
-	logger: Arc<Logger>, mut event_rx: mpsc::UnboundedReceiver<KyotoEvent>,
+/// Why the event loop stopped consuming kyoto's events.
+enum EventLoopEnd {
+	/// Kyoto dropped its event sender: the node is gone.
+	EventsClosed,
+	/// The applicator is gone: it halted on a divergence, and nothing can take blocks.
+	ApplicatorGone,
+	/// The loop cannot go on with this node: the requester was gone, or a matched block could
+	/// not be fetched after every retry.
+	Failed(Error),
+}
+
+/// One node's consumer of kyoto's events, turning them into [`ChainOp`]s for the applicator.
+struct EventLoop {
+	generation: u64,
 	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
-	runtime_status: Arc<Mutex<CbfRuntimeStatus>>, ops_tx: mpsc::Sender<ChainOp>,
-	onchain_wallet: Arc<Wallet>, sync_state_tx: watch::Sender<CbfSyncState>,
-) {
-	let mut match_set = MatchSet::new();
-	while let Some(event) = event_rx.recv().await {
-		match event {
-			KyotoEvent::IndexedFilter(indexed_filter) => {
-				// A new block's filter arrived, so we're behind by at least this block until it
-				// is fetched (if matched) and applied. Flip this before the fetch, not after,
-				// so a `sync_wallets` call issued in between doesn't return on a stale
-				// `synced_to_tip` that predates this block.
-				mark_syncing(&sync_state_tx);
+	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
+	ops_tx: mpsc::Sender<ChainOp>,
+	onchain_wallet: Arc<Wallet>,
+	sync_state_tx: watch::Sender<CbfSyncState>,
+	full_block_permits: Arc<Semaphore>,
+	/// Raised on `FiltersSynced`, for the restart loop's failure budget.
+	synced: Arc<AtomicBool>,
+	logger: Arc<Logger>,
+}
 
-				// Copy the requester out and release the lock before any `.await` below: this is a
-				// `std::sync::Mutex`, so holding its guard across an await point would make this
-				// future non-`Send` and it could not be spawned.
-				let requester_opt = match &*runtime_status.lock().unwrap_or_else(|e| e.into_inner())
-				{
-					CbfRuntimeStatus::Started { requester } => Some(requester.clone()),
-					CbfRuntimeStatus::Stopped => None,
-				};
-				let requester = match requester_opt {
-					Some(requester) => requester,
-					None => {
-						let _ = ops_tx.send(ChainOp::Failed { error: Error::NotRunning }).await;
-						return;
-					},
-				};
+impl EventLoop {
+	async fn run(self, mut event_rx: mpsc::UnboundedReceiver<KyotoEvent>) -> EventLoopEnd {
+		let mut match_set = MatchSet::new();
+		while let Some(event) = event_rx.recv().await {
+			match event {
+				KyotoEvent::IndexedFilter(indexed_filter) => {
+					// A new block's filter arrived, so we're behind by at least this block until it
+					// is fetched (if matched) and applied. Flip this before the fetch, not after,
+					// so a `sync_wallets` call issued in between doesn't return on a stale
+					// `synced_to_tip` that predates this block.
+					mark_syncing(&self.sync_state_tx);
 
-				let block_hash = indexed_filter.block_hash();
-				let matched = {
-					let scripts = match_set.current(&onchain_wallet, &registered_scripts);
-					indexed_filter.contains_any(scripts.iter())
-				};
+					let block_hash = indexed_filter.block_hash();
+					let matched = {
+						let scripts =
+							match_set.current(&self.onchain_wallet, &self.registered_scripts);
+						indexed_filter.contains_any(scripts.iter())
+					};
 
-				let chop: ChainOp = if matched {
-					let mut attempt = 0;
-					let block = loop {
-						attempt += 1;
-						let handle = match requester.request_block(block_hash) {
-							Ok(handle) => handle,
-							Err(_) => {
-								log_error!(
-									logger,
-									"Failed to obtain receiver for matched CBF block {}; node is stopped",
-									block_hash
-								);
-								let _ =
-									ops_tx.send(ChainOp::Failed { error: Error::NotRunning }).await;
-								return;
-							},
-						};
-
-						// Bound the download so an unresponsive peer can't park the fetch forever,
-						// then flatten the three error layers (timeout / receiver dropped / fetch
-						// error) into a single reason so the retry-or-fail decision is written once.
-						let fetched = tokio::time::timeout(
-							Duration::from_secs(CBF_BLOCK_FETCH_TIMEOUT_SECS),
-							handle,
-						)
-						.await
-						.map_err(|_| format!("timed out after {}s", CBF_BLOCK_FETCH_TIMEOUT_SECS))
-						.and_then(|recv| recv.map_err(|_| "receiver was dropped".to_string()))
-						.and_then(|fetch| fetch.map_err(|e| format!("failed: {:?}", e)));
-
-						match fetched {
-							Ok(block) => break block,
-							Err(reason) if attempt < CBF_BLOCK_FETCH_RETRIES => {
-								log_debug!(
-									logger,
-									"CBF block fetch for {} {} on attempt {}; retrying",
-									block_hash,
-									reason,
-									attempt
-								);
-							},
-							Err(reason) => {
-								log_error!(
-									logger,
-									"CBF block fetch for {} {} after {} attempts; giving up",
-									block_hash,
-									reason,
-									CBF_BLOCK_FETCH_RETRIES
-								);
-								let _ = ops_tx
-									.send(ChainOp::Failed { error: Error::TxSyncFailed })
-									.await;
-								return;
-							},
+					let op = if matched {
+						match self.fetch_full_block(block_hash).await {
+							Ok(op) => op,
+							Err(end) => return end,
+						}
+					} else {
+						ChainOp::ConnectFiltered {
+							header: indexed_filter.header(),
+							height: indexed_filter.height(),
 						}
 					};
-					ChainOp::ConnectFull { block }
-				} else {
-					ChainOp::ConnectFiltered {
-						header: indexed_filter.header(),
-						height: indexed_filter.height(),
+					if self.ops_tx.send(op).await.is_err() {
+						return EventLoopEnd::ApplicatorGone;
 					}
-				};
-				if let Err(e) = ops_tx.send(chop).await {
-					log_debug!(logger, "ops_rx gone: {}", e);
-				}
-			},
-			KyotoEvent::FiltersSynced(sync_update) => {
-				// Because application of blocks is async, the fact that kyoto synced up to the
-				// tip does NOT mean that we caught everything up, that's why we send a ChainOp,
-				// only processing of which means we processed all blocks up to the tip.
-				log_info!(logger, "Kyoto synced up to the tip {}", sync_update.tip().height);
-				let _ = ops_tx.send(ChainOp::Synced { tip_height: sync_update.tip().height }).await;
-			},
-			KyotoEvent::ChainUpdate(BlockHeaderChanges::Connected(indexed_header)) => {
-				log_debug!(logger, "Kyoto connected header at height {}", indexed_header.height);
-			},
-			KyotoEvent::ChainUpdate(BlockHeaderChanges::Reorganized {
-				reorganized,
-				accepted: _,
-			}) => {
-				// Rewind to the fork point, tip first; kyoto re-delivers the new chain's
-				// filters afterwards.
-				let mut headers: Vec<(Header, u32)> =
-					reorganized.iter().map(|h| (h.header, h.height)).collect();
-				headers.sort_by(|a, b| b.1.cmp(&a.1));
-				headers.dedup_by_key(|(_, height)| *height);
-				if !headers.is_empty() {
-					let _ = ops_tx.send(ChainOp::Disconnect { headers }).await;
-				}
-			},
-			KyotoEvent::ChainUpdate(BlockHeaderChanges::ForkAdded(fork)) => {
-				log_debug!(logger, "Kyoto added fork header at height {}", fork.height);
-			},
+				},
+				KyotoEvent::FiltersSynced(sync_update) => {
+					// Because application of blocks is async, the fact that kyoto synced up to the
+					// tip does NOT mean that we caught everything up, that's why we send a ChainOp,
+					// only processing of which means we processed all blocks up to the tip.
+					log_info!(
+						self.logger,
+						"Kyoto synced up to the tip {}",
+						sync_update.tip().height
+					);
+					self.synced.store(true, Ordering::Release);
+					let synced = ChainOp::Synced { tip_height: sync_update.tip().height };
+					if self.ops_tx.send(synced).await.is_err() {
+						return EventLoopEnd::ApplicatorGone;
+					}
+				},
+				KyotoEvent::ChainUpdate(BlockHeaderChanges::Connected(indexed_header)) => {
+					log_debug!(
+						self.logger,
+						"Kyoto connected header at height {}",
+						indexed_header.height
+					);
+				},
+				KyotoEvent::ChainUpdate(BlockHeaderChanges::Reorganized {
+					reorganized,
+					accepted: _,
+				}) => {
+					// Rewind to the fork point, tip first; kyoto re-delivers the new chain's
+					// filters afterwards.
+					let mut headers: Vec<(Header, u32)> =
+						reorganized.iter().map(|h| (h.header, h.height)).collect();
+					headers.sort_by(|a, b| b.1.cmp(&a.1));
+					headers.dedup_by_key(|(_, height)| *height);
+					if !headers.is_empty()
+						&& self.ops_tx.send(ChainOp::Disconnect { headers }).await.is_err()
+					{
+						return EventLoopEnd::ApplicatorGone;
+					}
+				},
+				KyotoEvent::ChainUpdate(BlockHeaderChanges::ForkAdded(fork)) => {
+					log_debug!(self.logger, "Kyoto added fork header at height {}", fork.height);
+				},
+			}
 		}
+		EventLoopEnd::EventsClosed
+	}
+
+	/// Fetches a matched block under one of the [`CBF_FULL_BLOCK_PERMITS`], retrying a bounded
+	/// number of times. The permit is taken before the request so the bound covers the block
+	/// while it downloads, and rides in the op until the applicator drops it.
+	async fn fetch_full_block(&self, block_hash: BlockHash) -> Result<ChainOp, EventLoopEnd> {
+		let permit = match Arc::clone(&self.full_block_permits).acquire_owned().await {
+			Ok(permit) => permit,
+			Err(_closed) => {
+				log_error!(self.logger, "CBF full-block permits were closed; cannot fetch blocks.");
+				return Err(EventLoopEnd::Failed(Error::TxSyncFailed));
+			},
+		};
+		let Some(requester) = own_requester(&self.runtime_status, self.generation) else {
+			return Err(EventLoopEnd::Failed(Error::NotRunning));
+		};
+
+		let mut attempt = 0;
+		loop {
+			attempt += 1;
+			let handle = match requester.request_block(block_hash) {
+				Ok(handle) => handle,
+				Err(_) => {
+					log_error!(
+						self.logger,
+						"Failed to obtain receiver for matched CBF block {}; node is stopped",
+						block_hash
+					);
+					return Err(EventLoopEnd::Failed(Error::NotRunning));
+				},
+			};
+
+			// Bound the download so an unresponsive peer can't park the fetch forever, then
+			// flatten the three error layers (timeout / receiver dropped / fetch error) into a
+			// single reason so the retry-or-fail decision is written once.
+			let fetched =
+				tokio::time::timeout(Duration::from_secs(CBF_BLOCK_FETCH_TIMEOUT_SECS), handle)
+					.await
+					.map_err(|_| format!("timed out after {}s", CBF_BLOCK_FETCH_TIMEOUT_SECS))
+					.and_then(|recv| recv.map_err(|_| "receiver was dropped".to_string()))
+					.and_then(|fetch| fetch.map_err(|e| format!("failed: {:?}", e)));
+
+			match fetched {
+				Ok(block) => return Ok(ChainOp::ConnectFull { block, permit }),
+				Err(reason) if attempt < CBF_BLOCK_FETCH_RETRIES => {
+					log_debug!(
+						self.logger,
+						"CBF block fetch for {} {} on attempt {}; retrying",
+						block_hash,
+						reason,
+						attempt
+					);
+				},
+				Err(reason) => {
+					log_error!(
+						self.logger,
+						"CBF block fetch for {} {} after {} attempts; giving up on this node",
+						block_hash,
+						reason,
+						CBF_BLOCK_FETCH_RETRIES
+					);
+					return Err(EventLoopEnd::Failed(Error::TxSyncFailed));
+				},
+			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn an_event_loop_failure_restarts_the_node_like_a_node_failure() {
+		// The give-up that used to be a permanent stall: the event task reports it, the node is
+		// still running, and the policy treats it as one failed run — backoff, rebuild.
+		let mut policy = RestartPolicy::new();
+		assert_eq!(
+			policy.decide(RunEnd::EventLoopFailed),
+			RestartDecision::Restart { backoff: Duration::from_millis(INITIAL_BACKOFF_MS) }
+		);
+		assert_eq!(
+			policy.decide(RunEnd::NodeFailed),
+			RestartDecision::Restart { backoff: Duration::from_millis(2 * INITIAL_BACKOFF_MS) },
+			"the two kinds of failure share one budget and one backoff"
+		);
+		assert_eq!(policy.failures(), 2);
+	}
+
+	#[test]
+	fn the_budget_is_spent_after_max_retries_and_refilled_by_a_run_that_caught_up() {
+		let mut policy = RestartPolicy::new();
+		for attempt in 1..=MAX_RESTART_RETRIES {
+			let expected = Duration::from_millis(INITIAL_BACKOFF_MS << (attempt - 1));
+			assert_eq!(
+				policy.decide(RunEnd::EventLoopFailed),
+				RestartDecision::Restart { backoff: expected },
+				"attempt {} restarts",
+				attempt
+			);
+		}
+		assert_eq!(policy.decide(RunEnd::NodeFailed), RestartDecision::GiveUp);
+
+		// A run that reached `FiltersSynced` was a healthy node that failed later; the budget
+		// starts over rather than counting a week-old restart against it.
+		policy.note_progress();
+		assert_eq!(policy.failures(), 0);
+		assert_eq!(
+			policy.decide(RunEnd::NodeFailed),
+			RestartDecision::Restart { backoff: Duration::from_millis(INITIAL_BACKOFF_MS) }
+		);
+	}
+
+	#[test]
+	fn a_shutdown_or_a_halted_applicator_is_never_restarted() {
+		let mut policy = RestartPolicy::new();
+		assert_eq!(policy.decide(RunEnd::Shutdown), RestartDecision::Stop);
+		assert_eq!(policy.decide(RunEnd::ApplicatorGone), RestartDecision::Stop);
+		assert_eq!(policy.failures(), 0, "neither counts against the failure budget");
 	}
 }

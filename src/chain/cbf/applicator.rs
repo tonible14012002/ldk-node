@@ -25,7 +25,7 @@ use bitcoin::Block;
 
 use bdk_chain::BlockId;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
 
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::cbf::fee::{coinbase_fee_rate, record_block_fee, BlockFeeCache};
@@ -42,10 +42,29 @@ use crate::{Error, NodeMetrics};
 /// accumulate with no backpressure — a concrete OOM risk on a 512 MiB device. A bound makes the
 /// event loop wait for the applicator instead.
 ///
-/// Kept small because a `ConnectFull` op carries an entire block: at 64 slots the worst case is
-/// bounded even when every queued op is a matched block. Most ops are `ConnectFiltered`, which
-/// carries only an 80-byte header, so this depth is ample for pipelining in the common case.
+/// Most ops are `ConnectFiltered`, which carries only an 80-byte header, so this depth is ample
+/// for pipelining in the common case. It is NOT the bound on full blocks: a `ConnectFull` op
+/// carries an entire block, and 64 of them would be ~256 MiB at the 4 MiB block size, more than
+/// half the memory of a 512 MiB device. Full blocks are bounded separately by
+/// [`CBF_FULL_BLOCK_PERMITS`].
+///
+/// This queue is the only backpressure between kyoto and the listeners. Kyoto's own event
+/// channel (`Client::event_rx`) is unbounded, so while the event loop waits on this queue or on
+/// a full-block permit, the filters kyoto keeps streaming accumulate there — an `IndexedFilter`
+/// is a few hundred bytes to a few kilobytes, which is why the wait here is short and the
+/// full-block bound is what matters.
 pub(crate) const CBF_CHAIN_OP_QUEUE_DEPTH: usize = 64;
+
+/// How many full blocks may exist at once between kyoto's event loop and the listeners: being
+/// downloaded, queued in a `ConnectFull` op, or being applied.
+///
+/// The event loop takes a permit before it asks kyoto for a matched block, and the permit rides
+/// in the op until the applicator drops it, so the worst case is this many blocks in memory —
+/// 16 MiB at the block size limit — whatever the queue depth. Four is enough to keep one block
+/// applying while the next downloads (the fetch is network-bound, the apply persist-bound) and
+/// matched blocks are rare next to filtered ones, so a deeper pipeline would buy nothing on a
+/// device that cannot afford it.
+pub(crate) const CBF_FULL_BLOCK_PERMITS: usize = 4;
 
 /// How many applied blocks may accumulate before the deferred on-chain chain tip is written.
 ///
@@ -59,8 +78,10 @@ pub(crate) const CBF_CHAIN_FLUSH_INTERVAL_BLOCKS: u32 = 2016;
 /// One unit of chain change, as kyoto's event loop reports it and the applicator applies it.
 #[derive(Debug)]
 pub(crate) enum ChainOp {
-	/// A block whose filter matched a watched script, fetched in full.
-	ConnectFull { block: IndexedBlock },
+	/// A block whose filter matched a watched script, fetched in full. The permit is one of
+	/// [`CBF_FULL_BLOCK_PERMITS`], taken before the fetch and released when this op is dropped —
+	/// applied or skipped.
+	ConnectFull { block: IndexedBlock, permit: OwnedSemaphorePermit },
 	/// A block whose filter did not match: only its header is handed over.
 	ConnectFiltered { header: Header, height: u32 },
 	/// Headers kyoto removed from the chain of most work, tip first — strictly DESCENDING
@@ -72,8 +93,6 @@ pub(crate) enum ChainOp {
 	/// height is a true tip; the applicator judges stranded listeners against it and nothing
 	/// else.
 	Synced { tip_height: u32 },
-	/// The event loop gave up.
-	Failed { error: Error },
 }
 
 /// Everything the applicator asks of the listeners, as one seam.
@@ -225,13 +244,14 @@ impl<F: ChainFanout> BlockApplicator<F> {
 	/// diverges.
 	pub(crate) async fn run(mut self) {
 		// Defer the wallet's full-chain map write for as long as this applicator runs. Every path
-		// that leaves the catching-up state (`Synced`, `Failed`, and the periodic interval) flushes,
-		// so deferral never outlives a sync boundary.
+		// that leaves the catching-up state (`Synced`, the channel closing on the event loop's
+		// exit, and the periodic interval) flushes, so deferral never outlives a sync boundary.
 		self.fanout.set_bulk_chain_persistence(true);
 
 		while let Some(op) = self.ops_rx.recv().await {
 			match op {
-				ChainOp::ConnectFull { block: ib } => {
+				// The permit is dropped with the op at the end of this arm, applied or skipped.
+				ChainOp::ConnectFull { block: ib, permit: _permit } => {
 					if ib.height != self.next_height {
 						log_debug!(
 							self.logger,
@@ -287,9 +307,24 @@ impl<F: ChainFanout> BlockApplicator<F> {
 					if self.fail_on_divergence() {
 						return;
 					}
-					self.next_height = fork_height + 1;
+					// Rewind the frontier to the fork point, but never advance it. During a
+					// catch-up kyoto header-syncs to the network tip before it streams filters, so
+					// a reorg it reports can sit entirely above the blocks still waiting in this
+					// queue; the listeners were `NotReached` by it, and jumping the frontier up to
+					// the fork point would drop every one of those blocks as out of sequence — and
+					// make the first block of the new branch a gap the listeners refuse.
+					if fork_height >= self.next_height {
+						log_debug!(
+							self.logger,
+							"CBF reorg with fork height {} is at or above the next height {}; the \
+							 blocks below it are still to be applied in order",
+							fork_height,
+							self.next_height
+						);
+					}
+					self.next_height = self.next_height.min(fork_height + 1);
 					self.sync_state_tx.send_replace(CbfSyncState::Active {
-						applied_tip: Some(fork_height),
+						applied_tip: Some(self.next_height.saturating_sub(1)),
 						synced_to_tip: false,
 					});
 				},
@@ -319,18 +354,13 @@ impl<F: ChainFanout> BlockApplicator<F> {
 						);
 					}
 				},
-				ChainOp::Failed { error } => {
-					log_error!(self.logger, "CBF sync failed: {}", error);
-					// Persist whatever we applied before the failure so the resume floor reflects it.
-					self.flush_chain_state();
-					self.sync_state_tx.send_replace(CbfSyncState::Failed(error));
-				},
 			}
 		}
 
-		// The channel closed, which is how a normal shutdown reaches us. Deferred chain state lives
-		// only in memory, so without this flush a clean stop would silently discard every block
-		// applied since the last interval flush and force them to be re-synced on next start.
+		// The channel closed, which is how every end of the event loop reaches us — a clean stop
+		// or the restart loop giving up. Deferred chain state lives only in memory, so without this
+		// flush the blocks applied since the last interval flush would be silently discarded and
+		// re-synced on the next start.
 		self.flush_chain_state();
 	}
 
@@ -862,6 +892,80 @@ mod tests {
 		assert_eq!(h.fanout.monitor_tip(a), BestBlock::new(headers[1].block_hash(), 102));
 		assert_eq!(h.fanout.monitor_tip(b), BestBlock::new(headers[1].block_hash(), 102));
 		assert!(h.fanout.take_divergence().is_none());
+
+		drop(h.ops_tx);
+		join(h.task).await;
+	}
+
+	#[tokio::test]
+	async fn a_reorg_above_the_replay_frontier_keeps_the_blocks_below_it_applying_in_order() {
+		// The catch-up geometry: the listeners are at 100 and kyoto, which header-synced to the
+		// network tip before streaming a single filter, reorganises 105 out while 101..=104 are
+		// still on their way through this queue. No listener has reached 105 (`NotReached`, not a
+		// divergence), and the frontier must stay at 101: moving it up to the fork point would
+		// drop 101..=104 as out of sequence and leave the new 105 a gap the listeners refuse.
+		let h = spawn(FakeFanout::at(BestBlock::new(hash(100), 100)));
+		let stale_105 = header_with(hash(104), 105);
+		h.ops_tx.send(ChainOp::Disconnect { headers: vec![(stale_105, 105)] }).await.unwrap();
+
+		// 101..=104 as kyoto already had them, then the new branch's 105.
+		let mut headers = Vec::new();
+		let mut prev = hash(100);
+		for height in 101..=104u32 {
+			let header = header_with(prev, height);
+			prev = header.block_hash();
+			headers.push(header);
+		}
+		let new_105 = header_with(prev, 0xbeef);
+		headers.push(new_105);
+		assert!(connect_and_sync(&h, 101, &headers, 105).await, "every block applied in order");
+
+		assert_eq!(
+			*h.fanout.disconnects.lock().unwrap(),
+			vec![(stale_105.block_hash(), 105)],
+			"the listeners were offered the reorg and had not reached it"
+		);
+		assert!(h.fanout.take_divergence().is_none());
+		assert_eq!(h.fanout.tip(), BestBlock::new(new_105.block_hash(), 105));
+		assert_eq!(h.ledger.tip(), Some(BlockId { height: 105, hash: new_105.block_hash() }));
+
+		drop(h.ops_tx);
+		join(h.task).await;
+	}
+
+	#[tokio::test]
+	async fn a_full_block_holds_its_permit_only_until_it_is_applied_or_skipped() {
+		let h = spawn(FakeFanout::at(BestBlock::new(hash(100), 100)));
+		let permits = Arc::new(tokio::sync::Semaphore::new(CBF_FULL_BLOCK_PERMITS));
+		let full_block = |header: Header, height: u32| IndexedBlock {
+			height,
+			block: Block { header, txdata: Vec::new() },
+		};
+
+		// A stray full block out of sequence is skipped, and one in sequence is applied; each
+		// arrived holding a permit, as the event loop hands them over, and each gives it back.
+		let stray = full_block(header_with(hash(104), 105), 105);
+		let permit = Arc::clone(&permits).acquire_owned().await.unwrap();
+		h.ops_tx.send(ChainOp::ConnectFull { block: stray, permit }).await.unwrap();
+		let header_101 = header_with(hash(100), 101);
+		let permit = Arc::clone(&permits).acquire_owned().await.unwrap();
+		h.ops_tx
+			.send(ChainOp::ConnectFull { block: full_block(header_101, 101), permit })
+			.await
+			.unwrap();
+		h.ops_tx.send(ChainOp::Synced { tip_height: 101 }).await.unwrap();
+		wait_for_state(&h, |s| {
+			matches!(s, CbfSyncState::Active { applied_tip: Some(101), synced_to_tip: true })
+		})
+		.await;
+
+		assert_eq!(h.fanout.tip(), BestBlock::new(header_101.block_hash(), 101));
+		assert!(h.fanout.take_divergence().is_none(), "the stray block never reached a listener");
+		assert_eq!(
+			permits.available_permits(),
+			CBF_FULL_BLOCK_PERMITS,
+			"the applied and the skipped block both released their permit"
+		);
 
 		drop(h.ops_tx);
 		join(h.task).await;

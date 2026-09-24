@@ -338,11 +338,20 @@ impl WatchLedger {
 		}
 	}
 
-	/// The applicator disconnected the block `header` at `height`: the tip is its parent now,
-	/// and nothing seen at or above `height` is confirmed any more.
+	/// The applicator disconnected the block `header` at `height`: nothing seen at or above
+	/// `height` is confirmed any more, and if the applied tip had reached `height` it is the
+	/// header's parent now.
+	///
+	/// A tip below `height` is left where it is. During a catch-up kyoto header-syncs to the
+	/// network tip before it streams filters, so a reorg it reports can sit above every block the
+	/// applicator has applied; moving the tip *forward* to the fork point would claim blocks that
+	/// were never applied.
 	pub(crate) fn note_disconnected(&self, header: &Header, height: u32) {
 		let mut inner = self.lock();
-		inner.tip = Some(BlockId { height: height.saturating_sub(1), hash: header.prev_blockhash });
+		if inner.tip.is_some_and(|tip| tip.height >= height) {
+			inner.tip =
+				Some(BlockId { height: height.saturating_sub(1), hash: header.prev_blockhash });
+		}
 		inner.confirmed.retain(|_, block| block.height < height);
 	}
 }
@@ -566,5 +575,37 @@ mod tests {
 
 		ledger.unwatch(&late);
 		assert!(!ledger.is_watched(&late));
+	}
+
+	#[test]
+	fn watch_ledger_never_moves_the_applied_tip_forward_on_disconnect() {
+		let ledger = WatchLedger::new();
+		let seen = txid(1);
+		ledger.watch(seen);
+		let above = Header {
+			version: bitcoin::block::Version::TWO,
+			prev_blockhash: block(104, 0xa4).hash,
+			merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+			time: 0,
+			bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+			nonce: 0,
+		};
+
+		// Nothing applied yet: a reorg kyoto reports during the header sync leaves it that way.
+		ledger.note_disconnected(&above, 105);
+		assert_eq!(ledger.tip(), None, "no block was applied, so none is the tip");
+
+		// Applied through 100, then 105 is reorganised out before the replay reaches it: the tip
+		// stays at 100 rather than jumping to the fork point 104, and the sighting at 100 stands.
+		ledger.note_connected(block(100, 0xa0), [seen]);
+		ledger.note_disconnected(&above, 105);
+		assert_eq!(ledger.tip(), Some(block(100, 0xa0)));
+		assert_eq!(ledger.confirmation(&seen), Some(block(100, 0xa0)));
+
+		// A disconnect the tip has reached still rewinds it.
+		let at_tip = Header { prev_blockhash: block(99, 0x99).hash, ..above };
+		ledger.note_disconnected(&at_tip, 100);
+		assert_eq!(ledger.tip(), Some(block(99, 0x99)));
+		assert_eq!(ledger.confirmation(&seen), None);
 	}
 }

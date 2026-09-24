@@ -78,8 +78,6 @@ fn mainnet_anchors() -> [(HashCheckpoint, &'static str); 3] {
 /// sweeper, and — through them — kyoto's resume checkpoint and the block applicator's
 /// `next_height`. A wallet with a persisted block is never rewound, but absent Lightning
 /// components are still initialized from it.
-// Wired by T9: the builder seeds a fresh wallet, ChannelManager and sweeper from it.
-#[allow(dead_code)]
 pub(crate) fn resolve_birthday(
 	logger: &Logger, network: Network, wallet_birthday_height: Option<u32>,
 ) -> Option<BestBlock> {
