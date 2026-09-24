@@ -213,6 +213,20 @@ pub(crate) trait SyncEngine: Send + Sync {
 		false
 	}
 
+	/// Whether this node may serve chain answers to other nodes at all.
+	///
+	/// Serving means answering from a chain source this node observes
+	/// itself. The engines over a real one — Esplora, Electrum, bitcoind —
+	/// answer `true`. Defaults to `false`: a Dependent node's every slot is
+	/// filled from its provider, and a filter-following node borrows what its
+	/// filters cannot show it, so either would forward another node's
+	/// question to a third node — a chain of trust nobody checked. Every
+	/// [`ChainLayer`] `serve_*` entry point refuses when this is `false`,
+	/// before the question reaches a slot.
+	fn serves_peers(&self) -> bool {
+		false
+	}
+
 	/// The compact-block-filter sync status, for an engine that follows the
 	/// chain by filters; `None` for every other engine. Never blocks.
 	fn cbf_sync_status(&self) -> Option<crate::chain::CbfSyncStatus> {
@@ -248,7 +262,6 @@ pub(crate) trait SyncEngine: Send + Sync {
 	/// was. Only an engine with its own view of the headers answers.
 	///
 	/// [`Anchored`]: crate::chain::seam::Anchored
-	#[allow(dead_code)] // called by the hybrid reorg-consistency check once it lands (T10)
 	async fn is_on_chain(&self, _block: &BlockId) -> Option<bool> {
 		None
 	}

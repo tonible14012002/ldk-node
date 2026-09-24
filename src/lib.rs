@@ -1711,8 +1711,13 @@ impl Node {
 	/// what it costs — that is the embedding application's business, and
 	/// keeping it out of this crate is what lets the same binary be either
 	/// tier by configuration alone.
+	///
+	/// Errors with [`Error::ChainServeUnsupported`] when this node's own fee
+	/// estimates are borrowed or derived rather than observed at a chain
+	/// source of its own — a Dependent or filter-following node — which must
+	/// never pass them on as though they were.
 	pub fn chain_serve_fee_estimates(&self) -> Result<chain_provider::WireFeeEstimates, Error> {
-		Ok(self.chain_source.serve_fee_estimates())
+		self.chain_source.serve_fee_estimates()
 	}
 
 	/// Broadcast another node's transaction through this node's chain source.

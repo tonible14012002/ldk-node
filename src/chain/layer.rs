@@ -15,10 +15,12 @@
 //!
 //! Nothing outside slot construction branches on which backend is configured.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use bdk_chain::BlockId;
 
 use lightning::chain::{Filter, WatchedOutput};
 
@@ -159,6 +161,70 @@ pub(crate) struct SharedChainCtx {
 	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
 }
 
+/// How long a transaction this node itself broadcast is shielded from a
+/// borrowed mempool answer's eviction.
+///
+/// Ten minutes — one block interval. A package handed to the node's own
+/// peers over P2P reaches a well-connected mempool within seconds, but the
+/// provider a hybrid node borrows its mempool view from may answer from a
+/// poll taken before the relay arrived, or from an `Incremental` memory that
+/// has not seen it yet; an eviction applied then would hand the inputs back
+/// to the on-chain wallet and offer them to a second spend. Within one block
+/// interval a transaction that did reach the network has either shown up in
+/// every well-connected mempool or been confirmed — and a confirmation the
+/// filters show makes the eviction moot. After it, an absence is a real
+/// signal — dropped, or replaced — and the inputs should be released.
+pub(crate) const OWN_BROADCAST_EVICTION_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// Bound on the transactions [`RecentOwnBroadcasts`] remembers. Own broadcasts
+/// are rare — a channel open, a sweep, a payment — so the bound is never
+/// reached in practice; it exists so nothing can grow the memory without limit.
+const OWN_BROADCAST_MEMORY_CAP: usize = 1024;
+
+/// The transactions this node itself put on the network within the last
+/// [`OWN_BROADCAST_EVICTION_GRACE`], recorded by the BROADCAST tail for the
+/// MEMPOOL tail to shield from a borrowed answer's eviction.
+///
+/// Pruned by age on every access, and by count past the cap, oldest first.
+#[derive(Default)]
+pub(crate) struct RecentOwnBroadcasts {
+	sent_at: HashMap<Txid, Instant>,
+}
+
+impl RecentOwnBroadcasts {
+	/// This node put `txid` on the network at `now`.
+	fn record(&mut self, txid: Txid, now: Instant) {
+		self.prune(now);
+		self.sent_at.insert(txid, now);
+		if self.sent_at.len() > OWN_BROADCAST_MEMORY_CAP {
+			let excess = self.sent_at.len() - OWN_BROADCAST_MEMORY_CAP;
+			let mut by_age: Vec<(Instant, Txid)> =
+				self.sent_at.iter().map(|(txid, at)| (*at, *txid)).collect();
+			by_age.sort_unstable();
+			for (_, txid) in by_age.into_iter().take(excess) {
+				self.sent_at.remove(&txid);
+			}
+		}
+	}
+
+	/// Whether this node put `txid` on the network within the grace period
+	/// before `now`.
+	fn is_recent(&mut self, txid: &Txid, now: Instant) -> bool {
+		self.prune(now);
+		self.sent_at.contains_key(txid)
+	}
+
+	fn prune(&mut self, now: Instant) {
+		self.sent_at
+			.retain(|_, at| now.saturating_duration_since(*at) <= OWN_BROADCAST_EVICTION_GRACE);
+	}
+
+	#[cfg(test)]
+	fn len(&self) -> usize {
+		self.sent_at.len()
+	}
+}
+
 /// The chain layer: the crate's single seam onto Bitcoin.
 pub(crate) struct ChainLayer {
 	slots: ChainSlots,
@@ -167,6 +233,13 @@ pub(crate) struct ChainLayer {
 	/// State shared by every slot's tail. Held once, rather than duplicated
 	/// into each backend as it was pre-seam.
 	shared: SharedChainCtx,
+	/// What the BROADCAST tail put on the network recently, for the MEMPOOL
+	/// tail; see [`OWN_BROADCAST_EVICTION_GRACE`].
+	recent_own_broadcasts: Mutex<RecentOwnBroadcasts>,
+	/// The last provider tip the engine could not place on its chain, so
+	/// accepting an unverifiable answer is logged once per tip rather than
+	/// once per pass.
+	last_unverifiable_tip: Mutex<Option<BlockId>>,
 }
 
 impl ChainLayer {
@@ -185,6 +258,8 @@ impl ChainLayer {
 				logger,
 				node_metrics,
 			},
+			recent_own_broadcasts: Mutex::new(RecentOwnBroadcasts::default()),
+			last_unverifiable_tip: Mutex::new(None),
 		}
 	}
 
@@ -862,6 +937,18 @@ impl ChainLayer {
 			},
 		};
 
+		// Only an engine with no mempool view of its own reaches here with
+		// transactions to echo, and only such an engine borrows a mempool view
+		// that could evict them before the network has seen them: remember
+		// what left, so the MEMPOOL tail knows a fresh absence is not a verdict.
+		if !unconfirmed.is_empty() {
+			let sent_at = Instant::now();
+			let mut recent = self.recent_own_broadcasts.lock().unwrap_or_else(|e| e.into_inner());
+			for (tx, _) in &unconfirmed {
+				recent.record(tx.compute_txid(), sent_at);
+			}
+		}
+
 		let Some(wallet) = self.engine.onchain_wallet() else {
 			log_debug!(
 				self.shared.logger,
@@ -901,6 +988,57 @@ impl ChainLayer {
 		!self.slots.mempool.is_empty()
 	}
 
+	/// The hybrid reorg-consistency check, run on every [`Anchored`] answer
+	/// inside its chain's run so a refused answer advances the chain.
+	///
+	/// An answer a provider computed on a chain this node does not consider
+	/// best — the engine knows a different block at the tip's height — is
+	/// `Unavailable`, never applied: its unconfirmed transactions, evictions
+	/// and confirmations describe a branch this node is not on. An answer
+	/// the engine cannot place (`None`: no header chain of its own, or the
+	/// height outside what it holds) is accepted as it always was, and said
+	/// so at debug once per tip. An answer with no tip carries nothing to
+	/// check.
+	async fn anchored_on_our_chain<T>(
+		&self, slot: &'static str, by: &'static str, answer: Anchored<T>,
+	) -> ActionResult<Anchored<T>> {
+		let Some(tip) = answer.tip else {
+			return Ok(answer);
+		};
+		match self.engine.is_on_chain(&tip).await {
+			Some(true) => Ok(answer),
+			Some(false) => {
+				log_info!(
+					self.shared.logger,
+					"slot={} adapter={} answered at tip {} (height {}), which is not on this node's chain; refusing the answer",
+					slot,
+					by,
+					tip.hash,
+					tip.height
+				);
+				Err(ChainActionError::unavailable(format!(
+					"provider tip {} at height {} is not on our chain",
+					tip.hash, tip.height
+				)))
+			},
+			None => {
+				let mut last = self.last_unverifiable_tip.lock().unwrap_or_else(|e| e.into_inner());
+				if *last != Some(tip) {
+					log_debug!(
+						self.shared.logger,
+						"slot={} adapter={} answered at tip {} (height {}), which this node cannot place on its chain; accepting it unchecked",
+						slot,
+						by,
+						tip.hash,
+						tip.height
+					);
+					*last = Some(tip);
+				}
+				Ok(answer)
+			},
+		}
+	}
+
 	/// Ask the MEMPOOL chain.
 	///
 	/// The answer is handed back as the chain produced it — anchored to the
@@ -909,10 +1047,77 @@ impl ChainLayer {
 	/// on-chain wallet exactly where it applied its own poll pre-seam, and the
 	/// serving path projects it onto the wire. An empty chain is
 	/// `Unavailable`; no engine with an empty chain asks.
+	///
+	/// Two things the tail does first, both for a node whose MEMPOOL chain is
+	/// borrowed. An answer anchored to a tip that is not on this node's chain
+	/// is refused and the chain advances ([`ChainLayer::anchored_on_our_chain`]).
+	/// And when the engine [`SyncEngine::tracks_own_broadcasts`] — so the
+	/// wallet learnt of its own transactions from the BROADCAST tail, and the
+	/// mempool being asked is not the one they were handed to — an eviction
+	/// of a transaction this node put on the network within
+	/// [`OWN_BROADCAST_EVICTION_GRACE`] is dropped: the borrowed view may not
+	/// have seen it yet, and releasing its inputs on that word would offer
+	/// them to a second spend. An engine with a mempool of its own applies
+	/// every eviction, because its own mempool's word is a verdict.
 	pub(crate) async fn mempool(
 		&self, query: &MempoolQuery,
 	) -> ActionResult<Answered<Anchored<MempoolAnswer>>> {
-		self.slots.mempool.run(|a| async move { a.mempool(query).await }).await
+		let mut answered = self
+			.slots
+			.mempool
+			.run(|a| async move {
+				let answer = a.mempool(query).await?;
+				self.anchored_on_our_chain("mempool", a.name(), answer).await
+			})
+			.await?;
+
+		if self.engine.tracks_own_broadcasts() {
+			self.shield_own_broadcasts(&mut answered.value.value.evicted, answered.by);
+		}
+		Ok(answered)
+	}
+
+	/// Drop from `evicted` every transaction this node itself broadcast within
+	/// [`OWN_BROADCAST_EVICTION_GRACE`]; see [`ChainLayer::mempool`].
+	fn shield_own_broadcasts(&self, evicted: &mut Evicted, by: &'static str) {
+		if evicted.is_empty() {
+			return;
+		}
+		let now = Instant::now();
+		let mut recent = self.recent_own_broadcasts.lock().unwrap_or_else(|e| e.into_inner());
+		evicted.retain(|(txid, _)| {
+			let shielded = recent.is_recent(txid, now);
+			if shielded {
+				log_debug!(
+					self.shared.logger,
+					"Not evicting {} on {}'s word: this node broadcast it within the last {}s",
+					txid,
+					by,
+					OWN_BROADCAST_EVICTION_GRACE.as_secs()
+				);
+			}
+			!shielded
+		});
+	}
+
+	/// Run the wide wallet scan `req` describes through the SCRIPT_HISTORY
+	/// chain.
+	///
+	/// Filled only on a hybrid node, from its provider; the answer is
+	/// [`Anchored`] to the update's checkpoint tip, and one anchored to a tip
+	/// that is not on this node's chain is refused with the chain advancing,
+	/// exactly as a MEMPOOL answer is. An empty chain is `Unavailable`.
+	#[allow(dead_code)] // run by the hybrid script-history restore on first boot (T11)
+	pub(crate) async fn script_history(
+		&self, req: &WireSyncRequest,
+	) -> ActionResult<Answered<Anchored<bdk_wallet::Update>>> {
+		self.slots
+			.script_history
+			.run(|a| async move {
+				let answer = a.script_history(req.clone()).await?;
+				self.anchored_on_our_chain("script_history", a.name(), answer).await
+			})
+			.await
 	}
 
 	/// Ask the TX_STATUS chain about `txid`.
@@ -929,7 +1134,10 @@ impl ChainLayer {
 
 	/// [`ChainLayer::observe_tx`] keeping the tip the answering adapter
 	/// derived the observation against, for the serving path to pass on. An
-	/// unreachable observation has no tip.
+	/// unreachable observation has no tip. An observation anchored to a tip
+	/// that is not on this node's chain is refused and the chain advances
+	/// ([`ChainLayer::anchored_on_our_chain`]): a confirmation on a branch
+	/// this node is not on is no confirmation.
 	#[cfg(feature = "swaps")]
 	async fn observe_tx_anchored(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
@@ -937,7 +1145,10 @@ impl ChainLayer {
 		match self
 			.slots
 			.tx_status
-			.run(|a| async move { a.tx_status(txid, script_pubkey).await })
+			.run(|a| async move {
+				let answer = a.tx_status(txid, script_pubkey).await?;
+				self.anchored_on_our_chain("tx_status", a.name(), answer).await
+			})
 			.await
 		{
 			Ok(answered) => answered.value,
@@ -951,13 +1162,36 @@ impl ChainLayer {
 	// from this node's own chain source. Each of these reads through the same
 	// slot this node uses itself, so a served answer and a local one cannot
 	// diverge.
+	//
+	// And each of them first asks the engine whether this node has a chain
+	// source of its own to answer from at all. A Dependent node's slots are
+	// filled from its provider, a hybrid node's borrowed slots likewise, and
+	// a filter-following node's own slots see only what its filters show: an
+	// answer from any of them would be forwarded, or partial, and the asking
+	// node could not tell. So they refuse, before the question reaches a slot.
+
+	/// The rule every serve has: only a node whose slots are filled from a
+	/// chain source it observes itself may answer another node.
+	fn refuse_unless_serving(&self) -> Result<(), Error> {
+		if self.engine.serves_peers() {
+			Ok(())
+		} else {
+			Err(Error::ChainServeUnsupported)
+		}
+	}
 
 	/// This node's current fee-rate cache, for a Dependent node to adopt.
 	///
 	/// Reported per target rather than per block count, because the per-target
 	/// policy — bitcoind's conservative-versus-economical choice, and this
 	/// node's own floors — is exactly what makes the answer worth asking for.
-	pub(crate) fn serve_fee_estimates(&self) -> WireFeeEstimates {
+	///
+	/// Refused — [`Error::ChainServeUnsupported`] — when this node's own fee
+	/// cache is itself borrowed or derived rather than observed at a real
+	/// chain source.
+	pub(crate) fn serve_fee_estimates(&self) -> Result<WireFeeEstimates, Error> {
+		self.refuse_unless_serving()?;
+
 		let targets = get_all_conf_targets()
 			.into_iter()
 			.map(|target| WireFeeTarget {
@@ -966,7 +1200,7 @@ impl ChainLayer {
 			})
 			.collect();
 
-		WireFeeEstimates { version: CHAIN_WIRE_VERSION, targets }
+		Ok(WireFeeEstimates { version: CHAIN_WIRE_VERSION, targets })
 	}
 
 	/// Put another node's transaction on the network through this node's
@@ -978,8 +1212,12 @@ impl ChainLayer {
 	/// rejected it: the asking node must see a failed call either way, and the
 	/// wire has no way to say which. The rejection is logged here so this
 	/// node's operator can tell the two apart. The transaction is not this
-	/// node's own, so the shared tail does not run for it.
+	/// node's own, so the shared tail does not run for it. Refused —
+	/// [`Error::ChainServeUnsupported`] — when this node's BROADCAST chain
+	/// is not its own chain source.
 	pub(crate) async fn serve_broadcast(&self, tx: &Transaction) -> Result<(), Error> {
+		self.refuse_unless_serving()?;
+
 		match self.run_broadcast(std::slice::from_ref(tx)).await.outcome {
 			Ok(_) => Ok(()),
 			Err(ChainActionError::Unavailable { reason, .. }) => {
@@ -1010,11 +1248,15 @@ impl ChainLayer {
 	/// An exhausted TX_STATUS chain is an **error**, never a response. The
 	/// wire type has no "unreachable" variant on purpose: if this node could
 	/// not look, the asking node must see a failed call and fail closed, not a
-	/// well-formed answer that reads as "not found".
+	/// well-formed answer that reads as "not found". Refused —
+	/// [`Error::ChainServeUnsupported`] — when this node's TX_STATUS chain is
+	/// not its own chain source.
 	#[cfg(feature = "swaps")]
 	pub(crate) async fn serve_tx_status(
 		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> Result<WireTxStatusResponse, Error> {
+		self.refuse_unless_serving()?;
+
 		let observed = self.observe_tx_anchored(txid, script_pubkey).await;
 		// The tip the adapter derived the answer against, when it reported
 		// one. `tip_height` below is still reconstructed from the depth, as
@@ -1054,13 +1296,12 @@ impl ChainLayer {
 	/// Answer another node's mempool question from this node's MEMPOOL
 	/// chain.
 	///
-	/// Refused — [`Error::ChainServeUnsupported`] — unless the engine says
-	/// the chain answers from a mempool this node observes itself
-	/// ([`SyncEngine::serves_mempool`]) and the chain has an adapter at all.
-	/// That is the rule every serve has: a Dependent node's chain is filled
-	/// from a provider, and answering from it would forward the question to
-	/// a third node. The question is asked in [`MempoolScope::Complete`],
-	/// so the poll loop's own memory of what it answered is left alone.
+	/// Refused — [`Error::ChainServeUnsupported`] — unless this node serves
+	/// peers at all ([`SyncEngine::serves_peers`]), the engine says the chain
+	/// answers from a mempool this node observes itself
+	/// ([`SyncEngine::serves_mempool`]), and the chain has an adapter at all.
+	/// The question is asked in [`MempoolScope::Complete`], so the poll
+	/// loop's own memory of what it answered is left alone.
 	///
 	/// An exhausted chain is [`Error::ChainServeFailed`], and so is an
 	/// answer taken before the engine has synced to any tip: the wire
@@ -1075,6 +1316,7 @@ impl ChainLayer {
 	pub(crate) async fn serve_mempool(
 		&self, req: &WireMempoolRequest,
 	) -> Result<WireMempoolResponse, Error> {
+		self.refuse_unless_serving()?;
 		if !self.engine.serves_mempool() || self.slots.mempool.is_empty() {
 			return Err(Error::ChainServeUnsupported);
 		}
@@ -1126,17 +1368,22 @@ impl ChainLayer {
 	}
 
 	/// Run another node's on-chain wallet scan against this node's chain
-	/// source.
+	/// source. Refused — [`Error::ChainServeUnsupported`] — when this node
+	/// has none of its own.
 	pub(crate) async fn serve_wallet_sync(
 		&self, req: &WireSyncRequest,
 	) -> Result<WireUpdate, Error> {
+		self.refuse_unless_serving()?;
 		self.engine.serve_wallet_sync(req).await
 	}
 
-	/// Answer another node's Lightning sync.
+	/// Answer another node's Lightning sync. Refused —
+	/// [`Error::ChainServeUnsupported`] — when this node has no chain source
+	/// of its own.
 	pub(crate) async fn serve_lightning_sync(
 		&self, req: &WireLightningSyncRequest,
 	) -> Result<WireLightningSyncResponse, Error> {
+		self.refuse_unless_serving()?;
 		self.engine.serve_lightning_sync(req).await
 	}
 
@@ -1355,12 +1602,85 @@ mod tests {
 		}
 	}
 
+	/// What one fake TX_STATUS adapter observes, anchored where it says.
+	#[cfg(feature = "swaps")]
+	struct FakeTxStatus {
+		name: &'static str,
+		observation: RawTxObservation,
+		tip: Option<BlockId>,
+		calls: AtomicUsize,
+	}
+
+	#[cfg(feature = "swaps")]
+	impl FakeTxStatus {
+		fn new(
+			name: &'static str, observation: RawTxObservation, tip: Option<BlockId>,
+		) -> Arc<Self> {
+			Arc::new(Self { name, observation, tip, calls: AtomicUsize::new(0) })
+		}
+
+		fn calls(&self) -> usize {
+			self.calls.load(Ordering::SeqCst)
+		}
+	}
+
+	#[cfg(feature = "swaps")]
+	#[async_trait]
+	impl TxStatusAction for FakeTxStatus {
+		fn name(&self) -> &'static str {
+			self.name
+		}
+
+		async fn tx_status(
+			&self, _txid: Txid, _script_pubkey: Option<&ScriptBuf>,
+		) -> ActionResult<Anchored<RawTxObservation>> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			Ok(Anchored { value: self.observation, tip: self.tip })
+		}
+	}
+
+	/// A fake SCRIPT_HISTORY adapter answering an empty update anchored where
+	/// it says.
+	struct FakeScriptHistory {
+		name: &'static str,
+		tip: Option<BlockId>,
+		calls: AtomicUsize,
+	}
+
+	impl FakeScriptHistory {
+		fn new(name: &'static str, tip: Option<BlockId>) -> Arc<Self> {
+			Arc::new(Self { name, tip, calls: AtomicUsize::new(0) })
+		}
+
+		fn calls(&self) -> usize {
+			self.calls.load(Ordering::SeqCst)
+		}
+	}
+
+	#[async_trait]
+	impl ScriptHistoryAction for FakeScriptHistory {
+		fn name(&self) -> &'static str {
+			self.name
+		}
+
+		async fn script_history(
+			&self, _req: WireSyncRequest,
+		) -> ActionResult<Anchored<bdk_wallet::Update>> {
+			self.calls.fetch_add(1, Ordering::SeqCst);
+			Ok(Anchored { value: bdk_wallet::Update::default(), tip: self.tip })
+		}
+	}
+
 	/// An engine that syncs nothing and only answers the questions the
-	/// BROADCAST tail and the serving path ask it.
+	/// BROADCAST tail, the hybrid tails and the serving path ask it.
 	struct FakeEngine {
 		wallet: Arc<Wallet>,
 		tracks_own_broadcasts: bool,
 		serves_mempool: bool,
+		serves_peers: bool,
+		/// The blocks this engine can place on its chain, and whether they are
+		/// on it. A block not listed is one it cannot tell about.
+		known_blocks: HashMap<BlockId, bool>,
 	}
 
 	#[async_trait]
@@ -1379,6 +1699,14 @@ mod tests {
 
 		fn serves_mempool(&self) -> bool {
 			self.serves_mempool
+		}
+
+		fn serves_peers(&self) -> bool {
+			self.serves_peers
+		}
+
+		async fn is_on_chain(&self, block: &BlockId) -> Option<bool> {
+			self.known_blocks.get(block).copied()
 		}
 
 		async fn sync_once(
@@ -1406,8 +1734,15 @@ mod tests {
 	struct HarnessSpec {
 		broadcast: Vec<Arc<dyn BroadcastAction>>,
 		mempool: Vec<Arc<dyn MempoolAction>>,
+		#[cfg(feature = "swaps")]
+		tx_status: Vec<Arc<dyn TxStatusAction>>,
+		script_history: Vec<Arc<dyn ScriptHistoryAction>>,
 		tracks_own_broadcasts: bool,
 		serves_mempool: bool,
+		/// Defaults to serving, so a test of a serve path's own rules runs
+		/// against a node that may serve at all.
+		serves_peers: bool,
+		known_blocks: HashMap<BlockId, bool>,
 		/// An existing wallet to build over, so a test can fund a wallet
 		/// once and then run different chains against it.
 		wallet: Option<Arc<Wallet>>,
@@ -1418,8 +1753,13 @@ mod tests {
 			Self {
 				broadcast: Vec::new(),
 				mempool: Vec::new(),
+				#[cfg(feature = "swaps")]
+				tx_status: Vec::new(),
+				script_history: Vec::new(),
 				tracks_own_broadcasts: false,
 				serves_mempool: false,
+				serves_peers: true,
+				known_blocks: HashMap::new(),
 				wallet: None,
 			}
 		}
@@ -1446,6 +1786,8 @@ mod tests {
 			wallet: Arc::clone(&wallet),
 			tracks_own_broadcasts: spec.tracks_own_broadcasts,
 			serves_mempool: spec.serves_mempool,
+			serves_peers: spec.serves_peers,
+			known_blocks: spec.known_blocks,
 		});
 		let slots = ChainSlots {
 			fee: ActionChain::new("fee", FEE_BUDGET, Vec::new(), Arc::clone(&logger)),
@@ -1453,7 +1795,7 @@ mod tests {
 			tx_status: ActionChain::new(
 				"tx_status",
 				TX_STATUS_BUDGET,
-				Vec::new(),
+				spec.tx_status,
 				Arc::clone(&logger),
 			),
 			broadcast: ActionChain::new(
@@ -1466,7 +1808,7 @@ mod tests {
 			script_history: ActionChain::new(
 				"script_history",
 				SCRIPT_HISTORY_BUDGET,
-				Vec::new(),
+				spec.script_history,
 				Arc::clone(&logger),
 			),
 			utxo: None,
@@ -2344,5 +2686,413 @@ mod tests {
 		let after = h.layer.slot_status();
 		assert_eq!(after.mempool.last_answered, Some("up".to_string()));
 		assert_eq!(after.broadcast.last_answered, None, "an unasked slot has no answerer");
+	}
+
+	fn tip_at(height: u32, seed: u8) -> BlockId {
+		BlockId { height, hash: BlockHash::from_byte_array([seed; 32]) }
+	}
+
+	fn complete_query(known_unconfirmed: Vec<Txid>) -> MempoolQuery {
+		MempoolQuery { scripts: Vec::new(), known_unconfirmed, scope: MempoolScope::Complete }
+	}
+
+	fn sync_request() -> WireSyncRequest {
+		WireSyncRequest {
+			version: CHAIN_WIRE_VERSION,
+			start_time: 0,
+			chain_tip: Vec::new(),
+			spks: Vec::new(),
+			txids: Vec::new(),
+			outpoints: Vec::new(),
+			full_scan: false,
+			stop_gap: 0,
+		}
+	}
+
+	/// N6: an answer a provider computed on a chain this node does not
+	/// consider best is refused inside the chain's run, so the next adapter
+	/// is asked; when it was the only adapter, the chain is exhausted with
+	/// the reason on record. For every anchored slot.
+	#[tokio::test]
+	async fn provider_answer_with_foreign_tip_is_dropped_and_chain_advances() {
+		let foreign = tip_at(7, 0xf0);
+		let ours = tip_at(7, 0x07);
+		let known_blocks: HashMap<BlockId, bool> = [(foreign, false), (ours, true)].into();
+		let (theirs, mine) = (unrelated(1), unrelated(2));
+
+		// MEMPOOL: the foreign answer is refused, the second adapter's taken.
+		let stale = FakeMempool::new(
+			"stale",
+			MempoolBehaviour::Answer { unconfirmed: vec![theirs.clone()], tip: Some(foreign) },
+		);
+		let good = FakeMempool::new(
+			"good",
+			MempoolBehaviour::Answer { unconfirmed: vec![mine.clone()], tip: Some(ours) },
+		);
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&stale), Arc::clone(&good)]),
+			known_blocks: known_blocks.clone(),
+			..HarnessSpec::default()
+		});
+		let answered = h.layer.mempool(&complete_query(Vec::new())).await.unwrap();
+		assert_eq!(answered.by, "good");
+		assert_eq!(answered.value.tip, Some(ours));
+		assert_eq!(answered.value.value.unconfirmed, vec![(mine, 1)]);
+		assert_eq!(stale.queries().len(), 1, "the foreign adapter was asked");
+		assert_eq!(good.queries().len(), 1, "and the chain advanced past it");
+
+		// Alone, the foreign answer exhausts the chain, and says why.
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&stale)]),
+			known_blocks: known_blocks.clone(),
+			..HarnessSpec::default()
+		});
+		let err = h.layer.mempool(&complete_query(Vec::new())).await.unwrap_err();
+		assert!(matches!(err, ChainActionError::Unavailable { timed_out: false, .. }), "{}", err);
+		assert!(err.to_string().contains("not on our chain"), "{}", err);
+
+		// SCRIPT_HISTORY: the same rule.
+		let stale_scan = FakeScriptHistory::new("stale", Some(foreign));
+		let good_scan = FakeScriptHistory::new("good", Some(ours));
+		let h = build(HarnessSpec {
+			script_history: vec![
+				Arc::clone(&stale_scan) as Arc<dyn ScriptHistoryAction>,
+				Arc::clone(&good_scan) as Arc<dyn ScriptHistoryAction>,
+			],
+			known_blocks: known_blocks.clone(),
+			..HarnessSpec::default()
+		});
+		let answered = h.layer.script_history(&sync_request()).await.unwrap();
+		assert_eq!(answered.by, "good");
+		assert_eq!(answered.value.tip, Some(ours));
+		assert_eq!(stale_scan.calls(), 1);
+		assert_eq!(good_scan.calls(), 1);
+
+		let h = build(HarnessSpec {
+			script_history: vec![Arc::clone(&stale_scan) as Arc<dyn ScriptHistoryAction>],
+			known_blocks: known_blocks.clone(),
+			..HarnessSpec::default()
+		});
+		let err = h.layer.script_history(&sync_request()).await.unwrap_err();
+		assert!(err.to_string().contains("not on our chain"), "{}", err);
+
+		// TX_STATUS: a confirmation on a branch this node is not on is no
+		// confirmation; alone, it fails closed.
+		#[cfg(feature = "swaps")]
+		{
+			let confirmed = RawTxObservation::Confirmed { height: Some(6), confirmations: 2 };
+			let stale_status = FakeTxStatus::new("stale", confirmed, Some(foreign));
+			let good_status = FakeTxStatus::new("good", RawTxObservation::NotFound, Some(ours));
+			let txid = theirs.compute_txid();
+			let h = build(HarnessSpec {
+				tx_status: vec![
+					Arc::clone(&stale_status) as Arc<dyn TxStatusAction>,
+					Arc::clone(&good_status) as Arc<dyn TxStatusAction>,
+				],
+				known_blocks: known_blocks.clone(),
+				..HarnessSpec::default()
+			});
+			assert_eq!(h.layer.swap_query_tx(txid, None).await, RawTxObservation::NotFound);
+			assert_eq!(stale_status.calls(), 1);
+			assert_eq!(good_status.calls(), 1);
+
+			let h = build(HarnessSpec {
+				tx_status: vec![Arc::clone(&stale_status) as Arc<dyn TxStatusAction>],
+				known_blocks,
+				..HarnessSpec::default()
+			});
+			assert_eq!(
+				h.layer.swap_query_tx(txid, None).await,
+				RawTxObservation::Unreachable,
+				"an exhausted chain fails closed, never a foreign confirmation"
+			);
+		}
+	}
+
+	/// N6: an answer with no tip carries nothing to check and is accepted,
+	/// and so is one anchored to a tip this node cannot place — an engine
+	/// with no header chain of its own does not refute what it cannot check.
+	#[tokio::test]
+	async fn provider_answer_without_tip_is_accepted() {
+		let foreign = tip_at(7, 0xf0);
+		let tx = unrelated(1);
+
+		// The engine holds every block it knows as NOT on its chain — and
+		// still a tipless answer goes through, from the first adapter.
+		let untipped = FakeMempool::new(
+			"untipped",
+			MempoolBehaviour::Answer { unconfirmed: vec![tx.clone()], tip: None },
+		);
+		let never_asked = FakeMempool::new("never-asked", MempoolBehaviour::Unavailable);
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&untipped), Arc::clone(&never_asked)]),
+			known_blocks: [(foreign, false)].into(),
+			..HarnessSpec::default()
+		});
+		let answered = h.layer.mempool(&complete_query(Vec::new())).await.unwrap();
+		assert_eq!(answered.by, "untipped");
+		assert_eq!(answered.value.tip, None);
+		assert_eq!(answered.value.value.unconfirmed, vec![(tx.clone(), 1)]);
+		assert!(never_asked.queries().is_empty());
+
+		// An engine that cannot tell about the tip accepts the answer as it
+		// always was, twice over: the once-per-tip log is not a refusal.
+		let unplaceable = FakeMempool::new(
+			"unplaceable",
+			MempoolBehaviour::Answer { unconfirmed: vec![tx.clone()], tip: Some(foreign) },
+		);
+		let h = build(HarnessSpec {
+			mempool: as_mempool(&[Arc::clone(&unplaceable)]),
+			known_blocks: HashMap::new(),
+			..HarnessSpec::default()
+		});
+		for _ in 0..2 {
+			let answered = h.layer.mempool(&complete_query(Vec::new())).await.unwrap();
+			assert_eq!(answered.by, "unplaceable");
+			assert_eq!(answered.value.tip, Some(foreign));
+		}
+		assert_eq!(unplaceable.queries().len(), 2);
+		assert_eq!(*h.layer.last_unverifiable_tip.lock().unwrap(), Some(foreign));
+
+		let scan = FakeScriptHistory::new("untipped", None);
+		let h = build(HarnessSpec {
+			script_history: vec![Arc::clone(&scan) as Arc<dyn ScriptHistoryAction>],
+			known_blocks: [(foreign, false)].into(),
+			..HarnessSpec::default()
+		});
+		assert_eq!(h.layer.script_history(&sync_request()).await.unwrap().by, "untipped");
+
+		#[cfg(feature = "swaps")]
+		{
+			let in_mempool = FakeTxStatus::new("untipped", RawTxObservation::InMempool, None);
+			let h = build(HarnessSpec {
+				tx_status: vec![Arc::clone(&in_mempool) as Arc<dyn TxStatusAction>],
+				known_blocks: [(foreign, false)].into(),
+				..HarnessSpec::default()
+			});
+			let txid = tx.compute_txid();
+			assert_eq!(h.layer.swap_query_tx(txid, None).await, RawTxObservation::InMempool);
+		}
+	}
+
+	/// N6: a borrowed mempool answer that evicts a transaction this node
+	/// itself just broadcast is not believed — the borrowed view may simply
+	/// not have seen it yet — while every other eviction it reports is
+	/// applied. An engine with a mempool of its own applies them all.
+	#[tokio::test]
+	async fn fresh_own_broadcast_is_not_evicted_by_a_borrowed_mempool_answer() {
+		let tip = tip_at(7, 0x07);
+		let ok = FakeBroadcast::new("ok", Behaviour::Ok);
+		let borrowed = FakeMempool::new(
+			"borrowed",
+			MempoolBehaviour::Answer { unconfirmed: Vec::new(), tip: Some(tip) },
+		);
+		let stale = Txid::from_byte_array([9u8; 32]);
+
+		// A filter-following node: the tail told the wallet about the spend,
+		// and remembers it left.
+		let h = build(HarnessSpec {
+			broadcast: as_broadcast(&[Arc::clone(&ok)]),
+			mempool: as_mempool(&[Arc::clone(&borrowed)]),
+			tracks_own_broadcasts: true,
+			known_blocks: [(tip, true)].into(),
+			..HarnessSpec::default()
+		});
+		let deposit_tx = deposit(&h.wallet, 1);
+		unconfirmed(&h.wallet, &[&deposit_tx]);
+		let spend = spend_of(&deposit_tx);
+		h.layer.broadcast_package(vec![spend.clone()]).await;
+		assert!(unconfirmed_txids(&h.wallet).contains(&spend.compute_txid()));
+		assert_eq!(h.layer.recent_own_broadcasts.lock().unwrap().len(), 1);
+
+		let answered = h
+			.layer
+			.mempool(&complete_query(vec![spend.compute_txid(), stale]))
+			.await
+			.expect("the borrowed view answers");
+		assert_eq!(
+			answered.value.value.evicted,
+			vec![(stale, 2)],
+			"the fresh own broadcast is shielded; the stale txid is evicted"
+		);
+		assert_eq!(
+			borrowed.queries().len(),
+			1,
+			"the shield is applied after the chain, not instead of it"
+		);
+
+		// An engine with a mempool of its own: the tail records nothing, and
+		// its own mempool's eviction is a verdict.
+		let h = build(HarnessSpec {
+			broadcast: as_broadcast(&[Arc::clone(&ok)]),
+			mempool: as_mempool(&[Arc::clone(&borrowed)]),
+			tracks_own_broadcasts: false,
+			known_blocks: [(tip, true)].into(),
+			..HarnessSpec::default()
+		});
+		let deposit_tx = deposit(&h.wallet, 2);
+		unconfirmed(&h.wallet, &[&deposit_tx]);
+		let spend = spend_of(&deposit_tx);
+		h.layer.broadcast_package(vec![spend.clone()]).await;
+		assert_eq!(h.layer.recent_own_broadcasts.lock().unwrap().len(), 0);
+		let answered =
+			h.layer.mempool(&complete_query(vec![spend.compute_txid(), stale])).await.unwrap();
+		assert_eq!(answered.value.value.evicted, vec![(spend.compute_txid(), 2), (stale, 2)]);
+	}
+
+	/// The own-broadcast memory forgets by age and caps by count, oldest
+	/// first, so a shielded eviction is one that arrived within the grace
+	/// period and nothing else.
+	#[test]
+	fn recent_own_broadcasts_forget_by_age_and_cap_by_count() {
+		let mut recent = RecentOwnBroadcasts::default();
+		let t0 = Instant::now();
+		let (a, b) = (Txid::from_byte_array([1u8; 32]), Txid::from_byte_array([2u8; 32]));
+
+		recent.record(a, t0);
+		assert!(recent.is_recent(&a, t0));
+		assert!(
+			recent.is_recent(&a, t0 + OWN_BROADCAST_EVICTION_GRACE),
+			"at the edge, still fresh"
+		);
+		assert!(!recent.is_recent(&b, t0), "never broadcast");
+		assert!(
+			!recent.is_recent(&a, t0 + OWN_BROADCAST_EVICTION_GRACE + Duration::from_secs(1)),
+			"past the grace period, an absence is a verdict"
+		);
+		assert_eq!(recent.len(), 0, "and the entry is gone");
+
+		// Past the cap the oldest go first, whatever their age.
+		let t1 = t0 + Duration::from_secs(1);
+		for i in 0..OWN_BROADCAST_MEMORY_CAP {
+			let mut bytes = [0u8; 32];
+			bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+			recent.record(Txid::from_byte_array(bytes), t0);
+		}
+		assert_eq!(recent.len(), OWN_BROADCAST_MEMORY_CAP);
+		recent.record(b, t1);
+		assert_eq!(recent.len(), OWN_BROADCAST_MEMORY_CAP);
+		assert!(recent.is_recent(&b, t1), "the newest survives");
+		let survivors = (0..OWN_BROADCAST_MEMORY_CAP)
+			.filter(|i| {
+				let mut bytes = [0u8; 32];
+				bytes[..8].copy_from_slice(&(*i as u64).to_le_bytes());
+				recent.is_recent(&Txid::from_byte_array(bytes), t1)
+			})
+			.count();
+		assert_eq!(survivors, OWN_BROADCAST_MEMORY_CAP - 1, "exactly one of the old ones went");
+	}
+
+	/// N6: a node whose engine does not serve peers refuses every serve
+	/// entry point before any slot is asked — the Dependent tier and the
+	/// filter-following node, hybrid or not — while a node over a real chain
+	/// source answers.
+	#[tokio::test]
+	async fn dependent_and_cbf_nodes_refuse_every_serve() {
+		let tx = unrelated(1);
+		let tip = tip_at(7, 0x07);
+		let mempool_req = WireMempoolRequest {
+			version: CHAIN_WIRE_VERSION,
+			spks: vec![script_to_wire(&someone_elses_script())],
+			known_unconfirmed: Vec::new(),
+		};
+		let lightning_req = WireLightningSyncRequest {
+			version: CHAIN_WIRE_VERSION,
+			txids: Vec::new(),
+			outputs: Vec::new(),
+		};
+
+		let ok = FakeBroadcast::new("ok", Behaviour::Ok);
+		let local = FakeMempool::new(
+			"local",
+			MempoolBehaviour::Answer { unconfirmed: vec![tx.clone()], tip: Some(tip) },
+		);
+		let spec = || HarnessSpec {
+			broadcast: as_broadcast(&[Arc::clone(&ok)]),
+			mempool: as_mempool(&[Arc::clone(&local)]),
+			serves_mempool: true,
+			serves_peers: false,
+			..HarnessSpec::default()
+		};
+
+		let h = build(spec());
+		assert!(matches!(h.layer.serve_fee_estimates(), Err(Error::ChainServeUnsupported)));
+		assert!(matches!(h.layer.serve_broadcast(&tx).await, Err(Error::ChainServeUnsupported)));
+		assert!(matches!(
+			h.layer.serve_mempool(&mempool_req).await,
+			Err(Error::ChainServeUnsupported)
+		));
+		assert!(matches!(
+			h.layer.serve_wallet_sync(&sync_request()).await,
+			Err(Error::ChainServeUnsupported)
+		));
+		assert!(matches!(
+			h.layer.serve_lightning_sync(&lightning_req).await,
+			Err(Error::ChainServeUnsupported)
+		));
+		#[cfg(feature = "swaps")]
+		assert!(matches!(
+			h.layer.serve_tx_status(tx.compute_txid(), None).await,
+			Err(Error::ChainServeUnsupported)
+		));
+		assert_eq!(ok.calls(), 0, "refused before the BROADCAST chain is asked");
+		assert!(local.queries().is_empty(), "refused before the MEMPOOL chain is asked");
+
+		// The same slots on a node that serves: the question reaches them.
+		let h = build(HarnessSpec { serves_peers: true, ..spec() });
+		assert!(h.layer.serve_fee_estimates().is_ok());
+		assert!(h.layer.serve_broadcast(&tx).await.is_ok());
+		assert!(h.layer.serve_mempool(&mempool_req).await.is_ok());
+		assert_eq!(ok.calls(), 1);
+		assert_eq!(local.queries().len(), 1);
+
+		// The real presets: the Dependent tier and the CBF node refuse, the
+		// engines over a chain source of their own answer.
+		let dependent = dependent_preset();
+		assert!(!dependent.engine.serves_peers(), "every slot is its provider's");
+		assert!(matches!(dependent.serve_fee_estimates(), Err(Error::ChainServeUnsupported)));
+		assert!(matches!(dependent.serve_broadcast(&tx).await, Err(Error::ChainServeUnsupported)));
+		assert!(matches!(
+			dependent.serve_lightning_sync(&lightning_req).await,
+			Err(Error::ChainServeUnsupported)
+		));
+		for serving in
+			[esplora_preset(), electrum_preset(), bitcoind_rpc_preset(), bitcoind_rest_preset()]
+		{
+			assert!(serving.engine.serves_peers(), "{}", serving.engine.name());
+			assert!(serving.serve_fee_estimates().is_ok(), "{}", serving.engine.name());
+		}
+
+		#[cfg(feature = "cbf")]
+		{
+			for cbf in [
+				cbf_layer(Vec::new(), CbfConfig::default(), None).expect("pure CBF"),
+				cbf_layer(Vec::new(), CbfConfig::default(), Some(Arc::new(SilentProvider)))
+					.expect("hybrid CBF"),
+			] {
+				assert!(matches!(cbf.serve_fee_estimates(), Err(Error::ChainServeUnsupported)));
+				assert!(matches!(
+					cbf.serve_broadcast(&tx).await,
+					Err(Error::ChainServeUnsupported)
+				));
+				assert!(matches!(
+					cbf.serve_mempool(&mempool_req).await,
+					Err(Error::ChainServeUnsupported)
+				));
+				assert!(matches!(
+					cbf.serve_wallet_sync(&sync_request()).await,
+					Err(Error::ChainServeUnsupported)
+				));
+				assert!(matches!(
+					cbf.serve_lightning_sync(&lightning_req).await,
+					Err(Error::ChainServeUnsupported)
+				));
+				#[cfg(feature = "swaps")]
+				assert!(matches!(
+					cbf.serve_tx_status(tx.compute_txid(), None).await,
+					Err(Error::ChainServeUnsupported)
+				));
+			}
+		}
 	}
 }

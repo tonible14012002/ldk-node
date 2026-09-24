@@ -59,6 +59,12 @@ impl SyncEngine for BitcoindSyncEngine {
 		true
 	}
 
+	/// Every slot is filled from this node's own bitcoind: a real chain
+	/// source, so other nodes may be served from it.
+	fn serves_peers(&self) -> bool {
+		true
+	}
+
 	/// Poll the tip, then the mempool, then record the pass — in that order,
 	/// as pre-seam. The mempool comes through the layer's MEMPOOL chain now;
 	/// what it answers is applied exactly where, and how, the client's own

@@ -257,6 +257,12 @@ impl SyncEngine for ElectrumSyncEngine {
 		true
 	}
 
+	/// Every slot is filled from this node's own Electrum server: a real
+	/// chain source, so other nodes may be served from it.
+	fn serves_peers(&self) -> bool {
+		true
+	}
+
 	fn start(&self, runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
 		self.electrum_runtime_status.write().unwrap().start(
 			self.server_url.clone(),

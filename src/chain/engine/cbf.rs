@@ -404,8 +404,9 @@ impl SyncEngine for CbfSyncEngine {
 	///
 	/// The mempool is supplementary: a filter-driven engine has none of its own, and a
 	/// provider that cannot answer this pass does not make the pass fail — the chain is
-	/// synced regardless. What it answers is applied as is; a hybrid node's reorg-consistency
-	/// check on the answer's tip is T10's.
+	/// synced regardless. What the layer hands back is applied as is: the layer has already
+	/// refused an answer anchored to a tip this engine does not consider best, and dropped
+	/// the eviction of anything this node itself broadcast moments ago.
 	async fn sync_once(
 		&self, layer: &ChainLayer, _channel_manager: Arc<ChannelManager>,
 		_chain_monitor: Arc<ChainMonitor>, _output_sweeper: Arc<Sweeper>,

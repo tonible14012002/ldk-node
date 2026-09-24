@@ -294,6 +294,12 @@ impl SyncEngine for EsploraSyncEngine {
 		Some(&self.onchain_wallet)
 	}
 
+	/// Every slot is filled from this node's own Esplora server: a real
+	/// chain source, so other nodes may be served from it.
+	fn serves_peers(&self) -> bool {
+		true
+	}
+
 	/// Run a Dependent node's scan against this node's own Esplora server.
 	///
 	/// The request is rebuilt into a real `SyncRequest` and handed to the same
