@@ -86,13 +86,17 @@
 //!
 //! The queue hands the slot every transaction LDK asked to broadcast together
 //! (a commitment tx and its anchor CPFP, say), and the adapter answers for the
-//! package. Each backend still sends one transaction at a time and keeps its
-//! own error classification and log levels; it folds each send into a
-//! [`TxBroadcastOutcome`] and [`package_result`] turns the package's worth of
-//! those into the slot's answer. `Ok` means every transaction was handed to
-//! the network — accepted, or already known to it. `Rejected` lists the
-//! transactions the network refused, and the layer's shared tail evicts them
-//! from the on-chain wallet so their inputs are spendable again.
+//! package, transaction by transaction. Each backend still sends one
+//! transaction at a time and keeps its own error classification and log
+//! levels; it folds each send into a [`TxBroadcastOutcome`] and hands the
+//! package's worth of those — the [`PackageOutcomes`] — back to the chain,
+//! where [`package_result`] turns them into the slot's answer. `Ok` means every
+//! transaction was handed to the network — accepted, or already known to it.
+//! `Rejected` lists the transactions the network refused, and the layer's
+//! shared tail evicts them from the on-chain wallet so their inputs are
+//! spendable again. The per-transaction outcomes outlive the verdict: when a
+//! package was partly accepted and the chain then ran out of adapters, the
+//! tail still knows which transactions are on the network.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -324,11 +328,11 @@ impl From<ChainActionError> for TxBroadcastOutcome {
 ///   transaction with its reason. Transactions not listed were accepted.
 ///
 /// An `Unavailable` package says nothing about which of its transactions the
-/// backend did take before the send that failed: the accepted subset is not
-/// carried in the answer, so once the chain is exhausted, an engine that
-/// tracks its own broadcasts (to recognise the echo of its own transaction
-/// in a later observation) has no list of what to expect. T8 must handle
-/// that when such an engine lands.
+/// backend did take before the send that failed. That is why the verdict is
+/// not the whole answer: the chain keeps the [`PackageOutcomes`] the adapter
+/// produced and, once exhausted, hands the accepted subset
+/// ([`accepted_txids`]) to the layer's tail, so an engine that tracks its own
+/// broadcasts still learns which of its transactions are on the network.
 pub(crate) fn package_result(
 	outcomes: impl IntoIterator<Item = (Txid, TxBroadcastOutcome)>,
 ) -> ActionResult<(), BroadcastRejection> {
@@ -357,6 +361,19 @@ pub(crate) fn package_result(
 		return Err(ChainActionError::Rejected(rejected));
 	}
 	Ok(())
+}
+
+/// What one BROADCAST adapter said about each transaction of a package, in
+/// package order: the answer of [`BroadcastAction::broadcast_package`].
+pub(crate) type PackageOutcomes = Vec<(Txid, TxBroadcastOutcome)>;
+
+/// The transactions of a package the network has — accepted, or already
+/// known to it — as one adapter's outcomes report them.
+pub(crate) fn accepted_txids(outcomes: &PackageOutcomes) -> impl Iterator<Item = Txid> + '_ {
+	outcomes.iter().filter_map(|(txid, outcome)| match outcome {
+		TxBroadcastOutcome::Accepted | TxBroadcastOutcome::AlreadyKnown => Some(*txid),
+		TxBroadcastOutcome::Rejected(_) | TxBroadcastOutcome::Unavailable { .. } => None,
+	})
 }
 
 /// The result of one adapter answering one action.
@@ -427,9 +444,18 @@ pub(crate) trait BroadcastAction: Send + Sync {
 		true
 	}
 
-	/// Send `txs` and answer for the package; see [`package_result`] for what
-	/// the answer means.
-	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection>;
+	/// Send `txs` and say what happened to each, in package order.
+	///
+	/// The chain turns the outcomes into the slot's verdict with
+	/// [`package_result`] and keeps them, so the tail learns which
+	/// transactions the network took even when the verdict is
+	/// `Unavailable`. An adapter that cannot send at all — not started,
+	/// nothing to send with — answers `Err(Unavailable)` without outcomes; one
+	/// that has a verdict on the whole package may answer `Err(Rejected)`
+	/// directly, though every backend today reports verdicts per transaction.
+	async fn broadcast_package(
+		&self, txs: &[Transaction],
+	) -> ActionResult<PackageOutcomes, BroadcastRejection>;
 }
 
 /// TX_STATUS — reorg-aware status of an ARBITRARY transaction, one the local
@@ -595,9 +621,12 @@ pub(crate) trait ScriptHistoryAction: Send + Sync {
 pub(crate) enum UtxoVerification {
 	/// The output is fetched and its value and script are checked.
 	Full,
-	/// Only that the output exists unspent is checked; value and script are
-	/// taken on trust.
-	#[allow(dead_code)] // declared by the CBF UTXO source once it exists
+	/// Only that the output exists is checked — the funding block is fetched
+	/// and the output read from it, so its value and script are real — but
+	/// whether it has since been spent is taken on trust: the source has no
+	/// UTXO set to ask. A closed channel can therefore stay in the graph
+	/// until its close is gossiped or the channel times out.
+	#[cfg_attr(not(feature = "cbf"), allow(dead_code))] // declared by the CBF UTXO source
 	ExistenceOnly,
 }
 

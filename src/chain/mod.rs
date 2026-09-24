@@ -403,6 +403,56 @@ impl SwapTxWatch {
 	}
 }
 
+/// A fresh regtest on-chain wallet for the chain tests: the layer's harness and the CBF
+/// adapters build over it, so the fixture lives once, here.
+#[cfg(test)]
+pub(crate) mod test_wallet {
+	use std::sync::Arc;
+
+	use bdk_wallet::Wallet as BdkWallet;
+	use bitcoin::Network;
+
+	use crate::config::Config;
+	use crate::fee_estimator::OnchainFeeEstimator;
+	use crate::io::{
+		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+	};
+	use crate::logger::Logger;
+	use crate::types::{Broadcaster, DynStore, PaymentStore, Wallet};
+	use crate::wallet::persist::KVStoreWalletPersister;
+
+	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
+	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
+
+	pub(crate) fn fresh_regtest_wallet(
+		kv_store: &Arc<DynStore>, broadcaster: &Arc<Broadcaster>,
+		fee_estimator: &Arc<OnchainFeeEstimator>, logger: &Arc<Logger>,
+	) -> Arc<Wallet> {
+		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
+		let mut persister = KVStoreWalletPersister::new(Arc::clone(kv_store), Arc::clone(logger));
+		let bdk_wallet = BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
+			.network(Network::Regtest)
+			.create_wallet(&mut persister)
+			.expect("valid test descriptors");
+		let payment_store = Arc::new(PaymentStore::new(
+			Vec::new(),
+			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
+			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
+			Arc::clone(kv_store),
+			Arc::clone(logger),
+		));
+		Arc::new(Wallet::new(
+			bdk_wallet,
+			persister,
+			Arc::clone(broadcaster),
+			Arc::clone(fee_estimator),
+			payment_store,
+			config,
+			Arc::clone(logger),
+		))
+	}
+}
+
 #[cfg(all(test, feature = "swaps"))]
 mod swap_b5_tests {
 	use super::{derive_tx_status, ChainStatus, RawTxObservation, SwapTxWatch};

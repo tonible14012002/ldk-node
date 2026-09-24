@@ -211,6 +211,23 @@ pub(crate) trait SyncEngine: Send + Sync {
 		false
 	}
 
+	/// Watch an arbitrary transaction — one the local wallet need not own —
+	/// for the TX_STATUS slot, with the output script it can be found by
+	/// (Peerswap B5, [`crate::Node::watch_txid`]).
+	///
+	/// Defaults to a no-op: the transaction-based and block-polling engines
+	/// answer TX_STATUS by asking their chain source about the txid at query
+	/// time, and need nothing registered ahead of it. A filter-driven engine
+	/// has no history to look back into, so it must be told *before* the
+	/// transaction confirms which block to look in — that is what this hook
+	/// is for.
+	#[cfg(feature = "swaps")]
+	fn watch_tx(&self, _txid: Txid, _script_pubkey: bitcoin::ScriptBuf) {}
+
+	/// Stop watching `txid`; see [`SyncEngine::watch_tx`].
+	#[cfg(feature = "swaps")]
+	fn unwatch_tx(&self, _txid: &Txid) {}
+
 	/// Whether `block` is on the chain this engine considers best: `Some(true)`
 	/// if it is, `Some(false)` if this engine knows a different block at that
 	/// height, `None` if it cannot say.

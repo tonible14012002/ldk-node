@@ -14,8 +14,8 @@ use bitcoin::Transaction;
 
 use crate::chain::electrum::ElectrumRuntimeClient;
 use crate::chain::seam::{
-	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
-	FeeUpdate, ADAPTER_BUDGET_MARGIN, PER_TX_BROADCAST_BUDGET,
+	ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction, FeeUpdate,
+	PackageOutcomes, ADAPTER_BUDGET_MARGIN, PER_TX_BROADCAST_BUDGET,
 };
 use crate::chain::ElectrumRuntimeStatus;
 use crate::config::FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS;
@@ -221,7 +221,9 @@ impl BroadcastAction for ElectrumChainAdapter {
 	/// contract. A server-side refusal arrives as a protocol error the client
 	/// classifies best-effort: a relayed `sendrawtransaction` verdict it can
 	/// read is answered as such, anything else is `Unavailable`.
-	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+	async fn broadcast_package(
+		&self, txs: &[Transaction],
+	) -> ActionResult<PackageOutcomes, BroadcastRejection> {
 		let Some(client) = self.client() else {
 			return Err(ChainActionError::unavailable("chain source not started"));
 		};
@@ -229,7 +231,7 @@ impl BroadcastAction for ElectrumChainAdapter {
 		for tx in txs {
 			outcomes.push((tx.compute_txid(), client.broadcast(tx.clone()).await));
 		}
-		package_result(outcomes)
+		Ok(outcomes)
 	}
 }
 

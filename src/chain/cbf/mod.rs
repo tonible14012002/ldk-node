@@ -44,6 +44,19 @@ use crate::Error;
 /// checkpoint, so a recent reorg cannot strand the node above the new best chain.
 pub(crate) const REORG_SAFETY_BLOCKS: u32 = 7;
 
+/// Per-attempt timeout when downloading a block from a peer — a matched block the engine
+/// applies, a fee sample the FEE adapter reads, a funding block the UTXO source fetches.
+/// Kyoto queues the request and awaits a peer response with no timeout of its own, so a slow or
+/// unresponsive peer would otherwise park the fetch forever. Kept short so a single request is
+/// bounded and can be retried (or, for a fee sample, only delays one sample) rather than
+/// stalling.
+pub(crate) const CBF_BLOCK_FETCH_TIMEOUT_SECS: u64 = 10;
+
+/// Bound on a header or chain-tip lookup against the kyoto node, for the same reason: the
+/// lookup is answered from kyoto's own header chain and is quick while the node runs, but the
+/// request rides a channel to the node's event loop, and a wedged loop would never answer.
+pub(crate) const CBF_HEADER_LOOKUP_TIMEOUT_SECS: u64 = 10;
+
 /// Where the engine is between "started" and "caught up", as the applicator advances it.
 ///
 /// Published through a `watch` channel: `wait_until_synced` blocks on it, and
@@ -318,7 +331,9 @@ impl WatchLedger {
 		self.lock().watched.insert(txid);
 	}
 
-	/// The block most recently applied by the applicator, if any block has been.
+	/// The block most recently applied by the applicator, if any block has been: the tip the
+	/// TX_STATUS adapter anchors its answers to.
+	#[cfg_attr(not(feature = "swaps"), allow(dead_code))]
 	pub(crate) fn tip(&self) -> Option<BlockId> {
 		self.lock().tip
 	}
@@ -356,9 +371,9 @@ impl WatchLedger {
 	}
 }
 
-// Wired by T8: the forward-only TX_STATUS adapter reads answers out of the ledger and lets a
-// settled watch go.
-#[allow(dead_code)]
+// The forward-only TX_STATUS adapter reads answers out of the ledger and lets a settled watch
+// go; that adapter exists only with the `swaps` feature, which is what TX_STATUS is.
+#[cfg_attr(not(feature = "swaps"), allow(dead_code))]
 impl WatchLedger {
 	/// Stop watching `txid` and forget where it was seen.
 	pub(crate) fn unwatch(&self, txid: &Txid) {

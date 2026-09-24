@@ -34,8 +34,8 @@ use crate::chain::provider::{
 	ChainDataProvider, WireBroadcastRequest, WireSyncRequest, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{
-	package_result, ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError,
-	FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, ScriptHistoryAction,
+	ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
+	FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, PackageOutcomes, ScriptHistoryAction,
 	TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, MAX_BROADCAST_PACKAGE_TXS,
 };
 use crate::chain::wire_convert::{
@@ -195,12 +195,14 @@ impl BroadcastAction for DependentChainAdapter {
 	/// [`ChainProviderError::Refused`]. `Refused` means only that the provider
 	/// would not serve, so it is `Unavailable` like every other provider
 	/// error, and the chain advances.
-	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+	async fn broadcast_package(
+		&self, txs: &[Transaction],
+	) -> ActionResult<PackageOutcomes, BroadcastRejection> {
 		let mut outcomes = Vec::with_capacity(txs.len());
 		for tx in txs {
 			outcomes.push((tx.compute_txid(), self.broadcast_tx(tx).await));
 		}
-		package_result(outcomes)
+		Ok(outcomes)
 	}
 }
 

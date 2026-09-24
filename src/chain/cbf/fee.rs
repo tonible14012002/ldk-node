@@ -29,14 +29,10 @@ use crate::fee_estimator::{get_num_block_defaults_for_target, ConfirmationTarget
 pub(crate) const BLOCK_FEE_CACHE_CAPACITY: usize = REORG_SAFETY_BLOCKS as usize * 2;
 
 /// Number of most recent blocks whose coinbase-derived fee rates feed the native CBF estimator.
-// Wired by T8: read by the coinbase-derived FEE adapter when it reconciles the window.
-#[allow(dead_code)]
 pub(crate) const FEE_WINDOW_BLOCKS: u32 = BLOCK_FEE_CACHE_CAPACITY as u32;
 
 /// Lower bound for native CBF fee estimates (1 sat/vB), matching the floor used by the Esplora
 /// and Electrum fee sources. Coinbase-derived rates are frequently zero on regtest/signet.
-// Wired by T8: applied by the coinbase-derived FEE adapter to every percentile it reads.
-#[allow(dead_code)]
 pub(crate) const CBF_MIN_FEERATE_SAT_PER_KWU: u64 = 250;
 
 /// Recent per-block coinbase-derived fee rates, keyed by height so a reader can window on the
@@ -88,8 +84,6 @@ pub(crate) fn coinbase_fee_rate(block: &Block, height: u32) -> FeeRate {
 /// More urgent targets (shorter confirmation horizon) read a higher percentile; relaxed targets
 /// read a lower one. This is a coarse stand-in for the per-horizon estimates a mempool-aware
 /// backend would provide.
-// Wired by T8: the coinbase-derived FEE adapter maps every target through it.
-#[allow(dead_code)]
 pub(crate) fn cbf_percentile_for_target(target: ConfirmationTarget) -> f64 {
 	match get_num_block_defaults_for_target(target) {
 		0..=2 => 90.0,
@@ -102,8 +96,6 @@ pub(crate) fn cbf_percentile_for_target(target: ConfirmationTarget) -> f64 {
 
 /// Returns the value at the given percentile of an ascending-sorted slice using nearest-rank.
 /// Returns `0` for an empty slice.
-// Wired by T8: the coinbase-derived FEE adapter reads the window through it.
-#[allow(dead_code)]
 pub(crate) fn percentile_of_sorted(sorted: &[u64], percentile: f64) -> u64 {
 	if sorted.is_empty() {
 		return 0;

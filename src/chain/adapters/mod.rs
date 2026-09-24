@@ -16,6 +16,8 @@
 //! same error code and message into the same [`TxBroadcastOutcome`].
 
 pub(crate) mod bitcoind;
+#[cfg(feature = "cbf")]
+pub(crate) mod cbf;
 pub(crate) mod dependent;
 pub(crate) mod electrum;
 pub(crate) mod esplora;

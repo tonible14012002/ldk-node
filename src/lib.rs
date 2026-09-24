@@ -1196,7 +1196,10 @@ impl Node {
 	/// and ignored by the Esplora/Bitcoind backends. Registration is idempotent.
 	#[cfg(feature = "swaps")]
 	pub fn watch_txid(&self, txid: bitcoin::Txid, scriptpubkey: bitcoin::ScriptBuf) {
-		self.swap_tx_watch.register(txid, scriptpubkey);
+		self.swap_tx_watch.register(txid, scriptpubkey.clone());
+		// A filter-driven chain source can only report a confirmation it was told to look
+		// for ahead of time; every other engine ignores this.
+		self.chain_source.watch_swap_tx(txid, scriptpubkey);
 	}
 
 	/// Drops the reorg-aware watch for `txid` registered via [`Node::watch_txid`]
@@ -1206,6 +1209,7 @@ impl Node {
 	#[cfg(feature = "swaps")]
 	pub fn unwatch_txid(&self, txid: bitcoin::Txid) {
 		self.swap_tx_watch.unregister(&txid);
+		self.chain_source.unwatch_swap_tx(&txid);
 	}
 
 	/// Queries the reorg-aware confirmation status of an arbitrary `txid`

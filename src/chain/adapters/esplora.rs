@@ -19,8 +19,8 @@ use lightning::util::ser::Writeable;
 
 use crate::chain::adapters::classify_relayed_sendrawtransaction;
 use crate::chain::seam::{
-	package_result, ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
-	FeeUpdate, TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, PER_TX_BROADCAST_BUDGET,
+	ActionResult, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction, FeeUpdate,
+	PackageOutcomes, TxBroadcastOutcome, ADAPTER_BUDGET_MARGIN, PER_TX_BROADCAST_BUDGET,
 };
 use crate::config::{Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS};
 use crate::fee_estimator::{
@@ -284,12 +284,14 @@ impl BroadcastAction for EsploraChainAdapter {
 	/// One send per transaction, exactly as pre-seam — a later transaction is
 	/// still sent after an earlier one failed — then the package is answered
 	/// for as a whole.
-	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+	async fn broadcast_package(
+		&self, txs: &[Transaction],
+	) -> ActionResult<PackageOutcomes, BroadcastRejection> {
 		let mut outcomes = Vec::with_capacity(txs.len());
 		for tx in txs {
 			outcomes.push((tx.compute_txid(), self.broadcast_tx(tx).await));
 		}
-		package_result(outcomes)
+		Ok(outcomes)
 	}
 }
 

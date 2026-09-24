@@ -43,10 +43,10 @@ use crate::chain::provider::{
 	WireUpdate, CHAIN_WIRE_VERSION,
 };
 use crate::chain::seam::{
-	ActionChain, ActionResult, Anchored, Answered, BroadcastAction, BroadcastRejection,
-	ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery,
-	ScriptHistoryAction, UtxoCapability, UtxoVerification, BROADCAST_BUDGET, FEE_BUDGET,
-	MAX_MEMPOOL_QUERY_ITEMS, MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
+	accepted_txids, package_result, ActionChain, ActionResult, Anchored, Answered, BroadcastAction,
+	BroadcastRejection, ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer,
+	MempoolQuery, ScriptHistoryAction, UtxoCapability, UtxoVerification, BROADCAST_BUDGET,
+	FEE_BUDGET, MAX_MEMPOOL_QUERY_ITEMS, MEMPOOL_BUDGET, SCRIPT_HISTORY_BUDGET,
 };
 use crate::chain::wire_convert::{mempool_answer_to_wire, wire_to_mempool_query};
 use crate::chain::{ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS};
@@ -59,6 +59,10 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogg
 use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
 use crate::{Error, NodeMetrics};
 
+#[cfg(all(feature = "cbf", feature = "swaps"))]
+use crate::chain::adapters::cbf::CbfWatchTxStatus;
+#[cfg(feature = "cbf")]
+use crate::chain::adapters::cbf::{CbfDerivedFee, CbfP2pBroadcast, CbfUtxoSource};
 #[cfg(feature = "cbf")]
 use crate::chain::engine::cbf::{CbfSyncEngine, ExternalElectrum};
 #[cfg(feature = "cbf")]
@@ -135,6 +139,13 @@ pub(crate) struct ChainSlots {
 /// network, and transactions the network refused, each with the time.
 type Unconfirmed = Vec<(Transaction, u64)>;
 type Evicted = Vec<(Txid, u64)>;
+
+/// One package's run through the BROADCAST chain: the chain's verdict, and
+/// every transaction some adapter reported as on the network along the way.
+struct BroadcastRun {
+	outcome: Result<Answered<()>, ChainActionError<BroadcastRejection>>,
+	accepted: HashSet<Txid>,
+}
 
 /// Everything a slot's shared tail needs once its adapter has answered.
 pub(crate) struct SharedChainCtx {
@@ -412,18 +423,25 @@ impl ChainLayer {
 
 	/// A node following the chain by compact block filters over P2P, borrowing
 	/// what filters cannot show it from an external fee source and, on a
-	/// hybrid node, from a provider.
+	/// hybrid node, from a provider, and falling back to what the filters and
+	/// the node's own peers can give.
 	///
-	/// The chains, in order: FEE = [external fee, if configured; provider, if
-	/// any], BROADCAST = [provider], TX_STATUS = [provider], MEMPOOL =
-	/// [provider], SCRIPT_HISTORY = [provider], UTXO = none. The CBF adapters
-	/// that fill the remaining positions — coinbase-derived fees, P2P
-	/// broadcast, the forward-only watch, the existence-only UTXO source
-	/// `cbf_config.utxo_source` enables — are T8's, and slot in around these;
+	/// The chains, in order:
+	///
+	/// * FEE = [external fee, if configured; provider, if any; coinbase-derived].
+	///   A mempool-aware source first; the after-the-fact fee market of recent
+	///   blocks is what remains when nobody answers.
+	/// * BROADCAST = [provider, if any; P2P]. A provider's bitcoind gives a
+	///   verdict; the node's own peers give none, so they come second.
+	/// * TX_STATUS = [forward-only watch; provider, if any]. What this node saw
+	///   confirm itself outranks what it is told, and costs nothing to ask.
+	/// * MEMPOOL = [provider, if any], SCRIPT_HISTORY = [provider, if any]:
+	///   nothing a filter node can fill itself.
+	/// * UTXO = the existence-only source over the filters when
+	///   `cbf_config.utxo_source` asks for it; none otherwise.
+	///
 	/// `wallet_birthday_height` floors the resume checkpoint here and seeds a
-	/// fresh wallet in the builder (T9). Without a provider a pure CBF node's
-	/// BROADCAST chain is empty until T8: the drain finds no ready adapter and
-	/// leaves the queue alone, which is lossy once it fills, and logged.
+	/// fresh wallet in the builder (T9).
 	// Wired by T9: the builder's `set_chain_source_cbf` preset is the caller.
 	#[cfg(feature = "cbf")]
 	#[allow(clippy::too_many_arguments, dead_code)]
@@ -460,21 +478,6 @@ impl ChainLayer {
 			None => {},
 		}
 
-		let provider = fallback
-			.map(|provider| Arc::new(DependentChainAdapter::new(provider, Arc::clone(&logger))));
-		if let Some(provider) = &provider {
-			fee.push(Arc::clone(provider) as Arc<dyn FeeAction>);
-		}
-		let broadcast: Vec<Arc<dyn BroadcastAction>> =
-			provider.iter().map(|p| Arc::clone(p) as Arc<dyn BroadcastAction>).collect();
-		#[cfg(feature = "swaps")]
-		let tx_status: Vec<Arc<dyn TxStatusAction>> =
-			provider.iter().map(|p| Arc::clone(p) as Arc<dyn TxStatusAction>).collect();
-		let mempool: Vec<Arc<dyn MempoolAction>> =
-			provider.iter().map(|p| Arc::clone(p) as Arc<dyn MempoolAction>).collect();
-		let script_history: Vec<Arc<dyn ScriptHistoryAction>> =
-			provider.iter().map(|p| Arc::clone(p) as Arc<dyn ScriptHistoryAction>).collect();
-
 		let engine = Arc::new(CbfSyncEngine::new(
 			peers,
 			cbf_config.required_peers,
@@ -486,6 +489,36 @@ impl ChainLayer {
 			Arc::clone(&logger),
 			Arc::clone(&node_metrics),
 		)?);
+
+		let provider = fallback
+			.map(|provider| Arc::new(DependentChainAdapter::new(provider, Arc::clone(&logger))));
+		if let Some(provider) = &provider {
+			fee.push(Arc::clone(provider) as Arc<dyn FeeAction>);
+		}
+		fee.push(Arc::new(CbfDerivedFee::new(Arc::clone(&engine), Arc::clone(&logger))));
+
+		let mut broadcast: Vec<Arc<dyn BroadcastAction>> =
+			provider.iter().map(|p| Arc::clone(p) as Arc<dyn BroadcastAction>).collect();
+		broadcast.push(Arc::new(CbfP2pBroadcast::new(Arc::clone(&engine), Arc::clone(&logger))));
+
+		#[cfg(feature = "swaps")]
+		let tx_status: Vec<Arc<dyn TxStatusAction>> = {
+			let watch: Arc<dyn TxStatusAction> =
+				Arc::new(CbfWatchTxStatus::new(Arc::clone(engine.watch_ledger())));
+			std::iter::once(watch)
+				.chain(provider.iter().map(|p| Arc::clone(p) as Arc<dyn TxStatusAction>))
+				.collect()
+		};
+
+		let mempool: Vec<Arc<dyn MempoolAction>> =
+			provider.iter().map(|p| Arc::clone(p) as Arc<dyn MempoolAction>).collect();
+		let script_history: Vec<Arc<dyn ScriptHistoryAction>> =
+			provider.iter().map(|p| Arc::clone(p) as Arc<dyn ScriptHistoryAction>).collect();
+
+		let utxo: Option<Arc<dyn UtxoCapability>> = cbf_config.utxo_source.then(|| {
+			Arc::new(CbfUtxoSource::new(Arc::clone(&engine), Arc::clone(&logger)))
+				as Arc<dyn UtxoCapability>
+		});
 
 		let slots = ChainSlots {
 			fee: ActionChain::new("fee", FEE_BUDGET, fee, Arc::clone(&logger)),
@@ -509,7 +542,7 @@ impl ChainLayer {
 				script_history,
 				Arc::clone(&logger),
 			),
-			utxo: None,
+			utxo,
 		};
 
 		Ok(Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics))
@@ -658,18 +691,32 @@ impl ChainLayer {
 
 	/// Run `txs` through the BROADCAST chain. An adapter that is not ready is
 	/// `Unavailable` without the round trip.
-	async fn run_broadcast(
-		&self, txs: &[Transaction],
-	) -> Result<Answered<()>, ChainActionError<BroadcastRejection>> {
-		self.slots
+	///
+	/// Besides the chain's verdict, the run keeps every transaction some
+	/// adapter reported as on the network — accepted, or already known —
+	/// whether or not the package as a whole got there. A package one adapter
+	/// half-sent before the chain ran out is not un-sent by the exhaustion.
+	async fn run_broadcast(&self, txs: &[Transaction]) -> BroadcastRun {
+		let accepted = Mutex::new(HashSet::new());
+		// A reference, so the `Fn` closure copies it into each future rather
+		// than moving the set into the first.
+		let accepted_ref = &accepted;
+		let outcome = self
+			.slots
 			.broadcast
 			.run(|a| async move {
 				if !a.ready().await {
 					return Err(ChainActionError::unavailable("not ready"));
 				}
-				a.broadcast_package(txs).await
+				let outcomes = a.broadcast_package(txs).await?;
+				accepted_ref
+					.lock()
+					.unwrap_or_else(|e| e.into_inner())
+					.extend(accepted_txids(&outcomes));
+				package_result(outcomes)
 			})
-			.await
+			.await;
+		BroadcastRun { outcome, accepted: accepted.into_inner().unwrap_or_else(|e| e.into_inner()) }
 	}
 
 	/// One package through the BROADCAST chain, then the shared tail.
@@ -686,9 +733,13 @@ impl ChainLayer {
 	///   package is unconfirmed now, because nothing else ever will; an
 	///   engine with a mempool view sees its own transactions come back and
 	///   is left alone.
-	/// * exhausted — logged at error and dropped, as lossy as pre-seam.
+	/// * exhausted — logged at error and dropped, as lossy as pre-seam. But a
+	///   transaction some adapter did hand to the network before the chain
+	///   ran out is not dropped: an engine that tracks its own broadcasts is
+	///   told it is unconfirmed, exactly as it would have been had the whole
+	///   package gone, so the coins it spent stop being offered again.
 	async fn broadcast_package(&self, package: Vec<Transaction>) {
-		let outcome = self.run_broadcast(&package).await;
+		let BroadcastRun { outcome, accepted } = self.run_broadcast(&package).await;
 
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 		let echo_own = self.engine.tracks_own_broadcasts();
@@ -714,13 +765,29 @@ impl ChainLayer {
 					reason
 				);
 				for tx in &package {
-					log_trace!(
-						self.shared.logger,
-						"Dropped broadcast transaction {}",
-						tx.compute_txid()
-					);
+					if !accepted.contains(&tx.compute_txid()) {
+						log_trace!(
+							self.shared.logger,
+							"Dropped broadcast transaction {}",
+							tx.compute_txid()
+						);
+					}
 				}
-				return;
+				if !echo_own || accepted.is_empty() {
+					return;
+				}
+				log_debug!(
+					self.shared.logger,
+					"{} of the package's transaction(s) reached the network before the chain \
+					 was exhausted; recording them as unconfirmed",
+					accepted.len()
+				);
+				let sent = package
+					.into_iter()
+					.filter(|tx| accepted.contains(&tx.compute_txid()))
+					.map(|tx| (tx, now))
+					.collect();
+				(sent, Vec::new())
 			},
 			Err(ChainActionError::Rejected(rejected)) => {
 				for (txid, reason) in &rejected {
@@ -864,7 +931,7 @@ impl ChainLayer {
 	/// node's operator can tell the two apart. The transaction is not this
 	/// node's own, so the shared tail does not run for it.
 	pub(crate) async fn serve_broadcast(&self, tx: &Transaction) -> Result<(), Error> {
-		match self.run_broadcast(std::slice::from_ref(tx)).await {
+		match self.run_broadcast(std::slice::from_ref(tx)).await.outcome {
 			Ok(_) => Ok(()),
 			Err(ChainActionError::Unavailable { reason, .. }) => {
 				log_error!(
@@ -1032,6 +1099,21 @@ impl ChainLayer {
 		self.observe_tx(txid, script_pubkey).await
 	}
 
+	/// Tell the engine to watch `txid` for the TX_STATUS slot, with the output
+	/// script it can be found by. An engine that answers from its chain
+	/// source at query time ignores this; a filter-driven one needs it before
+	/// the transaction confirms. See [`SyncEngine::watch_tx`].
+	#[cfg(feature = "swaps")]
+	pub(crate) fn watch_swap_tx(&self, txid: Txid, script_pubkey: ScriptBuf) {
+		self.engine.watch_tx(txid, script_pubkey)
+	}
+
+	/// The counterpart of [`ChainLayer::watch_swap_tx`].
+	#[cfg(feature = "swaps")]
+	pub(crate) fn unwatch_swap_tx(&self, txid: &Txid) {
+		self.engine.unwatch_tx(txid)
+	}
+
 	/// The shared on-chain fee estimator (Peerswap native primitive B6; also what a chain
 	/// listener hands a channel monitor it rewinds on its own).
 	pub(crate) fn fee_estimator(&self) -> &Arc<OnchainFeeEstimator> {
@@ -1079,7 +1161,6 @@ mod tests {
 	use std::time::Duration;
 
 	use bdk_chain::BlockId;
-	use bdk_wallet::Wallet as BdkWallet;
 	use bitcoin::hashes::Hash;
 	use bitcoin::{
 		absolute, transaction, Amount, BlockHash, Network, OutPoint, ScriptBuf, Sequence, TxIn,
@@ -1088,19 +1169,13 @@ mod tests {
 	use lightning::chain::chaininterface::BroadcasterInterface;
 	use lightning::util::test_utils::TestStore;
 
-	use crate::chain::seam::{ActionResult, MempoolScope};
+	use crate::chain::seam::{ActionResult, MempoolScope, PackageOutcomes, TxBroadcastOutcome};
+	use crate::chain::test_wallet::fresh_regtest_wallet;
 	use crate::chain::wire_convert::{script_to_wire, tx_to_wire, txid_to_wire};
-	use crate::io::{
-		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
-	};
 	use crate::tx_broadcaster::TransactionBroadcaster;
-	use crate::types::PaymentStore;
-	use crate::wallet::persist::KVStoreWalletPersister;
 
 	use async_trait::async_trait;
 
-	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
-	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
 	const FUNDING_SATS: u64 = 100_000;
 
 	/// What one fake adapter does with a package.
@@ -1110,6 +1185,9 @@ mod tests {
 		NotReady,
 		/// Rejects exactly these txids and accepts the rest of the package.
 		Reject(Vec<Txid>),
+		/// Accepts exactly these txids and cannot send the rest: the shape of
+		/// a backend that went away halfway through a package.
+		AcceptOnly(Vec<Txid>),
 	}
 
 	struct FakeBroadcast {
@@ -1140,20 +1218,39 @@ mod tests {
 
 		async fn broadcast_package(
 			&self, txs: &[Transaction],
-		) -> ActionResult<(), BroadcastRejection> {
+		) -> ActionResult<PackageOutcomes, BroadcastRejection> {
 			self.calls.fetch_add(1, Ordering::SeqCst);
+			let txids = txs.iter().map(|tx| tx.compute_txid());
 			match &self.behaviour {
-				Behaviour::Ok => Ok(()),
+				Behaviour::Ok => {
+					Ok(txids.map(|txid| (txid, TxBroadcastOutcome::Accepted)).collect())
+				},
 				Behaviour::Unavailable | Behaviour::NotReady => {
 					Err(ChainActionError::unavailable(format!("{} is down", self.name)))
 				},
-				Behaviour::Reject(txids) => Err(ChainActionError::Rejected(
-					txs.iter()
-						.map(|tx| tx.compute_txid())
-						.filter(|txid| txids.contains(txid))
-						.map(|txid| (txid, "policy".to_string()))
-						.collect(),
-				)),
+				Behaviour::Reject(rejected) => Ok(txids
+					.map(|txid| {
+						let outcome = if rejected.contains(&txid) {
+							TxBroadcastOutcome::Rejected("policy".to_string())
+						} else {
+							TxBroadcastOutcome::Accepted
+						};
+						(txid, outcome)
+					})
+					.collect()),
+				Behaviour::AcceptOnly(accepted) => Ok(txids
+					.map(|txid| {
+						let outcome = if accepted.contains(&txid) {
+							TxBroadcastOutcome::Accepted
+						} else {
+							TxBroadcastOutcome::Unavailable {
+								reason: format!("{} went away", self.name),
+								timed_out: false,
+							}
+						};
+						(txid, outcome)
+					})
+					.collect()),
 			}
 		}
 	}
@@ -1283,28 +1380,7 @@ mod tests {
 		kv_store: &Arc<DynStore>, broadcaster: &Arc<Broadcaster>,
 		fee_estimator: &Arc<OnchainFeeEstimator>, logger: &Arc<Logger>,
 	) -> Arc<Wallet> {
-		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
-		let mut persister = KVStoreWalletPersister::new(Arc::clone(kv_store), Arc::clone(logger));
-		let bdk_wallet = BdkWallet::create(EXTERNAL_DESCRIPTOR, INTERNAL_DESCRIPTOR)
-			.network(Network::Regtest)
-			.create_wallet(&mut persister)
-			.expect("valid test descriptors");
-		let payment_store = Arc::new(PaymentStore::new(
-			Vec::new(),
-			PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE.to_string(),
-			PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE.to_string(),
-			Arc::clone(kv_store),
-			Arc::clone(logger),
-		));
-		Arc::new(Wallet::new(
-			bdk_wallet,
-			persister,
-			Arc::clone(broadcaster),
-			Arc::clone(fee_estimator),
-			payment_store,
-			config,
-			Arc::clone(logger),
-		))
+		fresh_regtest_wallet(kv_store, broadcaster, fee_estimator, logger)
 	}
 
 	fn build(spec: HarnessSpec) -> Harness {
@@ -1574,6 +1650,54 @@ mod tests {
 		assert_eq!(total_sats(&h.wallet), FUNDING_SATS, "exactly one deposit is spendable again");
 	}
 
+	/// N3: a package one adapter half-sent before the chain ran out is not
+	/// un-sent by the exhaustion. The engine that tracks its own broadcasts
+	/// is told about the transactions that did reach the network — and only
+	/// those — while an engine with a mempool view is left alone as ever.
+	#[tokio::test]
+	async fn exhausted_chain_still_echoes_the_accepted_subset() {
+		let h = harness(&[], true);
+		let deposit_a = deposit(&h.wallet, 1);
+		let deposit_b = deposit(&h.wallet, 2);
+		unconfirmed(&h.wallet, &[&deposit_a, &deposit_b]);
+		let spend_a = spend_of(&deposit_a);
+		let spend_b = spend_of(&deposit_b);
+
+		// The first adapter takes spend_a and then goes away; the second is
+		// down. The package is `Unavailable` and the chain exhausted.
+		let flaky =
+			FakeBroadcast::new("flaky", Behaviour::AcceptOnly(vec![spend_a.compute_txid()]));
+		let down = FakeBroadcast::new("down", Behaviour::Unavailable);
+		let h = harness_with_wallet(&[Arc::clone(&flaky), Arc::clone(&down)], true, h.wallet);
+
+		h.layer.broadcast_package(vec![spend_a.clone(), spend_b.clone()]).await;
+
+		assert_eq!(flaky.calls(), 1);
+		assert_eq!(down.calls(), 1, "the chain went on after the half-sent package");
+		let txids = unconfirmed_txids(&h.wallet);
+		assert!(txids.contains(&spend_a.compute_txid()), "the accepted spend is echoed");
+		assert!(!txids.contains(&spend_b.compute_txid()), "the unsent spend is not");
+		assert_eq!(
+			total_sats(&h.wallet),
+			FUNDING_SATS,
+			"deposit_a is spent as far as the wallet knows; deposit_b is offered again"
+		);
+
+		// An engine with a mempool view learns of its transactions from the
+		// mempool, half-sent or not.
+		let h = harness(&[], false);
+		let deposit_tx = deposit(&h.wallet, 3);
+		unconfirmed(&h.wallet, &[&deposit_tx]);
+		let spend = spend_of(&deposit_tx);
+		let flaky = FakeBroadcast::new("flaky", Behaviour::AcceptOnly(vec![spend.compute_txid()]));
+		let h = harness_with_wallet(&[flaky], false, h.wallet);
+
+		h.layer.broadcast_package(vec![spend.clone(), unrelated(4)]).await;
+
+		assert_eq!(unconfirmed_txids(&h.wallet), vec![deposit_tx.compute_txid()]);
+		assert_eq!(total_sats(&h.wallet), FUNDING_SATS, "the wallet was not told about the spend");
+	}
+
 	#[tokio::test]
 	async fn serve_broadcast_rejected_is_err() {
 		let tx = unrelated(1);
@@ -1824,12 +1948,13 @@ mod tests {
 		)
 	}
 
-	/// The CBF preset with a provider: the external fee source is asked
-	/// before the provider, and every other slot the filters cannot fill is
-	/// the provider's. The CBF adapters slot in around these in T8.
+	/// The hybrid CBF preset: a mempool-aware fee source and the provider
+	/// before the coinbase-derived fallback, the provider's verdict before a
+	/// P2P relay that gives none, what this node saw confirm before what it
+	/// is told, and the slots a filter node cannot fill left to the provider.
 	#[cfg(feature = "cbf")]
 	#[test]
-	fn new_cbf_orders_the_external_fee_before_the_provider() {
+	fn new_cbf_orders_the_borrowed_adapters_around_the_cbf_ones() {
 		let cbf_config = CbfConfig {
 			external_fee: Some(CbfExternalFee::Electrum("tcp://127.0.0.1:1".into())),
 			..CbfConfig::default()
@@ -1843,31 +1968,41 @@ mod tests {
 
 		let slots = layer.slot_adapters();
 		assert_eq!(slots.engine, "cbf");
-		assert_eq!(slots.fee, vec!["electrum", "dependent"]);
-		assert_eq!(slots.broadcast, vec!["dependent"]);
+		assert_eq!(slots.fee, vec!["electrum", "dependent", "cbf_derived"]);
+		assert_eq!(slots.broadcast, vec!["dependent", "cbf_p2p"]);
 		#[cfg(feature = "swaps")]
-		assert_eq!(slots.tx_status, vec!["dependent"]);
+		assert_eq!(slots.tx_status, vec!["cbf_watch", "dependent"]);
 		assert_eq!(slots.mempool, vec!["dependent"]);
 		assert_eq!(slots.script_history, vec!["dependent"]);
-		assert!(slots.utxo.is_none(), "no CBF UTXO source until T8");
+		assert!(slots.utxo.is_none(), "announcements go unverified unless asked for");
 		assert!(layer.has_mempool_chain());
 		assert!(layer.engine.tracks_own_broadcasts(), "the tail must echo own broadcasts");
 		assert!(!layer.engine.serves_mempool(), "a borrowed mempool is never served on");
 	}
 
-	/// A pure CBF node: nothing borrowed, every slot empty until T8 fills it,
-	/// and a mistyped peer is a construction error rather than a dropped entry.
+	/// A pure CBF node: what the filters and the node's own peers give, and
+	/// nothing else — the borrowed slots stay empty, the UTXO source appears
+	/// only when opted into, and a mistyped peer is a construction error
+	/// rather than a dropped entry.
 	#[cfg(feature = "cbf")]
 	#[test]
-	fn new_cbf_without_a_provider_leaves_the_borrowed_slots_empty() {
+	fn new_cbf_without_a_provider_runs_on_the_cbf_adapters_alone() {
 		let layer =
 			cbf_layer(Vec::new(), CbfConfig::default(), None).expect("a well-formed preset");
 		let slots = layer.slot_adapters();
-		assert!(slots.fee.is_empty());
-		assert!(slots.broadcast.is_empty());
+		assert_eq!(slots.fee, vec!["cbf_derived"]);
+		assert_eq!(slots.broadcast, vec!["cbf_p2p"]);
+		#[cfg(feature = "swaps")]
+		assert_eq!(slots.tx_status, vec!["cbf_watch"]);
 		assert!(slots.mempool.is_empty());
 		assert!(slots.script_history.is_empty());
+		assert!(slots.utxo.is_none());
 		assert!(!layer.has_mempool_chain());
+
+		let opted_in = CbfConfig { utxo_source: true, ..CbfConfig::default() };
+		let layer = cbf_layer(Vec::new(), opted_in, None).expect("a well-formed preset");
+		assert_eq!(layer.slot_adapters().utxo, Some(("cbf", UtxoVerification::ExistenceOnly)));
+		assert!(layer.as_utxo_source().is_some(), "the gossip verifier gets a source");
 
 		let err = cbf_layer(vec!["no-port-here".into()], CbfConfig::default(), None)
 			.err()

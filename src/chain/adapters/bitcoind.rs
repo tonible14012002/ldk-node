@@ -25,8 +25,8 @@ use lightning_block_sync::rpc::RpcError;
 use crate::chain::adapters::classify_sendrawtransaction;
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
 use crate::chain::seam::{
-	package_result, ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError,
-	FeeAction, FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, MempoolScope,
+	ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
+	FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, MempoolScope, PackageOutcomes,
 	TxBroadcastOutcome, UtxoCapability, UtxoVerification, ADAPTER_BUDGET_MARGIN,
 	PER_TX_BROADCAST_BUDGET,
 };
@@ -458,12 +458,14 @@ impl BroadcastAction for BitcoindChainAdapter {
 	// features, we should eventually switch to use `submitpackage` via the
 	// `rust-bitcoind-json-rpc` crate rather than just broadcasting individual
 	// transactions.
-	async fn broadcast_package(&self, txs: &[Transaction]) -> ActionResult<(), BroadcastRejection> {
+	async fn broadcast_package(
+		&self, txs: &[Transaction],
+	) -> ActionResult<PackageOutcomes, BroadcastRejection> {
 		let mut outcomes = Vec::with_capacity(txs.len());
 		for tx in txs {
 			outcomes.push((tx.compute_txid(), self.broadcast_tx(tx).await));
 		}
-		package_result(outcomes)
+		Ok(outcomes)
 	}
 }
 

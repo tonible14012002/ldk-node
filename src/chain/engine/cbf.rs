@@ -50,7 +50,7 @@ use crate::chain::cbf::birthday::resolve_birthday;
 use crate::chain::cbf::fee::{new_block_fee_cache, BlockFeeCache};
 use crate::chain::cbf::{
 	mark_syncing, parse_trusted_peer, resume_checkpoint, simplify_sync_state, CbfSyncState,
-	ResumeRefusal, WatchLedger,
+	ResumeRefusal, WatchLedger, CBF_BLOCK_FETCH_TIMEOUT_SECS, CBF_HEADER_LOOKUP_TIMEOUT_SECS,
 };
 use crate::chain::engine::SyncEngine;
 use crate::chain::seam::{MempoolAnswer, MempoolQuery, MempoolScope};
@@ -76,21 +76,10 @@ const INITIAL_BACKOFF_MS: u64 = 500;
 /// Retry matched block downloads before giving up on the node and rebuilding it.
 const CBF_BLOCK_FETCH_RETRIES: u8 = 3;
 
-/// Per-attempt timeout when downloading a matched block from a peer. Kyoto queues the request
-/// and awaits a peer response with no timeout of its own, so a slow or unresponsive peer would
-/// otherwise park the fetch forever. Kept short so a single request is bounded and can be
-/// retried rather than stalling.
-const CBF_BLOCK_FETCH_TIMEOUT_SECS: u64 = 10;
-
 /// How long the restart loop waits for a node it asked to shut down before dropping it. A node
 /// takes the shutdown on its next loop iteration, so this is only ever reached by one wedged
 /// in a peer handshake or a database write.
 const CBF_NODE_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
-
-/// Bound on the header lookup [`SyncEngine::is_on_chain`] makes, for the same reason.
-// Reached only through `is_on_chain`, whose first caller is the hybrid check (T10).
-#[allow(dead_code)]
-const CBF_HEADER_LOOKUP_TIMEOUT_SECS: u64 = 10;
 
 /// Runtime status of the underlying kyoto node.
 enum CbfRuntimeStatus {
@@ -337,9 +326,8 @@ impl CbfSyncEngine {
 	}
 }
 
-// Wired by T8: the CBF adapters — coinbase-derived FEE, P2P BROADCAST, forward-only
-// TX_STATUS and the existence-only UTXO source — read the engine through these.
-#[allow(dead_code)]
+// The CBF adapters — coinbase-derived FEE, P2P BROADCAST, forward-only TX_STATUS and the
+// existence-only UTXO source — read the engine through these.
 impl CbfSyncEngine {
 	/// The live kyoto requester, or `None` while kyoto is not running.
 	pub(crate) fn requester(&self) -> Option<Requester> {
@@ -354,22 +342,16 @@ impl CbfSyncEngine {
 		&self.block_fee_cache
 	}
 
-	/// The scripts LDK asked to watch, on top of the wallet's own.
-	pub(crate) fn registered_scripts(&self) -> &Arc<Mutex<HashSet<ScriptBuf>>> {
-		&self.registered_scripts
-	}
-
-	/// Where watched transactions were seen confirmed.
+	/// Where watched transactions were seen confirmed, and the block the applicator most
+	/// recently applied. Read by the TX_STATUS adapter, which exists with `swaps`.
+	#[cfg_attr(not(feature = "swaps"), allow(dead_code))]
 	pub(crate) fn watch_ledger(&self) -> &Arc<WatchLedger> {
 		&self.watch_ledger
 	}
 
-	/// The block the applicator most recently applied, if any.
-	pub(crate) fn applied_tip(&self) -> Option<BlockId> {
-		self.watch_ledger.tip()
-	}
-
 	/// A simplified, externally-consumable snapshot of the sync state. Never blocks.
+	// Wired by T9: `Node::cbf_sync_status` is its caller.
+	#[allow(dead_code)]
 	pub(crate) fn sync_status(&self) -> CbfSyncStatus {
 		simplify_sync_state(*self.sync_state_tx.borrow())
 	}
@@ -563,6 +545,22 @@ impl SyncEngine for CbfSyncEngine {
 			.lock()
 			.unwrap_or_else(|e| e.into_inner())
 			.insert(output.script_pubkey);
+	}
+
+	/// A swap watch is a `Filter` registration and a ledger entry in one: the script joins the
+	/// match set so the confirming block is fetched, and the ledger records where the
+	/// applicator sees the transaction, which is the only place the TX_STATUS adapter over this
+	/// engine can answer from.
+	#[cfg(feature = "swaps")]
+	fn watch_tx(&self, txid: Txid, script_pubkey: ScriptBuf) {
+		CbfSyncEngine::watch_tx(self, txid, script_pubkey);
+	}
+
+	/// The script stays in the match set — a set that only grows, and a script LDK may still
+	/// watch for its own reasons — but the ledger forgets the transaction.
+	#[cfg(feature = "swaps")]
+	fn unwatch_tx(&self, txid: &Txid) {
+		self.watch_ledger.unwatch(txid);
 	}
 
 	/// Asks kyoto for the header at the block's height and compares hashes. `None` while
