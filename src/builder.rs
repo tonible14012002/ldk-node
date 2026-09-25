@@ -136,6 +136,8 @@ struct RawChainSourceConfig {
 	user: String,
 	password: String,
 	cert_sha256: Option<String>,
+	/// See [`NodeBuilder::set_raw_chain_source_allow_insecure_http`].
+	allow_insecure_http: bool,
 }
 
 // Hand-written so the credentials never reach a log.
@@ -352,6 +354,7 @@ pub struct NodeBuilder {
 	#[cfg(feature = "cbf")]
 	cbf_filter_source: Option<CbfFilterSource>,
 	raw_chain_source_config: Option<RawChainSourceConfig>,
+	raw_chain_source_allow_insecure_http: bool,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -382,6 +385,7 @@ impl NodeBuilder {
 			#[cfg(feature = "cbf")]
 			cbf_filter_source: None,
 			raw_chain_source_config: None,
+			raw_chain_source_allow_insecure_http: false,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
@@ -590,7 +594,8 @@ impl NodeBuilder {
 	/// and filter requests fail.
 	///
 	/// Credentials over plain `http://` are only sent to a loopback host;
-	/// anywhere else use `https://`. A configuration that is refused — a URL
+	/// anywhere else use `https://`, or opt in explicitly with
+	/// [`NodeBuilder::set_raw_chain_source_allow_insecure_http`]. A configuration that is refused — a URL
 	/// or pin that does not parse, credentials over `http://` to another host
 	/// — does not fail the build: it is logged at error, raw serving is off,
 	/// and [`Node::raw_chain_source_status`] says why. Nothing is contacted
@@ -598,9 +603,35 @@ impl NodeBuilder {
 	pub fn set_raw_chain_source_bitcoind_rpc(
 		&mut self, url: String, user: String, password: String, cert_sha256: Option<String>,
 	) -> &mut Self {
-		self.raw_chain_source_config =
-			Some(RawChainSourceConfig { url, user, password, cert_sha256 });
+		self.raw_chain_source_config = Some(RawChainSourceConfig {
+			url,
+			user,
+			password,
+			cert_sha256,
+			allow_insecure_http: false,
+		});
 		self
+	}
+
+	/// Lets the raw chain source set through
+	/// [`NodeBuilder::set_raw_chain_source_bitcoind_rpc`] send its RPC
+	/// credentials over plain `http://` to a host that is not loopback — for
+	/// an RPC port reachable only over a private network (a VPN, a VPC)
+	/// where TLS is not set up. Off by default. When it takes effect the
+	/// node logs a warning at startup naming the host, never the
+	/// credentials: anyone on the path between the two machines can read
+	/// them. Order-independent with the setter it modifies.
+	pub fn set_raw_chain_source_allow_insecure_http(&mut self, allow: bool) -> &mut Self {
+		self.raw_chain_source_allow_insecure_http = allow;
+		self
+	}
+
+	/// The raw source configuration as the build applies it.
+	fn raw_chain_source_config_for_build(&self) -> Option<RawChainSourceConfig> {
+		self.raw_chain_source_config.clone().map(|mut raw| {
+			raw.allow_insecure_http = self.raw_chain_source_allow_insecure_http;
+			raw
+		})
 	}
 
 	/// Configures the [`Node`] instance to connect to a Bitcoin Core node via RPC.
@@ -961,7 +992,7 @@ impl NodeBuilder {
 			self.chain_provider_fallback(),
 			#[cfg(feature = "cbf")]
 			self.cbf_filter_source(),
-			self.raw_chain_source_config.as_ref(),
+			self.raw_chain_source_config_for_build().as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -988,7 +1019,7 @@ impl NodeBuilder {
 			self.chain_provider_fallback(),
 			#[cfg(feature = "cbf")]
 			self.cbf_filter_source(),
-			self.raw_chain_source_config.as_ref(),
+			self.raw_chain_source_config_for_build().as_ref(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1162,6 +1193,15 @@ impl ArcedNodeBuilder {
 			password,
 			cert_sha256,
 		);
+	}
+
+	/// Lets the raw chain source send its credentials over plain `http://`
+	/// to a host that is not loopback; see
+	/// [`NodeBuilder::set_raw_chain_source_allow_insecure_http`].
+	///
+	/// Rust-only for now: not in the UDL.
+	pub fn set_raw_chain_source_allow_insecure_http(&self, allow: bool) {
+		self.inner.write().unwrap().set_raw_chain_source_allow_insecure_http(allow);
 	}
 
 	/// Configures the [`Node`] instance to source its gossip data from the Lightning peer-to-peer
@@ -1705,6 +1745,7 @@ fn build_with_store_internal(
 			Some(raw.user.clone()),
 			Some(raw.password.clone()),
 			raw.cert_sha256.as_deref(),
+			raw.allow_insecure_http,
 		);
 	}
 

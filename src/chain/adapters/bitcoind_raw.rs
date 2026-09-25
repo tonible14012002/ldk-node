@@ -84,13 +84,25 @@
 //! [`RawSourceStatus`]. A URL carrying `user:password@` has them moved into
 //! the basic-auth header and removed from the URL that errors might print.
 //! Over plain `http://` credentials are only sent to a loopback host;
-//! anywhere else the URL must be `https://`.
+//! anywhere else the URL must be `https://` — unless the operator opts in
+//! with `allow_insecure_http` (see [`BitcoindRpcSource::with_options`]), for
+//! an RPC port reachable only over a private network. The node then logs a
+//! warning naming the host at startup.
+//!
+//! # Readiness
+//!
+//! A bitcoind still in initial block download, or whose filter index has not
+//! caught up with its chain, answers some questions and not others. The
+//! source reads `getindexinfo` and `getblockchaininfo` on first contact and
+//! again at most every [`READINESS_REFRESH`], and keeps what they say in
+//! [`RawSourceStatus`]: whether the index is there and how far it has got,
+//! and — while the source cannot serve yet — why not.
 
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -106,6 +118,7 @@ use serde_json::{json, Value};
 use crate::chain::cbf::source::{
 	BlockFilter, BlockId, FilterHeader, FilterHeaders, FilterSource, IndexedFilter, SourceError,
 };
+use crate::chain::filter_scan::{HeaderState, ScanSource};
 use crate::chain::provider::{
 	MAX_FILTERS_PER_REQUEST, MAX_FILTER_HEADERS_PER_REQUEST, MAX_HEADERS_PER_REQUEST,
 };
@@ -142,6 +155,86 @@ const NO_FILTER_INDEX_MARKER: &str = "Index is not enabled for filtertype";
 /// index — stable, so logs and status can say plainly what is missing.
 pub(crate) const NO_FILTER_INDEX_REASON: &str = "rpc source has no blockfilterindex";
 
+/// How often, at most, the source re-reads `getindexinfo` and
+/// `getblockchaininfo`; see the module docs.
+pub(crate) const READINESS_REFRESH: Duration = Duration::from_secs(30);
+
+/// The key `getindexinfo` reports the basic block filter index under.
+const BASIC_FILTER_INDEX_KEY: &str = "basic block filter index";
+
+/// What `getindexinfo` and `getblockchaininfo` said about a bitcoind's
+/// readiness to serve. Every field is `None` when the call did not answer —
+/// an older bitcoind has no `getindexinfo`, and a restricted RPC user may not
+/// be allowed either call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SourceReadiness {
+	/// Whether the basic block filter index is enabled.
+	pub(crate) has_filter_index: Option<bool>,
+	/// Whether the index has caught up with the chain.
+	pub(crate) filter_index_synced: Option<bool>,
+	/// The height the index has reached.
+	pub(crate) filter_index_height: Option<u32>,
+	/// Whether bitcoind is in initial block download.
+	pub(crate) initial_block_download: Option<bool>,
+	/// Blocks bitcoind has validated.
+	pub(crate) blocks: Option<u32>,
+	/// Headers bitcoind knows of.
+	pub(crate) headers: Option<u32>,
+}
+
+impl SourceReadiness {
+	/// Fold in a `getindexinfo` result.
+	pub(crate) fn apply_index_info(&mut self, info: &Value) {
+		let Some(indexes) = info.as_object() else { return };
+		match indexes.get(BASIC_FILTER_INDEX_KEY) {
+			Some(index) => {
+				self.has_filter_index = Some(true);
+				self.filter_index_synced = index.get("synced").and_then(Value::as_bool);
+				self.filter_index_height = index
+					.get("best_block_height")
+					.and_then(Value::as_u64)
+					.and_then(|h| u32::try_from(h).ok());
+			},
+			None => {
+				self.has_filter_index = Some(false);
+				self.filter_index_synced = None;
+				self.filter_index_height = None;
+			},
+		}
+	}
+
+	/// Fold in a `getblockchaininfo` result.
+	pub(crate) fn apply_chain_info(&mut self, info: &Value) {
+		let height =
+			|key: &str| info.get(key).and_then(Value::as_u64).and_then(|h| u32::try_from(h).ok());
+		self.initial_block_download = info.get("initialblockdownload").and_then(Value::as_bool);
+		self.blocks = height("blocks");
+		self.headers = height("headers");
+	}
+
+	/// Why the source cannot serve yet, or `None` when nothing says so. A
+	/// missing index is not "not ready" — it never will be — and neither is
+	/// a call that did not answer.
+	pub(crate) fn not_ready_reason(&self) -> Option<String> {
+		let show = |h: Option<u32>| h.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string());
+		if self.initial_block_download == Some(true) {
+			return Some(format!(
+				"bitcoind is in initial block download (block {} of {} headers)",
+				show(self.blocks),
+				show(self.headers)
+			));
+		}
+		if self.has_filter_index == Some(true) && self.filter_index_synced == Some(false) {
+			return Some(format!(
+				"the block filter index is still syncing (height {} of {})",
+				show(self.filter_index_height),
+				show(self.blocks)
+			));
+		}
+		None
+	}
+}
+
 /// How a Pro node's raw chain source is doing, for the operator; see
 /// [`Node::raw_chain_source_status`].
 ///
@@ -162,9 +255,22 @@ pub struct RawSourceStatus {
 	pub last_error: Option<String>,
 	/// When `last_error` happened (UNIX seconds).
 	pub last_error_unix: Option<u64>,
-	/// Whether the bitcoind has `-blockfilterindex`: `None` until a filter
-	/// read answered or said the index is missing.
+	/// Whether the bitcoind has `-blockfilterindex`: from `getindexinfo`,
+	/// read on first contact and refreshed periodically, and from filter
+	/// reads. `None` until one of them answered.
 	pub has_filter_index: Option<bool>,
+	/// The height the block filter index has reached, from `getindexinfo`.
+	/// `None` until read, and without the index.
+	pub filter_index_height: Option<u32>,
+	/// Why the source cannot serve yet — bitcoind in initial block download,
+	/// or its filter index still syncing — or `None` when nothing says so.
+	///
+	/// A raw serve that fails while this is set failed because the source is
+	/// not ready, not because of the request or the transport: an embedding
+	/// app answers it as "not ready", so the asking node moves to another
+	/// source at once rather than retrying this one. The raw tip is refused
+	/// outright while this is set: a tip read mid-sync is not the chain's.
+	pub not_ready: Option<String>,
 }
 
 /// The live [`RawSourceStatus`] a [`BitcoindRpcSource`] keeps up to date.
@@ -217,6 +323,22 @@ impl RawSourceHealth {
 				status.last_error_unix = unix_now();
 			},
 		}
+	}
+
+	/// Notes what `getindexinfo` / `getblockchaininfo` said. A call that did
+	/// not answer leaves what is known alone.
+	pub(crate) fn record_readiness(&self, readiness: &SourceReadiness) {
+		let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+		if let Some(has_index) = readiness.has_filter_index {
+			status.has_filter_index = Some(has_index);
+			status.filter_index_height = readiness.filter_index_height;
+		}
+		status.not_ready = readiness.not_ready_reason();
+	}
+
+	/// Why the source cannot serve yet; see [`RawSourceStatus::not_ready`].
+	pub(crate) fn not_ready(&self) -> Option<String> {
+		self.status.lock().unwrap_or_else(|e| e.into_inner()).not_ready.clone()
 	}
 
 	pub(crate) fn snapshot(&self) -> RawSourceStatus {
@@ -354,6 +476,11 @@ pub(crate) struct BitcoindRpcSource {
 	endpoint: String,
 	next_id: AtomicU64,
 	health: Arc<RawSourceHealth>,
+	/// The host credentials go to over plain `http://`, when the operator
+	/// allowed that for a host that is not loopback.
+	plaintext_credentials_host: Option<String>,
+	/// When readiness was last read; see [`READINESS_REFRESH`].
+	readiness_read_at: Mutex<Option<Instant>>,
 }
 
 impl fmt::Debug for BitcoindRpcSource {
@@ -375,8 +502,23 @@ impl BitcoindRpcSource {
 	/// `cert_sha256` pins the server's leaf certificate and requires
 	/// `https://`. The error is a reason fit for a log: it never carries a
 	/// credential.
+	///
+	/// The node itself builds its sources through [`Self::with_options`].
+	#[cfg(test)]
 	pub(crate) fn new(
 		url: &str, user: Option<String>, password: Option<String>, cert_sha256: Option<&str>,
+	) -> Result<Self, String> {
+		Self::with_options(url, user, password, cert_sha256, false)
+	}
+
+	/// [`Self::new`], with plain-`http://` credentials to a host that is not
+	/// loopback allowed when `allow_insecure_http` is set: for an RPC port
+	/// reachable only over a private network. The credentials then cross
+	/// that network in the clear; [`Self::plaintext_credentials_host`] names
+	/// the host so the caller can say so.
+	pub(crate) fn with_options(
+		url: &str, user: Option<String>, password: Option<String>, cert_sha256: Option<&str>,
+		allow_insecure_http: bool,
 	) -> Result<Self, String> {
 		let mut url = reqwest::Url::parse(url).map_err(|e| format!("invalid rpc url: {}", e))?;
 		let https = match url.scheme() {
@@ -398,13 +540,19 @@ impl BitcoindRpcSource {
 			None => url_auth,
 		};
 
-		if !https && auth.is_some() && !is_loopback_host(&host) {
-			return Err(format!(
-				"refusing to send rpc credentials over plain http:// to {}: use https://, \
-				 or a loopback host (127.0.0.0/8, ::1, localhost)",
-				host
-			));
-		}
+		let plaintext_credentials_host = if !https && auth.is_some() && !is_loopback_host(&host) {
+			if !allow_insecure_http {
+				return Err(format!(
+					"refusing to send rpc credentials over plain http:// to {}: use https://, \
+					 or a loopback host (127.0.0.0/8, ::1, localhost), or allow plain http \
+					 explicitly",
+					host
+				));
+			}
+			Some(host.clone())
+		} else {
+			None
+		};
 
 		let endpoint = match url.port_or_known_default() {
 			Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
@@ -436,7 +584,45 @@ impl BitcoindRpcSource {
 			endpoint,
 			next_id: AtomicU64::new(1),
 			health: Arc::new(RawSourceHealth::new()),
+			plaintext_credentials_host,
+			readiness_read_at: Mutex::new(None),
 		})
+	}
+
+	/// The host this source sends credentials to over plain `http://`, when
+	/// that was allowed for a host that is not loopback; `None` otherwise.
+	pub(crate) fn plaintext_credentials_host(&self) -> Option<&str> {
+		self.plaintext_credentials_host.as_deref()
+	}
+
+	/// Read `getindexinfo` and `getblockchaininfo`. A call that fails leaves
+	/// its fields `None`: an older bitcoind has no `getindexinfo`, and a
+	/// restricted RPC user may be allowed neither.
+	pub(crate) async fn read_readiness(&self) -> SourceReadiness {
+		let timeout = Duration::from_secs(RAW_RPC_CALL_TIMEOUT_SECS);
+		let mut readiness = SourceReadiness::default();
+		if let Ok(info) = self.call("getindexinfo", json!([]), timeout).await {
+			readiness.apply_index_info(&info);
+		}
+		if let Ok(info) = self.call("getblockchaininfo", json!([]), timeout).await {
+			readiness.apply_chain_info(&info);
+		}
+		readiness
+	}
+
+	/// Re-read readiness into the status when it is older than
+	/// [`READINESS_REFRESH`] — or has never been read. Concurrent callers do
+	/// not all re-read: the first one claims the refresh.
+	async fn refresh_readiness(&self) {
+		{
+			let mut read_at = self.readiness_read_at.lock().unwrap_or_else(|e| e.into_inner());
+			if read_at.is_some_and(|at| at.elapsed() < READINESS_REFRESH) {
+				return;
+			}
+			*read_at = Some(Instant::now());
+		}
+		let readiness = self.read_readiness().await;
+		self.health.record_readiness(&readiness);
 	}
 
 	/// `scheme://host:port` of the RPC endpoint, credential-free.
@@ -828,6 +1014,7 @@ impl FilterSource for BitcoindRpcSource {
 	}
 
 	async fn tip(&self) -> Result<BlockId, SourceError> {
+		self.refresh_readiness().await;
 		let result = self.read_tip().await;
 		self.health.record(&result, false);
 		result
@@ -835,6 +1022,7 @@ impl FilterSource for BitcoindRpcSource {
 
 	/// Clamped to [`MAX_HEADERS_PER_REQUEST`]; the contract allows fewer.
 	async fn headers(&self, from_height: u32, count: u32) -> Result<Vec<Header>, SourceError> {
+		self.refresh_readiness().await;
 		let result = self.read_headers(from_height, count).await;
 		self.health.record(&result, false);
 		result
@@ -843,6 +1031,7 @@ impl FilterSource for BitcoindRpcSource {
 	async fn filter_headers(
 		&self, start_height: u32, stop_hash: BlockHash,
 	) -> Result<FilterHeaders, SourceError> {
+		self.refresh_readiness().await;
 		let result = self.read_filter_headers(start_height, stop_hash).await;
 		self.health.record(&result, true);
 		result
@@ -851,15 +1040,104 @@ impl FilterSource for BitcoindRpcSource {
 	async fn filters(
 		&self, start_height: u32, stop_hash: BlockHash,
 	) -> Result<Vec<IndexedFilter>, SourceError> {
+		self.refresh_readiness().await;
 		let result = self.read_filters(start_height, stop_hash).await;
 		self.health.record(&result, true);
 		result
 	}
 
 	async fn block(&self, hash: BlockHash) -> Result<Block, SourceError> {
+		self.refresh_readiness().await;
 		let result = self.read_block(hash).await;
 		self.health.record(&result, false);
 		result
+	}
+}
+
+/// The reads a server-side filter scan makes ([`crate::chain::filter_scan`]),
+/// over the same RPC. Not noted in the health: this impl serves the bitcoind
+/// sync engine's own scans, not the raw serves the status describes.
+#[async_trait]
+impl ScanSource for BitcoindRpcSource {
+	async fn scan_tip(&self) -> Result<(BlockId, Header), SourceError> {
+		let tip = self.read_tip().await?;
+		let header = self.block_header(&tip.hash).await?;
+		Ok((tip, header))
+	}
+
+	async fn hash_at(&self, height: u32) -> Result<Option<BlockHash>, SourceError> {
+		match self
+			.call("getblockhash", json!([height]), Duration::from_secs(RAW_RPC_CALL_TIMEOUT_SECS))
+			.await
+		{
+			Ok(value) => Ok(Some(parse_block_hash(&value, "getblockhash")?)),
+			Err(SourceError::NotFound(_)) => Ok(None),
+			Err(e) => Err(e),
+		}
+	}
+
+	async fn best_hashes(&self, from: u32, count: u32) -> Result<Vec<BlockHash>, SourceError> {
+		if count == 0 {
+			return Ok(Vec::new());
+		}
+		self.best_chain_hashes(from, count).await
+	}
+
+	async fn header_state(&self, hash: &BlockHash) -> Result<Option<HeaderState>, SourceError> {
+		let header = match self
+			.call(
+				"getblockheader",
+				json!([hash.to_string(), true]),
+				Duration::from_secs(RAW_RPC_CALL_TIMEOUT_SECS),
+			)
+			.await
+		{
+			Ok(header) => header,
+			Err(SourceError::NotFound(_)) => return Ok(None),
+			Err(e) => return Err(e),
+		};
+		let prev = match header.get("previousblockhash") {
+			Some(prev) => Some(parse_block_hash(prev, "getblockheader previousblockhash")?),
+			None => None,
+		};
+		Ok(Some(HeaderState {
+			height: parse_height(&header)?,
+			// `confirmations` is -1 for a block off the best chain.
+			in_best_chain: header.get("confirmations").and_then(Value::as_i64).unwrap_or(-1) >= 0,
+			prev,
+		}))
+	}
+
+	async fn block_header(&self, hash: &BlockHash) -> Result<Header, SourceError> {
+		let value = self
+			.call(
+				"getblockheader",
+				json!([hash.to_string(), false]),
+				Duration::from_secs(RAW_RPC_CALL_TIMEOUT_SECS),
+			)
+			.await?;
+		let header: Header = parse_hex(&value, "getblockheader")?;
+		if header.block_hash() != *hash {
+			return Err(SourceError::Invalid(format!(
+				"getblockheader for {} returned another header",
+				hash
+			)));
+		}
+		Ok(header)
+	}
+
+	async fn block_filters(&self, hashes: &[BlockHash]) -> Result<Vec<BlockFilter>, SourceError> {
+		let mut filters = Vec::with_capacity(hashes.len());
+		self.for_each_block_filter(hashes, |filter, _header| {
+			filters.push(filter);
+			Ok(true)
+		})
+		.await?;
+		Ok(filters)
+	}
+
+	async fn full_block(&self, hash: &BlockHash) -> Result<Block, SourceError> {
+		self.read_block(*hash).await
 	}
 }
 
@@ -1022,6 +1300,10 @@ mod tests {
 		filters: Vec<BlockFilter>,
 		filter_headers: Vec<FilterHeader>,
 		filter_index: bool,
+		/// What `getindexinfo` / `getblockchaininfo` answer; `None` answers
+		/// "method not found", as an older bitcoind does.
+		index_info: Option<Value>,
+		chain_info: Option<Value>,
 	}
 
 	impl MockChain {
@@ -1044,7 +1326,14 @@ mod tests {
 					prev
 				})
 				.collect();
-			Self { blocks, filters, filter_headers, filter_index }
+			Self {
+				blocks,
+				filters,
+				filter_headers,
+				filter_index,
+				index_info: None,
+				chain_info: None,
+			}
 		}
 
 		/// Every filter `len` bytes long, the filter headers chained over them.
@@ -1086,7 +1375,12 @@ mod tests {
 				"getblockheader" => {
 					let h = self.height_of(params[0].as_str().unwrap()).ok_or_else(not_found)?;
 					if params[1].as_bool().unwrap() {
-						Ok(json!({ "height": h, "confirmations": self.blocks.len() - h }))
+						let mut header =
+							json!({ "height": h, "confirmations": self.blocks.len() - h });
+						if h > 0 {
+							header["previousblockhash"] = json!(self.blocks[h - 1].block_hash());
+						}
+						Ok(header)
 					} else {
 						Ok(json!(serialize(&self.blocks[h].header).to_lower_hex_string()))
 					}
@@ -1104,6 +1398,12 @@ mod tests {
 				"getblock" => {
 					let h = self.height_of(params[0].as_str().unwrap()).ok_or_else(not_found)?;
 					Ok(json!(serialize(&self.blocks[h]).to_lower_hex_string()))
+				},
+				"getindexinfo" => {
+					self.index_info.clone().ok_or((-32601, "Method not found".into()))
+				},
+				"getblockchaininfo" => {
+					self.chain_info.clone().ok_or((-32601, "Method not found".into()))
 				},
 				_ => Err((-32601, "Method not found".into())),
 			}
@@ -1399,6 +1699,150 @@ mod tests {
 			source.tip().await,
 			Err(SourceError::Unavailable { timed_out: false, .. })
 		));
+	}
+
+	#[test]
+	fn readiness_is_read_from_getindexinfo_and_getblockchaininfo() {
+		let mut r = SourceReadiness::default();
+		assert_eq!(r.not_ready_reason(), None, "nothing known is not \"not ready\"");
+
+		r.apply_index_info(&json!({
+			"txindex": { "synced": true, "best_block_height": 850_000 },
+			"basic block filter index": { "synced": false, "best_block_height": 612_345 },
+		}));
+		assert_eq!(r.has_filter_index, Some(true));
+		assert_eq!(r.filter_index_synced, Some(false));
+		assert_eq!(r.filter_index_height, Some(612_345));
+		r.apply_chain_info(&json!({
+			"chain": "main", "blocks": 850_000, "headers": 850_001,
+			"initialblockdownload": false,
+		}));
+		let reason = r.not_ready_reason().expect("an index still syncing is not ready");
+		assert!(reason.contains("filter index") && reason.contains("612345"), "{}", reason);
+
+		r.apply_chain_info(
+			&json!({ "blocks": 12, "headers": 850_001, "initialblockdownload": true }),
+		);
+		let reason = r.not_ready_reason().expect("IBD is not ready");
+		assert!(
+			reason.contains("initial block download") && reason.contains("850001"),
+			"{}",
+			reason
+		);
+
+		// Synced: ready. No index at all: not "not ready", it never will be.
+		let mut r = SourceReadiness::default();
+		r.apply_index_info(&json!({
+			"basic block filter index": { "synced": true, "best_block_height": 101 },
+		}));
+		r.apply_chain_info(
+			&json!({ "blocks": 101, "headers": 101, "initialblockdownload": false }),
+		);
+		assert_eq!(r.not_ready_reason(), None);
+		assert_eq!(r.filter_index_height, Some(101));
+		let mut r = SourceReadiness::default();
+		r.apply_index_info(&json!({}));
+		assert_eq!((r.has_filter_index, r.filter_index_height), (Some(false), None));
+		assert_eq!(r.not_ready_reason(), None);
+		// Garbage leaves everything unknown.
+		let mut r = SourceReadiness::default();
+		r.apply_index_info(&json!("nope"));
+		r.apply_chain_info(&json!([]));
+		assert_eq!(r, SourceReadiness::default());
+	}
+
+	#[tokio::test]
+	async fn the_status_carries_the_index_and_readiness_from_first_contact() {
+		let mut chain = MockChain::new(6, true);
+		chain.index_info = Some(json!({
+			"basic block filter index": { "synced": false, "best_block_height": 3 },
+		}));
+		chain.chain_info =
+			Some(json!({ "blocks": 5, "headers": 5, "initialblockdownload": false }));
+		let mock = mock_bitcoind(chain, None);
+		let source = BitcoindRpcSource::new(&mock.url, None, None, None).unwrap();
+		source.tip().await.unwrap();
+		let status = source.health().snapshot();
+		assert_eq!(status.has_filter_index, Some(true), "known before any filter read");
+		assert_eq!(status.filter_index_height, Some(3));
+		let not_ready = status.not_ready.expect("the index is behind");
+		assert!(not_ready.contains("syncing"), "{}", not_ready);
+		assert_eq!(source.health().not_ready(), Some(not_ready));
+
+		// An older bitcoind without either call: nothing claimed.
+		let mock = mock_bitcoind(MockChain::new(3, true), None);
+		let source = BitcoindRpcSource::new(&mock.url, None, None, None).unwrap();
+		source.tip().await.unwrap();
+		let status = source.health().snapshot();
+		assert_eq!((status.has_filter_index, status.filter_index_height), (None, None));
+		assert_eq!(status.not_ready, None);
+	}
+
+	#[test]
+	fn plain_http_credentials_to_another_host_need_the_explicit_opt_in() {
+		let open = |url: &str, allow: bool| {
+			BitcoindRpcSource::with_options(
+				url,
+				Some("user".into()),
+				Some("s3cret".into()),
+				None,
+				allow,
+			)
+		};
+		let err = open("http://10.0.0.5:8332", false).expect_err("refused without the opt-in");
+		assert!(err.contains("allow plain http"), "{}", err);
+
+		let source = open("http://10.0.0.5:8332", true).expect("allowed with the opt-in");
+		assert_eq!(source.plaintext_credentials_host(), Some("10.0.0.5"));
+		assert_eq!(source.auth.as_ref().map(|(u, _)| u.as_str()), Some("user"));
+		assert!(!format!("{:?}", source).contains("s3cret"));
+
+		// Nothing to warn about where nothing crosses a network in the clear.
+		for url in ["http://127.0.0.1:8332", "https://node.example:8443"] {
+			assert_eq!(open(url, true).unwrap().plaintext_credentials_host(), None, "{}", url);
+		}
+		let no_creds =
+			BitcoindRpcSource::with_options("http://10.0.0.5:8332", None, None, None, true)
+				.unwrap();
+		assert_eq!(no_creds.plaintext_credentials_host(), None);
+		// The opt-in does not relax the pin rule.
+		let pin = "ab".repeat(32);
+		assert!(BitcoindRpcSource::with_options("http://10.0.0.5", None, None, Some(&pin), true)
+			.is_err());
+	}
+
+	#[tokio::test]
+	async fn the_scan_reads_go_over_the_same_rpc() {
+		let chain = MockChain::new(8, true);
+		let blocks = chain.blocks.clone();
+		let filters = chain.filters.clone();
+		let mock = mock_bitcoind(chain, None);
+		let source = BitcoindRpcSource::new(&mock.url, None, None, None).unwrap();
+
+		let (tip, header) = source.scan_tip().await.unwrap();
+		assert_eq!(tip, BlockId { height: 7, hash: blocks[7].block_hash() });
+		assert_eq!(header, blocks[7].header);
+		assert_eq!(source.hash_at(3).await.unwrap(), Some(blocks[3].block_hash()));
+		assert_eq!(source.hash_at(8).await.unwrap(), None, "above the tip");
+		assert_eq!(
+			source.best_hashes(5, 10).await.unwrap(),
+			blocks[5..].iter().map(|b| b.block_hash()).collect::<Vec<_>>()
+		);
+
+		let state = source.header_state(&blocks[4].block_hash()).await.unwrap().unwrap();
+		assert_eq!(
+			state,
+			HeaderState { height: 4, in_best_chain: true, prev: Some(blocks[3].block_hash()) }
+		);
+		let genesis = source.header_state(&blocks[0].block_hash()).await.unwrap().unwrap();
+		assert_eq!(genesis.prev, None);
+		let stranger = synthetic_block(10, 999).block_hash();
+		assert_eq!(source.header_state(&stranger).await.unwrap(), None);
+
+		let hashes: Vec<BlockHash> = blocks[2..6].iter().map(|b| b.block_hash()).collect();
+		assert_eq!(source.block_filters(&hashes).await.unwrap(), filters[2..6].to_vec());
+		assert_eq!(source.full_block(&hashes[1]).await.unwrap(), blocks[3]);
+		assert_eq!(source.block_header(&hashes[1]).await.unwrap(), blocks[3].header);
 	}
 
 	/// Mac probe against a public mainnet RPC (no filter index there):

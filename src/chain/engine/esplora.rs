@@ -421,6 +421,7 @@ impl SyncEngine for EsploraSyncEngine {
 			tip_header_hex: header_to_wire(&tip_header),
 			confirmed,
 			unconfirmed,
+			server_tip: None,
 		})
 	}
 

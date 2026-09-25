@@ -126,6 +126,41 @@ where
 			.collect()
 	}
 
+	/// The wallet's outputs whose spend a filter-scanning chain provider must
+	/// be able to recognise: every unspent one, every one spent by a
+	/// transaction not yet confirmed, and every one spent less than
+	/// `reorg_depth` blocks below the tip — a reorg can put that spend back
+	/// on the market.
+	///
+	/// A block filter tells the provider that a block spends one of the
+	/// wallet's scripts; within the block a spend shows only the outpoint it
+	/// spends, so this is what lets the provider tell which transaction it
+	/// was. See [`crate::chain::provider::WireSyncRequest::owned_outpoints`].
+	pub(crate) fn outpoints_for_spend_watch(&self, reorg_depth: u32) -> Vec<bitcoin::OutPoint> {
+		use bdk_chain::{CanonicalizationParams, ChainPosition};
+
+		let inner = self.inner.lock().unwrap();
+		let tip = inner.latest_checkpoint().block_id();
+		let outpoints = inner.spk_index().outpoints().iter().cloned();
+		inner
+			.tx_graph()
+			.filter_chain_txouts(
+				inner.local_chain(),
+				tip,
+				CanonicalizationParams::default(),
+				outpoints,
+			)
+			.filter(|(_, txo)| match &txo.spent_by {
+				None => true,
+				Some((ChainPosition::Unconfirmed { .. }, _)) => true,
+				Some((ChainPosition::Confirmed { anchor, .. }, _)) => {
+					anchor.block_id.height.saturating_add(reorg_depth) > tip.height
+				},
+			})
+			.map(|(_, txo)| txo.outpoint)
+			.collect()
+	}
+
 	pub(crate) fn get_cached_txs(&self) -> Vec<Arc<Transaction>> {
 		self.inner.lock().unwrap().tx_graph().full_txs().map(|tx_node| tx_node.tx).collect()
 	}

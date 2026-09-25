@@ -178,6 +178,7 @@ pub(crate) fn sync_request_to_wire(mut req: SyncRequest<(KeychainKind, u32)>) ->
 		outpoints,
 		full_scan: false,
 		stop_gap: 0,
+		owned_outpoints: Vec::new(),
 	}
 }
 
@@ -214,6 +215,7 @@ pub(crate) fn full_scan_request_batch_to_wire(
 		outpoints: Vec::new(),
 		full_scan: true,
 		stop_gap,
+		owned_outpoints: Vec::new(),
 	}
 }
 
@@ -421,7 +423,15 @@ pub(crate) fn tx_update_to_wire(
 
 	let checkpoints = chain_update.as_ref().map(checkpoint_to_wire).unwrap_or_default();
 
-	WireUpdate { version: CHAIN_WIRE_VERSION, txs, txouts, anchors, seen_ats, checkpoints }
+	WireUpdate {
+		version: CHAIN_WIRE_VERSION,
+		txs,
+		txouts,
+		anchors,
+		seen_ats,
+		checkpoints,
+		server_tip: None,
+	}
 }
 
 // ── RAW BIP157 DATA (both sides) ─────────────────────────────────────────────
@@ -763,6 +773,7 @@ mod tests {
 			outpoints: Vec::new(),
 			full_scan: false,
 			stop_gap: 0,
+			owned_outpoints: Vec::new(),
 		};
 
 		let req = wire_to_sync_request(&wire).unwrap();

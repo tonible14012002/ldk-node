@@ -32,24 +32,41 @@
 //! with the difference. A transaction that moved blocks comes back in
 //! `confirmed` with its new block; one that left the chain comes back in
 //! `unconfirmed`.
+//!
+//! # Serving nodes that scan by block filter
+//!
+//! A Pro node over bitcoind has no script index; it answers by scanning block
+//! filters from where this node left off ([`crate::chain::filter_scan`]). So
+//! each request also says where that is — the wallet's checkpoint chain, the
+//! Lightning sync's best block — and carries what a filter scan cannot work
+//! out alone: the script each watched transaction is registered with, and the
+//! wallet's outputs whose spends must be recognised. An index-backed server
+//! ignores all three.
+//!
+//! Such a server caps what one answer scans, and says so: an answer that
+//! stopped short of its tip carries that tip as `server_tip`. It is followed
+//! at once by another request from where it ended, a bounded number of times
+//! per sync; the next sync continues from wherever that left off.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bitcoin::{BlockHash, Script, Txid};
+use bitcoin::{BlockHash, Script, ScriptBuf, Txid};
 
-use lightning::chain::{Confirm, WatchedOutput};
+use bdk_chain::BlockId;
+
+use lightning::chain::{BestBlock, Confirm, WatchedOutput};
 
 use crate::chain::engine::{run_tx_based_sync_loop, SyncEngine, TxBasedBackend};
 use crate::chain::provider::{
-	ChainDataProvider, WireLightningSyncRequest, WireWatchedOutput, WireWatchedTx,
-	CHAIN_WIRE_VERSION,
+	ChainDataProvider, WireLightningSyncRequest, WireSyncRequest, WireUpdate, WireWatchedOutput,
+	WireWatchedTx, CHAIN_WIRE_VERSION,
 };
 use crate::chain::wire_convert::{
-	block_hash_from_wire, check_version, full_scan_request_batch_to_wire, header_from_wire,
-	outpoint_to_wire, script_to_wire, sync_request_to_wire, tx_from_wire, txid_from_wire,
-	txid_to_wire, wire_update_to_bdk,
+	block_hash_from_wire, block_id_from_wire, block_id_to_wire, check_version,
+	full_scan_request_batch_to_wire, header_from_wire, outpoint_to_wire, script_to_wire,
+	sync_request_to_wire, tx_from_wire, txid_from_wire, txid_to_wire, wire_update_to_bdk,
 };
 use crate::chain::{ChainLayer, WalletSyncStatus};
 use crate::config::{
@@ -76,11 +93,40 @@ const FULL_SCAN_BATCH_SPKS: u32 = 100;
 /// cannot hold a sync open forever.
 const FULL_SCAN_MAX_BATCHES: usize = 50;
 
+/// Rounds of on-chain sync one call makes at most, each continuing from
+/// where a capped answer stopped.
+const ONCHAIN_SYNC_MAX_ROUNDS: usize = 4;
+
+/// Lightning sync passes one call makes at most: a pass is repeated when it
+/// may have stopped short of the tip, or when replaying it registered
+/// something new — which may have confirmed, or been spent, inside the very
+/// blocks the pass covered.
+const LIGHTNING_SYNC_MAX_PASSES: usize = 4;
+
+/// How deep a spend of one of the wallet's outputs must be buried before the
+/// output is no longer offered to the provider for spend recognition; see
+/// [`crate::wallet::Wallet::outpoints_for_spend_watch`].
+const SPEND_WATCH_REORG_DEPTH: u32 = 144;
+
+/// Whether an answer that brought this node to `reached` stopped short of
+/// the serving node's tip, which it then names.
+fn stopped_short(server_tip: Option<&crate::chain::provider::WireBlockId>, reached: u32) -> bool {
+	server_tip.is_some_and(|tip| tip.height > reached)
+}
+
 /// What `Filter` has asked to have watched.
 #[derive(Default)]
 struct WatchedSet {
-	txids: HashSet<Txid>,
+	/// Each transaction with the script it was registered with.
+	txids: HashMap<Txid, ScriptBuf>,
 	outputs: Vec<WatchedOutput>,
+}
+
+impl WatchedSet {
+	/// How many registrations there are, to tell whether a pass added any.
+	fn len(&self) -> usize {
+		self.txids.len() + self.outputs.len()
+	}
 }
 
 pub(crate) struct DependentSyncEngine {
@@ -120,27 +166,52 @@ impl DependentSyncEngine {
 	}
 
 	/// Ask the provider to advance the on-chain wallet, and apply the answer.
-	async fn run_onchain_sync(&self) -> Result<(), Error> {
+	///
+	/// Returns whether the wallet is known to have reached the provider's tip.
+	/// A first sync that did not is not recorded as done, so the next one is
+	/// a full scan again, from where this one stopped.
+	async fn run_onchain_sync(&self) -> Result<bool, Error> {
 		// First sync is a full scan with the configured gap limit; after that,
 		// incremental. Same rule as every other engine.
 		let incremental_sync =
 			self.node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
 
-		let spk_map = self.onchain_wallet.revealed_spk_index();
-
-		if incremental_sync {
-			let request = sync_request_to_wire(self.onchain_wallet.get_incremental_sync_request());
-			let wire_update = self.ask_wallet_sync(request).await?;
-			let update = wire_update_to_bdk(&wire_update, &spk_map).map_err(|e| {
-				log_error!(self.logger, "Chain provider returned an unusable update: {}", e);
-				Error::WalletOperationFailed
-			})?;
-			return self.onchain_wallet.apply_update(update);
+		for _round in 0..ONCHAIN_SYNC_MAX_ROUNDS {
+			let from = self.onchain_wallet.current_best_block().height;
+			let server_tip = if incremental_sync {
+				let spk_map = self.onchain_wallet.revealed_spk_index();
+				let mut request =
+					sync_request_to_wire(self.onchain_wallet.get_incremental_sync_request());
+				request.owned_outpoints = self.owned_outpoints();
+				let wire_update = self.ask_wallet_sync(request).await?;
+				self.apply_wallet_update(&wire_update, &spk_map)?;
+				wire_update.server_tip
+			} else {
+				self.run_full_scan().await?
+			};
+			let reached = self.onchain_wallet.current_best_block().height;
+			if !stopped_short(server_tip.as_ref(), reached) {
+				return Ok(true);
+			}
+			log_info!(
+				self.logger,
+				"On-chain sync advanced from height {} to {} of the provider's {}; continuing",
+				from,
+				reached,
+				server_tip.map(|t| t.height).unwrap_or_default()
+			);
 		}
+		Ok(false)
+	}
 
+	/// One full scan, driven here in bounded batches of scripts. Returns the
+	/// provider's tip when an answer stopped short of it.
+	async fn run_full_scan(&self) -> Result<Option<crate::chain::provider::WireBlockId>, Error> {
+		let mut server_tip = None;
+		let spk_map = self.onchain_wallet.revealed_spk_index();
 		let mut full_scan = self.onchain_wallet.get_full_scan_request();
 		for batch in 0..FULL_SCAN_MAX_BATCHES {
-			let request = full_scan_request_batch_to_wire(
+			let mut request = full_scan_request_batch_to_wire(
 				&mut full_scan,
 				FULL_SCAN_BATCH_SPKS,
 				BDK_CLIENT_STOP_GAP as u32,
@@ -148,17 +219,16 @@ impl DependentSyncEngine {
 			if request.spks.is_empty() {
 				break;
 			}
+			request.owned_outpoints = self.owned_outpoints();
 
 			let wire_update = self.ask_wallet_sync(request).await?;
 			// Every batch is applied as it arrives rather than accumulated:
 			// a later batch failing then leaves the wallet with the progress
 			// already made instead of discarding all of it.
 			let had_activity = !wire_update.txs.is_empty();
-			let update = wire_update_to_bdk(&wire_update, &spk_map).map_err(|e| {
-				log_error!(self.logger, "Chain provider returned an unusable update: {}", e);
-				Error::WalletOperationFailed
-			})?;
-			self.onchain_wallet.apply_update(update)?;
+			self.apply_wallet_update(&wire_update, &spk_map)?;
+			// Every batch scans the same blocks; any one capped means all were.
+			server_tip = server_tip.or(wire_update.server_tip);
 
 			if !had_activity {
 				// A batch with no activity at all satisfies the gap limit for
@@ -175,13 +245,31 @@ impl DependentSyncEngine {
 				);
 			}
 		}
-
-		Ok(())
+		Ok(server_tip)
 	}
 
-	async fn ask_wallet_sync(
-		&self, request: crate::chain::provider::WireSyncRequest,
-	) -> Result<crate::chain::provider::WireUpdate, Error> {
+	/// The wallet's outputs whose spends a filter-scanning provider must
+	/// recognise, in wire form.
+	fn owned_outpoints(&self) -> Vec<crate::chain::provider::WireOutPoint> {
+		self.onchain_wallet
+			.outpoints_for_spend_watch(SPEND_WATCH_REORG_DEPTH)
+			.iter()
+			.map(outpoint_to_wire)
+			.collect()
+	}
+
+	fn apply_wallet_update(
+		&self, wire_update: &WireUpdate,
+		spk_map: &HashMap<ScriptBuf, (bdk_wallet::KeychainKind, u32)>,
+	) -> Result<(), Error> {
+		let update = wire_update_to_bdk(wire_update, spk_map).map_err(|e| {
+			log_error!(self.logger, "Chain provider returned an unusable update: {}", e);
+			Error::WalletOperationFailed
+		})?;
+		self.onchain_wallet.apply_update(update)
+	}
+
+	async fn ask_wallet_sync(&self, request: WireSyncRequest) -> Result<WireUpdate, Error> {
 		let fut = tokio::time::timeout(
 			Duration::from_secs(BDK_WALLET_SYNC_TIMEOUT_SECS),
 			self.provider.wallet_sync(request),
@@ -227,7 +315,17 @@ impl TxBasedBackend for DependentSyncEngine {
 		let now = Instant::now();
 
 		let res = match self.run_onchain_sync().await {
-			Ok(()) => {
+			Ok(false) if !incremental_sync => {
+				// Not recorded as done: the next sync scans on from here.
+				log_info!(
+					self.logger,
+					"First sync of on-chain wallet reached height {} in {}ms and continues next time.",
+					self.onchain_wallet.current_best_block().height,
+					now.elapsed().as_millis()
+				);
+				Ok(())
+			},
+			Ok(_) => {
 				log_info!(
 					self.logger,
 					"{} of on-chain wallet finished in {}ms.",
@@ -276,7 +374,8 @@ impl TxBasedBackend for DependentSyncEngine {
 			&*output_sweeper as &(dyn Confirm + Sync + Send),
 		];
 
-		let res = self.run_lightning_sync(&confirmables).await;
+		let res =
+			self.run_lightning_sync(&confirmables, channel_manager.current_best_block()).await;
 
 		match res {
 			Ok(()) => {
@@ -307,10 +406,41 @@ impl TxBasedBackend for DependentSyncEngine {
 }
 
 impl DependentSyncEngine {
-	/// Ask about everything being tracked and replay the answer into `Confirm`.
+	/// Bring `Confirm` up to the provider's tip from `best_block`, the block
+	/// it has synced to; see the module docs for why that can take more than
+	/// one pass.
 	async fn run_lightning_sync(
-		&self, confirmables: &[&(dyn Confirm + Sync + Send)],
+		&self, confirmables: &[&(dyn Confirm + Sync + Send)], best_block: BestBlock,
 	) -> Result<(), Error> {
+		let mut scan_from = BlockId { height: best_block.height, hash: best_block.block_hash };
+		for _pass in 0..LIGHTNING_SYNC_MAX_PASSES {
+			let registered = self.watched.lock().unwrap().len();
+			let (tip, server_tip) = self.lightning_sync_pass(confirmables, scan_from).await?;
+			if self.watched.lock().unwrap().len() != registered {
+				// Replaying the answer registered something: it may have
+				// confirmed, or been spent, in the blocks just covered. Ask
+				// about the same blocks again; what is already known is
+				// skipped or replayed harmlessly.
+				log_trace!(
+					self.logger,
+					"Lightning sync registered new items; covering the same blocks again"
+				);
+				continue;
+			}
+			if !stopped_short(server_tip.as_ref(), tip.height) {
+				break;
+			}
+			scan_from = tip;
+		}
+		Ok(())
+	}
+
+	/// Ask about everything being tracked, from `scan_from`, and replay the
+	/// answer into `Confirm`. Returns the tip the answer brought `Confirm` to,
+	/// and the provider's own tip when that was short of it.
+	async fn lightning_sync_pass(
+		&self, confirmables: &[&(dyn Confirm + Sync + Send)], scan_from: BlockId,
+	) -> Result<(BlockId, Option<crate::chain::provider::WireBlockId>), Error> {
 		// What LDK still considers relevant, plus anything `Filter`
 		// registered that has never been seen. The block hash LDK carries is
 		// authoritative — it is what a reorg has to be detected against.
@@ -325,8 +455,8 @@ impl DependentSyncEngine {
 			let watched = self.watched.lock().unwrap();
 			(watched.txids.clone(), watched.outputs.clone())
 		};
-		for txid in registered_txids {
-			tracked.entry(txid).or_insert(None);
+		for txid in registered_txids.keys() {
+			tracked.entry(*txid).or_insert(None);
 		}
 
 		let request = WireLightningSyncRequest {
@@ -336,6 +466,7 @@ impl DependentSyncEngine {
 				.map(|(txid, block_hash)| WireWatchedTx {
 					txid: txid_to_wire(txid),
 					known_block_hash: block_hash.map(|h| h.to_string()),
+					script_hex: registered_txids.get(txid).map(script_to_wire),
 				})
 				.collect(),
 			outputs: outputs
@@ -346,6 +477,7 @@ impl DependentSyncEngine {
 					block_hash: o.block_hash.map(|h| h.to_string()),
 				})
 				.collect(),
+			scan_from: Some(block_id_to_wire(&scan_from)),
 		};
 
 		let fut = tokio::time::timeout(
@@ -420,11 +552,17 @@ impl DependentSyncEngine {
 		}
 
 		let tip_header = header_from_wire(&response.tip_header_hex).map_err(malformed)?;
+		let tip = block_id_from_wire(&response.tip).map_err(malformed)?;
+		if tip_header.block_hash() != tip.hash {
+			return Err(malformed(crate::chain::provider::ChainProviderError::Malformed(
+				"the tip header is not the tip's".to_string(),
+			)));
+		}
 		for confirmable in confirmables {
-			confirmable.best_block_updated(&tip_header, response.tip.height);
+			confirmable.best_block_updated(&tip_header, tip.height);
 		}
 
-		Ok(())
+		Ok((tip, response.server_tip))
 	}
 }
 
@@ -474,11 +612,39 @@ impl SyncEngine for DependentSyncEngine {
 		.await
 	}
 
-	fn register_tx(&self, txid: &Txid, _script_pubkey: &Script) {
-		self.watched.lock().unwrap().txids.insert(*txid);
+	fn register_tx(&self, txid: &Txid, script_pubkey: &Script) {
+		self.watched.lock().unwrap().txids.insert(*txid, script_pubkey.to_owned());
 	}
 
 	fn register_output(&self, output: WatchedOutput) {
-		self.watched.lock().unwrap().outputs.push(output);
+		let mut watched = self.watched.lock().unwrap();
+		if !watched.outputs.iter().any(|o| o.outpoint == output.outpoint) {
+			watched.outputs.push(output);
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::chain::provider::WireBlockId;
+	use bitcoin::hashes::Hash;
+
+	#[test]
+	fn only_an_answer_naming_a_higher_tip_is_continued() {
+		let tip = |height| WireBlockId { height, hash: String::new() };
+		assert!(!stopped_short(None, 100), "an index-backed answer is complete");
+		assert!(stopped_short(Some(&tip(5000)), 2116), "a capped scan is continued");
+		assert!(!stopped_short(Some(&tip(2116)), 2116), "reached the named tip");
+		assert!(!stopped_short(Some(&tip(2000)), 2116), "a stale name is no reason to ask again");
+	}
+
+	#[test]
+	fn the_watched_set_counts_what_was_registered_once() {
+		let mut set = WatchedSet::default();
+		assert_eq!(set.len(), 0);
+		set.txids.insert(Txid::from_byte_array([1; 32]), ScriptBuf::new());
+		set.txids.insert(Txid::from_byte_array([1; 32]), ScriptBuf::new());
+		assert_eq!(set.len(), 1);
 	}
 }

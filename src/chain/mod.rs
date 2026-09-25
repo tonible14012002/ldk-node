@@ -20,6 +20,7 @@ pub(crate) mod cbf {
 }
 pub(crate) mod electrum;
 pub(crate) mod engine;
+pub(crate) mod filter_scan;
 mod layer;
 pub mod provider;
 pub(crate) mod raw_serve;

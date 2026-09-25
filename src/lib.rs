@@ -1829,10 +1829,18 @@ impl Node {
 
 	/// How this node's raw chain source — the bitcoind set through
 	/// [`Builder::set_raw_chain_source_bitcoind_rpc`] — is doing: when it last
-	/// answered, its last error, and whether it has the block filter index.
+	/// answered, its last error, whether it has the block filter index and how
+	/// far the index has got, and — while it cannot serve yet — why not.
 	/// `configured` is `false` when the configuration was refused at build time
 	/// (raw serving is then off, and `last_error` says why). `None` when no raw
 	/// source was set. Never carries a credential.
+	///
+	/// A raw serve that fails with [`Error::ChainServeFailed`] while
+	/// [`RawSourceStatus::not_ready`] is set failed because the source is not
+	/// ready (initial block download, or a filter index still syncing), not
+	/// because of the request or the transport: an embedding app should answer
+	/// it as "not ready", so the asking node moves on at once instead of
+	/// retrying here.
 	pub fn raw_chain_source_status(&self) -> Option<RawSourceStatus> {
 		self.chain_source.raw_source_status()
 	}

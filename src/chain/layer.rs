@@ -36,7 +36,7 @@ use crate::chain::adapters::electrum::ElectrumChainAdapter;
 use crate::chain::adapters::esplora::EsploraChainAdapter;
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache};
 use crate::chain::cbf::source::FilterSource;
-use crate::chain::engine::bitcoind::BitcoindSyncEngine;
+use crate::chain::engine::bitcoind::{BitcoindSyncEngine, DependentScanServer};
 use crate::chain::engine::dependent::DependentSyncEngine;
 use crate::chain::engine::electrum::ElectrumSyncEngine;
 use crate::chain::engine::esplora::EsploraSyncEngine;
@@ -334,12 +334,17 @@ impl ChainLayer {
 	/// off, not the node: raw serving is a service to other nodes, and this
 	/// node's own Lightning channels must not wait on it. The refusal is
 	/// logged at error and kept for [`Self::raw_source_status`].
+	///
+	/// `allow_insecure_http` lets credentials go over plain `http://` to a
+	/// host that is not loopback; a warning naming the host (never the
+	/// credentials) is logged when that is what the configuration does.
 	pub(crate) fn set_raw_source_bitcoind_rpc(
 		&mut self, url: &str, user: Option<String>, password: Option<String>,
-		cert_sha256: Option<&str>,
+		cert_sha256: Option<&str>, allow_insecure_http: bool,
 	) {
 		let logger = Arc::clone(&self.shared.logger);
-		match BitcoindRpcSource::new(url, user, password, cert_sha256) {
+		match BitcoindRpcSource::with_options(url, user, password, cert_sha256, allow_insecure_http)
+		{
 			Ok(source) => {
 				log_info!(
 					logger,
@@ -347,8 +352,17 @@ impl ChainLayer {
 					source.endpoint(),
 					if cert_sha256.is_some() { " (certificate pinned)" } else { "" }
 				);
-				self.raw_health = Some(source.health());
+				if let Some(host) = source.plaintext_credentials_host() {
+					log_warn!(
+						logger,
+						"Raw chain source: RPC credentials are sent over plain http:// to {} (allowed by configuration); anyone on the network path can read them",
+						host
+					);
+				}
+				let health = source.health();
+				self.raw_health = Some(Arc::clone(&health));
 				self.set_raw_source(Arc::new(source));
+				self.raw = self.raw.take().map(|server| server.with_health(health));
 			},
 			Err(reason) => {
 				log_error!(
@@ -532,10 +546,13 @@ impl ChainLayer {
 		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
 		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
+		let scan_server =
+			Self::dependent_scan_server(&rpc_host, rpc_port, &rpc_user, &rpc_password, &logger);
 		let api_client =
 			Arc::new(BitcoindClient::new_rpc(rpc_host, rpc_port, rpc_user, rpc_password));
 		Self::from_bitcoind_client(
 			api_client,
+			scan_server,
 			onchain_wallet,
 			fee_estimator,
 			tx_broadcaster,
@@ -553,6 +570,8 @@ impl ChainLayer {
 		rest_client_config: BitcoindRestClientConfig, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
+		let scan_server =
+			Self::dependent_scan_server(&rpc_host, rpc_port, &rpc_user, &rpc_password, &logger);
 		let api_client = Arc::new(BitcoindClient::new_rest(
 			rest_client_config.rest_host,
 			rest_client_config.rest_port,
@@ -563,6 +582,7 @@ impl ChainLayer {
 		));
 		Self::from_bitcoind_client(
 			api_client,
+			scan_server,
 			onchain_wallet,
 			fee_estimator,
 			tx_broadcaster,
@@ -573,12 +593,47 @@ impl ChainLayer {
 		)
 	}
 
+	/// The client a bitcoind-backed node scans with when it serves Dependent
+	/// nodes: the same RPC endpoint and credentials the chain source uses,
+	/// over the same plain HTTP — so allowed to any host, as the chain
+	/// source's own client is. `None`, logged, only for an endpoint that does
+	/// not parse; the serves then refuse and the node runs on.
+	fn dependent_scan_server(
+		rpc_host: &str, rpc_port: u16, rpc_user: &str, rpc_password: &str, logger: &Arc<Logger>,
+	) -> Option<Arc<DependentScanServer>> {
+		let host = if rpc_host.contains(':') && !rpc_host.starts_with('[') {
+			format!("[{}]", rpc_host)
+		} else {
+			rpc_host.to_string()
+		};
+		let url = format!("http://{}:{}", host, rpc_port);
+		match BitcoindRpcSource::with_options(
+			&url,
+			Some(rpc_user.to_string()),
+			Some(rpc_password.to_string()),
+			None,
+			true,
+		) {
+			Ok(source) => Some(Arc::new(DependentScanServer::new(source, Arc::clone(logger)))),
+			Err(reason) => {
+				log_error!(
+					logger,
+					"Serving Dependent nodes is off: no RPC client for {}:{}: {}",
+					rpc_host,
+					rpc_port,
+					reason
+				);
+				None
+			},
+		}
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	fn from_bitcoind_client(
-		api_client: Arc<BitcoindClient>, onchain_wallet: Arc<Wallet>,
-		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
-		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		api_client: Arc<BitcoindClient>, scan_server: Option<Arc<DependentScanServer>>,
+		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
+		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
 		let latest_chain_tip = Arc::new(RwLock::new(None));
 
@@ -599,6 +654,7 @@ impl ChainLayer {
 			config,
 			logger: Arc::clone(&logger),
 			node_metrics: Arc::clone(&node_metrics),
+			scan_server,
 		});
 
 		let mempool = vec![Arc::clone(&adapter) as Arc<dyn MempoolAction>];
@@ -2969,6 +3025,7 @@ mod tests {
 			outpoints: Vec::new(),
 			full_scan: false,
 			stop_gap: 0,
+			owned_outpoints: Vec::new(),
 		}
 	}
 
@@ -3374,6 +3431,7 @@ mod tests {
 			version: CHAIN_WIRE_VERSION,
 			txids: Vec::new(),
 			outputs: Vec::new(),
+			scan_from: None,
 		};
 
 		let ok = FakeBroadcast::new("ok", Behaviour::Ok);
@@ -3483,6 +3541,7 @@ mod tests {
 			Some("user".into()),
 			Some("s3cret".into()),
 			None,
+			false,
 		);
 		assert!(matches!(layer.serve_tip().await, Err(Error::ChainServeUnsupported)));
 		let status = layer.raw_source_status().expect("the refusal is reported");
@@ -3490,12 +3549,26 @@ mod tests {
 		let reason = status.last_error.expect("why");
 		assert!(reason.contains("https://") && !reason.contains("s3cret"), "{}", reason);
 
-		layer.set_raw_source_bitcoind_rpc("ftp://nowhere", None, None, None);
+		layer.set_raw_source_bitcoind_rpc("ftp://nowhere", None, None, None, false);
 		assert!(!layer.raw_source_status().unwrap().configured);
 
-		layer.set_raw_source_bitcoind_rpc("http://127.0.0.1:1", None, None, None);
+		layer.set_raw_source_bitcoind_rpc("http://127.0.0.1:1", None, None, None, false);
 		let status = layer.raw_source_status().unwrap();
 		assert!(status.configured && status.last_error.is_none());
+		assert!(layer.raw.is_some(), "raw serving is on");
+
+		// The explicit opt-in lets credentials cross to another host in the
+		// clear: configured, serving.
+		let mut layer = esplora_preset();
+		layer.set_raw_source_bitcoind_rpc(
+			"http://10.1.2.3:8332",
+			Some("user".into()),
+			Some("s3cret".into()),
+			None,
+			true,
+		);
+		let status = layer.raw_source_status().unwrap();
+		assert!(status.configured && status.last_error.is_none(), "{:?}", status);
 		assert!(layer.raw.is_some(), "raw serving is on");
 	}
 

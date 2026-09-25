@@ -338,6 +338,15 @@ pub struct WireSyncRequest {
 	pub full_scan: bool,
 	/// Gap limit for a full scan.
 	pub stop_gap: u32,
+	/// Outputs the asking wallet holds (unspent, or spent by a transaction
+	/// not yet buried), so a serving node that scans by block filter can
+	/// recognise their spends: a filter match says a block touches one of
+	/// the scripts, and within the block a spend shows only the outpoint it
+	/// spends. An index-backed server finds spends by script history and
+	/// ignores this. Absent from a request by an older node; the server then
+	/// recognises only spends of coins it saw arrive during the same scan.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub owned_outpoints: Vec<WireOutPoint>,
 }
 
 /// Everything needed to advance a BDK wallet one sync forward.
@@ -368,6 +377,13 @@ pub struct WireUpdate {
 	/// requesting wallet's existing chain; a gap makes the update
 	/// unapplicable.
 	pub checkpoints: Vec<WireBlockId>,
+	/// Set only on an answer that stopped short of the serving node's tip —
+	/// a filter-scanning server caps what one answer scans — and then that
+	/// tip. The answer is correct up to its last checkpoint; the asker's next
+	/// request, from there, continues the scan. Absent from an index-backed
+	/// server's answer, which always reaches its tip.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub server_tip: Option<WireBlockId>,
 }
 
 // ── LIGHTNING SYNC ───────────────────────────────────────────────────────────
@@ -397,6 +413,12 @@ pub struct WireWatchedTx {
 	/// The block the asking node last saw it confirmed in, hex. `None` means
 	/// it has never seen it confirmed.
 	pub known_block_hash: Option<String>,
+	/// One of the transaction's output scripts, hex — the one registered
+	/// with it through `Filter::register_tx`. A serving node that scans by
+	/// block filter can only find a transaction by a script; an index-backed
+	/// one looks it up by txid and ignores this.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub script_hex: Option<String>,
 }
 
 /// The registered set, sent so the serving node can answer for all of it at
@@ -410,6 +432,15 @@ pub struct WireLightningSyncRequest {
 	pub txids: Vec<WireWatchedTx>,
 	/// Outputs registered through `Filter::register_output`.
 	pub outputs: Vec<WireWatchedOutput>,
+	/// The block the asking node has synced to. A serving node that scans by
+	/// block filter scans the blocks after it — or after the point where its
+	/// branch left the best chain — rather than the whole chain; an answer
+	/// that could not reach the tip reports the last block it scanned as
+	/// `tip`, and the next request continues from there. An index-backed
+	/// server ignores it. Absent from a request by an older node; the server
+	/// then scans the last day of blocks.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub scan_from: Option<WireBlockId>,
 }
 
 /// A transaction found in a block, with everything LDK's
@@ -444,6 +475,11 @@ pub struct WireLightningSyncResponse {
 	/// Registered transactions the serving node no longer finds in the best
 	/// chain — a reorg, or a dropped transaction. Hex txids.
 	pub unconfirmed: Vec<String>,
+	/// Set only when `tip` is not the serving node's tip but the last block a
+	/// capped filter scan reached, and then the serving node's tip; see
+	/// [`WireUpdate::server_tip`]. The next request, from `tip`, continues.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub server_tip: Option<WireBlockId>,
 }
 
 // ── RAW BIP157 DATA ──────────────────────────────────────────────────────────

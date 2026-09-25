@@ -55,6 +55,7 @@ use std::time::Duration;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::BlockHash;
 
+use crate::chain::adapters::bitcoind_raw::RawSourceHealth;
 use crate::chain::cbf::source::{FilterHeaders, FilterSource, IndexedFilter, SourceError};
 use crate::chain::provider::{
 	WireBlockChunk, WireBlockRequest, WireChainTip, WireFilterHeaders, WireFilterHeadersRequest,
@@ -223,6 +224,8 @@ pub(crate) struct RawChainServer {
 	/// wait for the one fetch instead of each making their own.
 	block_flights: Mutex<HashMap<BlockHash, Arc<tokio::sync::Mutex<()>>>>,
 	limits: RawServeLimits,
+	/// The source's status, when it keeps one: what says it is not ready.
+	health: Option<Arc<RawSourceHealth>>,
 	logger: Arc<Logger>,
 }
 
@@ -245,8 +248,22 @@ impl RawChainServer {
 			permits: Semaphore::new(limits.concurrency.max(1)),
 			block_flights: Mutex::new(HashMap::new()),
 			limits,
+			health: None,
 			logger,
 		}
+	}
+
+	/// Consult `health` for readiness: while it says the source is not
+	/// ready, the tip is refused and every failure is logged as such. See
+	/// [`crate::RawSourceStatus::not_ready`].
+	pub(crate) fn with_health(mut self, health: Arc<RawSourceHealth>) -> Self {
+		self.health = Some(health);
+		self
+	}
+
+	/// Why the source is not ready, when its status says so.
+	fn not_ready(&self) -> Option<String> {
+		self.health.as_ref().and_then(|health| health.not_ready())
 	}
 
 	/// Runs one serve under `limit`. A serve that runs out is dropped — its
@@ -281,6 +298,16 @@ impl RawChainServer {
 	}
 
 	fn source_failed(&self, what: &str, e: SourceError) -> Error {
+		if let Some(reason) = self.not_ready() {
+			log_info!(
+				self.logger,
+				"Raw {} request not served: the source is not ready ({}): {}",
+				what,
+				reason,
+				e
+			);
+			return Error::ChainServeFailed;
+		}
 		match &e {
 			SourceError::NotFound(_) => {
 				log_debug!(self.logger, "Raw {} request not served: {}", what, e)
@@ -300,6 +327,17 @@ impl RawChainServer {
 		self.deadline("tip", self.limits.small_timeout, async {
 			let _turn = self.turn().await?;
 			let tip = self.source.tip().await.map_err(|e| self.source_failed("tip", e))?;
+			// A tip read mid-sync is not the chain's: an asker that took it
+			// would follow a chain that stops short.
+			if let Some(reason) = self.not_ready() {
+				log_info!(
+					self.logger,
+					"Refusing a raw tip request at height {}: the source is not ready: {}",
+					tip.height,
+					reason
+				);
+				return Err(Error::ChainServeFailed);
+			}
 			Ok(chain_tip_to_wire(&tip))
 		})
 		.await
@@ -818,6 +856,39 @@ mod tests {
 		lru.insert(5, "e2", 5);
 		assert_eq!(lru.bytes, 15, "replacing an entry releases its old size");
 		assert_eq!(lru.get(&5), Some("e2"));
+	}
+
+	/// While the source's status says it is not ready, its tip is refused
+	/// (and the reason is there for the app to turn into a "not ready"
+	/// refusal); data that is there is still served; once ready, the tip is
+	/// served again.
+	#[tokio::test]
+	async fn a_source_that_is_not_ready_has_its_tip_refused() {
+		use crate::chain::adapters::bitcoind_raw::SourceReadiness;
+
+		let health = Arc::new(RawSourceHealth::new());
+		let (server, source) = server(MockFilterSource::new(5, 10));
+		let server = server.with_health(Arc::clone(&health));
+		assert!(server.serve_tip().await.is_ok(), "nothing says it is not ready");
+
+		let mut syncing = SourceReadiness::default();
+		syncing.apply_chain_info(&serde_json::json!({
+			"blocks": 4, "headers": 900_000, "initialblockdownload": true,
+		}));
+		health.record_readiness(&syncing);
+		assert!(matches!(server.serve_tip().await, Err(Error::ChainServeFailed)));
+		assert_eq!(source.calls("tip"), 2, "the source was asked, and its answer withheld");
+		assert!(health.snapshot().not_ready.expect("why").contains("initial block download"));
+		let req = WireHeadersRequest { version: CHAIN_WIRE_VERSION, from_height: 0, count: 3 };
+		assert!(server.serve_headers(&req).await.is_ok(), "headers it has are still served");
+
+		let mut ready = SourceReadiness::default();
+		ready.apply_chain_info(&serde_json::json!({
+			"blocks": 900_000, "headers": 900_000, "initialblockdownload": false,
+		}));
+		health.record_readiness(&ready);
+		assert!(server.serve_tip().await.is_ok());
+		assert_eq!(health.snapshot().not_ready, None);
 	}
 
 	#[tokio::test]
