@@ -532,8 +532,12 @@ impl NodeBuilder {
 	/// when [`CbfConfig::source`] is [`CbfSource::Node`] or
 	/// [`CbfSource::NodeThenP2p`] — typically the embedding app's client of
 	/// another Node device that serves raw chain data. Every header, filter
-	/// header, filter and block it returns is verified by this node before it
-	/// is applied.
+	/// header, filter and block it returns is checked by this node before it
+	/// is applied — but the source is trusted not to leave transactions out
+	/// of its filters, which one source cannot be checked for. See
+	/// [`CbfSource::trusts_source_for_inclusion`]; the app decides where that
+	/// is acceptable (not, say, on mainnet with a source that is also a
+	/// channel counterparty).
 	///
 	/// A node-source mode without a filter source fails the build with
 	/// [`BuildError::ChainSourceSetupFailed`]; a filter source beside the
@@ -542,6 +546,7 @@ impl NodeBuilder {
 	/// [`CbfSource::Node`]: crate::config::CbfSource::Node
 	/// [`CbfSource::NodeThenP2p`]: crate::config::CbfSource::NodeThenP2p
 	/// [`CbfSource::P2p`]: crate::config::CbfSource::P2p
+	/// [`CbfSource::trusts_source_for_inclusion`]: crate::config::CbfSource::trusts_source_for_inclusion
 	#[cfg(feature = "cbf")]
 	pub fn set_cbf_filter_source(&mut self, source: Arc<dyn FilterSource>) -> &mut Self {
 		self.cbf_filter_source = Some(CbfFilterSource(source));

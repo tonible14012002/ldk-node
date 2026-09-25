@@ -5,37 +5,60 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-//! A BIP157 client that follows the chain through a [`FilterSource`] instead of the Bitcoin P2P
-//! network, and verifies everything it is handed.
+//! A BIP157 client that follows the chain through a [`FilterSource`] — typically one other
+//! node — instead of the Bitcoin P2P network, and verifies what it can of what it is handed.
 //!
 //! The loop feeds the same [`BlockApplicator`](crate::chain::cbf::applicator::BlockApplicator)
 //! kyoto does, with the same [`ChainOp`]s, so the per-listener gates, the resume anchor, the
 //! [`WatchLedger`](crate::chain::cbf::WatchLedger) and the sync-state publishing are shared.
 //! What differs is where the data comes from and who checks it: kyoto checks what its peers
-//! send; here the source is a single node that may be broken or lying, and this loop checks:
+//! send and can compare them; here the source is a single node that may be broken or lying.
+//!
+//! # What is verified
 //!
 //! * **Headers** — each links to the one below, carries its proof of work, claims exactly the
 //!   target the network rules require (the 2016-block retarget, testnet's minimum-difficulty
-//!   rule, regtest's none), and has a timestamp above the median of the eleven before it and
-//!   within two hours of this node's clock. See [`header_verify`](super::header_verify).
+//!   rule, regtest's none), and has a timestamp above the median of the eleven before it. One
+//!   more than two hours past this node's clock is waited out, not held against the source.
+//!   See [`header_verify`](super::header_verify).
 //! * **Fork choice** — a branch the source switches to replaces ours only when it has more
 //!   work.
-//! * **Filter headers** — the served span continues the filter-header chain already verified,
-//!   and every filter hashes to its served filter header.
-//! * **Filters** — belong to the block our header chain has at that height.
-//! * **Blocks** — the header is ours, the merkle root and the witness commitment hold, and no
-//!   transaction appears twice.
+//! * **Filters against filter headers** — the served span continues the filter-header chain
+//!   already verified, and every filter hashes to its served filter header.
+//! * **Filters against headers** — each belongs to the block our header chain has at that
+//!   height.
+//! * **Blocks** — the header is ours, the merkle root holds, the first transaction is the only
+//!   coinbase, no transaction is 64 bytes without its witness, none appears twice, and the
+//!   witness data matches the coinbase commitment (or there is none and no commitment).
 //!
-//! One trust gap is documented rather than closed: the first filter-header span after a resume
-//! has no verified predecessor (nothing about filters is persisted), so its `previous` is taken
-//! from the source. Everything after it chains from there. A source that lies at that point
-//! can hide the transactions of the blocks it serves until the next restart — it cannot make
-//! this node accept a block, a header or a chain that is not valid.
+//! # What is trusted: inclusion
+//!
+//! Nothing in a block header commits to its filter, and BIP157's defence — asking several
+//! peers and comparing their filter headers — needs more than one source. So a source can
+//! serve a filter and filter-header chain that is consistent with itself, from any height,
+//! whose filters leave a transaction out: a payment to this node, or a spend of an output it
+//! watches — a revoked commitment spending a channel's funding outpoint, say. This node then
+//! never fetches that block and never sees the transaction, and nothing here can tell.
+//!
+//! In short: node mode verifies headers (proof of work, difficulty), block contents, and that
+//! filters and filter headers agree, but it **trusts the source for transaction inclusion in
+//! filters** — for not omitting anything. A lying source cannot make this node accept a
+//! header, a chain or a block that is not valid; it can make it miss transactions.
+//! [`CbfSource::trusts_source_for_inclusion`] says so to the embedding app, which decides where
+//! that trust is acceptable — it should not be where the source gains from a missed
+//! transaction, such as on mainnet when the source node is also a channel counterparty.
+//!
+//! The filter headers are not persisted, so the first span after a resume, or after the loop
+//! starts over, takes its predecessor from the source: the same trust, not a further one.
+//!
+//! # Memory
 //!
 //! Headers and filter headers are held in RAM from the resume anchor (see [`HeaderChain`]),
 //! pruned to the last [`SourceTuning::held_headers`]; filters and blocks are dropped once
 //! used. Nothing new is persisted: the resume point comes from the wallet and LDK stores, as it
 //! does for kyoto.
+//!
+//! [`CbfSource::trusts_source_for_inclusion`]: crate::config::CbfSource::trusts_source_for_inclusion
 
 use std::collections::HashSet;
 use std::fmt;

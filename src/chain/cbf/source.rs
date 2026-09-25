@@ -14,8 +14,12 @@
 //! to check and must trust. A `FilterSource` hands back *raw consensus data*
 //! — headers, filter headers, filters, blocks — that the consuming CBF engine
 //! verifies itself: proof of work, the filter-header chain, the merkle root.
-//! A lying source can withhold data, but it cannot make a verifying client
-//! accept a chain that is not one.
+//! A lying source cannot make a verifying client accept a header, a chain or
+//! a block that is not valid. It can withhold data — including, since nothing
+//! in a header commits to a filter, leaving a transaction out of a filter
+//! that is consistent with its own filter-header chain. A client with a
+//! single source trusts it for inclusion; see
+//! `CbfSource::trusts_source_for_inclusion` (with the `cbf` feature).
 //!
 //! One trait, several implementations (a symmetric port):
 //!

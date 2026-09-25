@@ -239,9 +239,10 @@ impl Default for CbfConfig {
 
 /// Where a compact-block-filter node gets its raw chain data from.
 ///
-/// Whatever the source, every header, filter header, filter and block is verified by this
-/// node before it is applied; the source can withhold data, not make the node accept a chain
-/// that is not valid.
+/// Whatever the source, every header, filter header, filter and block is checked by this
+/// node before it is applied: a source cannot make the node accept a header, a chain or a
+/// block that is not valid. What a single node source *can* do is leave a transaction out of
+/// its filters — see [`CbfSource::trusts_source_for_inclusion`].
 #[cfg(feature = "cbf")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CbfSource {
@@ -253,6 +254,12 @@ pub enum CbfSource {
 	/// another Node device serving raw BIP157 data. Kyoto is never built and the node opens no
 	/// Bitcoin P2P connection. Building without a filter source fails.
 	///
+	/// **Trusts the source for inclusion.** Headers (proof of work, difficulty), block
+	/// contents, and the agreement of filters with filter headers are verified; that the
+	/// filters leave no transaction out is not, and cannot be with one source. A source that
+	/// omits a transaction — a revoked commitment spending a channel's funding outpoint, say —
+	/// hides it from this node. See [`CbfSource::trusts_source_for_inclusion`].
+	///
 	/// A source that keeps sending data that fails verification fails the sync closed; it is
 	/// tried again from scratch after a backoff of up to ten minutes. A tip more than three
 	/// hours old by this node's clock is reported as syncing, not synced (regtest aside).
@@ -263,6 +270,9 @@ pub enum CbfSource {
 	/// when the source stays unavailable for five minutes, keeps sending data that fails
 	/// verification, or serves a tip more than three hours old (regtest aside). Building without
 	/// a filter source fails.
+	///
+	/// **Trusts the source for inclusion** while it is used, as [`CbfSource::Node`] does: an
+	/// omission is not something the node can detect, so it is no reason to fall back.
 	NodeThenP2p,
 }
 
@@ -274,6 +284,33 @@ impl CbfSource {
 	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
 	pub fn uses_node_source(&self) -> bool {
 		matches!(self, Self::Node | Self::NodeThenP2p)
+	}
+
+	/// What a node filter source is trusted with, in words an app can show its operator.
+	pub const NODE_SOURCE_TRUST_NOTE: &'static str =
+		"Compact-block-filter sync through a single node source: headers (proof of work, \
+		 difficulty), block contents and filter/filter-header consistency are verified, but \
+		 the source is trusted not to leave transactions out of its filters. A source that \
+		 omits one (for example a revoked commitment spending a channel's funding output) \
+		 hides it from this node. Do not use a source that could gain from that, such as a \
+		 channel counterparty on mainnet.";
+
+	/// Whether this source trusts the node source not to leave transactions out of its
+	/// filters: `true` for [`CbfSource::Node`] and [`CbfSource::NodeThenP2p`], `false` for
+	/// [`CbfSource::P2p`], whose peers are compared.
+	///
+	/// This crate does not know who runs the source; the app does. An app should refuse a node
+	/// source where it would pay to hide a transaction — on mainnet, when the source node is
+	/// also one of this node's channel counterparties.
+	pub fn trusts_source_for_inclusion(&self) -> bool {
+		self.uses_node_source()
+	}
+
+	/// [`CbfSource::NODE_SOURCE_TRUST_NOTE`] when this source
+	/// [trusts the node source for inclusion](CbfSource::trusts_source_for_inclusion), for the
+	/// app to surface; `None` otherwise.
+	pub fn trust_note(&self) -> Option<&'static str> {
+		self.trusts_source_for_inclusion().then_some(Self::NODE_SOURCE_TRUST_NOTE)
 	}
 }
 
@@ -664,6 +701,19 @@ mod tests {
 	use super::Config;
 	use super::NodeAlias;
 	use super::SocketAddress;
+
+	#[cfg(feature = "cbf")]
+	#[test]
+	fn node_sources_say_they_trust_the_source_for_inclusion() {
+		use super::CbfSource;
+		assert!(!CbfSource::P2p.trusts_source_for_inclusion());
+		assert_eq!(CbfSource::P2p.trust_note(), None);
+		for source in [CbfSource::Node, CbfSource::NodeThenP2p] {
+			assert!(source.trusts_source_for_inclusion());
+			let note = source.trust_note().expect("a note to surface");
+			assert!(note.contains("trusted not to leave transactions out"), "{}", note);
+		}
+	}
 
 	#[test]
 	fn node_announce_channel() {
