@@ -253,10 +253,16 @@ pub enum CbfSource {
 	/// another Node device serving raw BIP157 data. Kyoto is never built and the node opens no
 	/// Bitcoin P2P connection. Building without a filter source fails.
 	///
+	/// A source that keeps sending data that fails verification fails the sync closed; it is
+	/// tried again from scratch after a backoff of up to ten minutes. A tip more than three
+	/// hours old by this node's clock is reported as syncing, not synced (regtest aside).
+	///
 	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
 	Node,
-	/// The filter source first; if it stays unavailable for five minutes, the node falls back
-	/// to the P2P network for the rest of the run. Building without a filter source fails.
+	/// The filter source first. The node falls back to the P2P network for the rest of the run
+	/// when the source stays unavailable for five minutes, keeps sending data that fails
+	/// verification, or serves a tip more than three hours old (regtest aside). Building without
+	/// a filter source fails.
 	NodeThenP2p,
 }
 

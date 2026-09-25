@@ -82,6 +82,17 @@ pub(crate) const MAX_INVALID_STRIKES: u32 = 3;
 /// How long a `node,p2p` node waits on an unavailable node source before it starts kyoto.
 pub(crate) const NODE_SOURCE_FALLBACK_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// A verified tip whose timestamp is older than this, by this node's clock, is not reported
+/// as synced: the source has most likely stopped following the chain. Three hours without a
+/// block happens on mainnet about once in decades; regtest is exempt.
+pub(crate) const STALE_TIP_AFTER: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// The first wait before a node-mode sync that failed closed on invalid data starts over.
+pub(crate) const SOURCE_RESTART_FIRST_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The longest wait between two such restarts.
+pub(crate) const SOURCE_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
 /// How many headers are held below the tip. Two retarget periods: the retarget and the
 /// minimum-difficulty rules need the current period's first header, the median-time rule the
 /// last eleven, and a reorg can be followed only as deep as the chain held.
@@ -170,6 +181,11 @@ impl HeaderChain {
 
 	fn filter_header(&self, height: u32) -> Option<FilterHeader> {
 		self.index(height).and_then(|i| self.filter_headers[i])
+	}
+
+	/// Forgets every filter header held.
+	fn clear_filter_headers(&mut self) {
+		self.filter_headers.iter_mut().for_each(|fh| *fh = None);
 	}
 
 	fn set_filter_header(&mut self, height: u32, filter_header: FilterHeader) {
@@ -409,6 +425,9 @@ enum StepError {
 	LessWork { fork: u32 },
 	/// The source's chain forks from ours below the lowest header held.
 	ReorgTooDeep { held_from: u32 },
+	/// Caught up with the source, but its tip is older than [`SourceTuning::stale_tip_after`]:
+	/// the source has probably stopped following the chain. Not synced.
+	StaleTip { height: u32, age_secs: u64 },
 	/// The full-block permits were closed.
 	PermitsClosed,
 	/// The applicator is gone: it halted on a divergence and published the failure itself.
@@ -430,9 +449,36 @@ impl fmt::Display for StepError {
 				"the source's chain forks from this node's below height {}, the lowest header held",
 				held_from
 			),
+			Self::StaleTip { height, age_secs } => write!(
+				f,
+				"the source's tip {} is {} minutes old by this node's clock; it has probably stopped following the chain",
+				height,
+				age_secs / 60
+			),
 			Self::PermitsClosed => f.write_str("the full-block permits were closed"),
 			Self::ApplicatorGone => f.write_str("the block applicator is gone"),
 		}
+	}
+}
+
+impl StepError {
+	/// A failed check that says nothing against the source: a header timestamped too far
+	/// ahead of this node's clock (Core does not mark such a header invalid either, it waits),
+	/// or an ancestor this node does not hold (its own bookkeeping). Retried later, never a
+	/// strike.
+	fn is_retry_later(&self) -> bool {
+		matches!(
+			self,
+			Self::Verify(VerifyFailure::Header(
+				HeaderCheck::FutureTime { .. } | HeaderCheck::MissingAncestor { .. }
+			))
+		)
+	}
+
+	/// Invalid data: the source's own admission, or a check it failed.
+	fn is_invalid(&self) -> bool {
+		matches!(self, Self::Source(SourceError::Invalid(_)) | Self::Verify(_))
+			&& !self.is_retry_later()
 	}
 }
 
@@ -477,13 +523,22 @@ pub(crate) struct SourceTuning {
 	pub(crate) wait_report_interval: Duration,
 	pub(crate) max_invalid_strikes: u32,
 	/// `Some` for `node,p2p`: how long an unavailable source is waited on before falling back.
+	/// A `node,p2p` node also falls back, at once, when the source fails verification
+	/// [`SourceTuning::max_invalid_strikes`] times in a row or its tip goes stale.
 	pub(crate) fallback_after: Option<Duration>,
 	pub(crate) header_lookahead: u32,
 	pub(crate) held_headers: u32,
+	/// A caught-up tip older than this is not synced; `None` never judges (regtest).
+	pub(crate) stale_tip_after: Option<Duration>,
+	/// How often a stale tip is reported at warn.
+	pub(crate) stale_report_interval: Duration,
+	/// `Some((first, max))`: after failing closed on invalid data, `node` mode starts over after
+	/// `first`, doubling up to `max`, rather than staying failed until the node restarts.
+	pub(crate) restart_backoff: Option<(Duration, Duration)>,
 }
 
 impl SourceTuning {
-	pub(crate) fn production(fall_back_to_p2p: bool) -> Self {
+	pub(crate) fn production(fall_back_to_p2p: bool, network: Network) -> Self {
 		use crate::chain::engine::cbf::{
 			CBF_MAX_BACKOFF_MS, CBF_PEER_WAIT_REPORT_INTERVAL, INITIAL_BACKOFF_MS,
 		};
@@ -497,6 +552,9 @@ impl SourceTuning {
 			fallback_after: fall_back_to_p2p.then_some(NODE_SOURCE_FALLBACK_AFTER),
 			header_lookahead: HEADER_LOOKAHEAD,
 			held_headers: HELD_HEADERS,
+			stale_tip_after: (network != Network::Regtest).then_some(STALE_TIP_AFTER),
+			stale_report_interval: CBF_PEER_WAIT_REPORT_INTERVAL,
+			restart_backoff: Some((SOURCE_RESTART_FIRST_BACKOFF, SOURCE_RESTART_MAX_BACKOFF)),
 		}
 	}
 }
@@ -510,6 +568,11 @@ enum RetryReport {
 	WaitingQuiet,
 	/// Invalid data: an error, counted.
 	Invalid,
+	/// A check that is retried later (see [`StepError::is_retry_later`]), or a stale tip:
+	/// reported at warn once per interval.
+	LaterWarn,
+	/// The same, reported recently.
+	LaterQuiet,
 }
 
 /// What to do after a failed step.
@@ -528,18 +591,41 @@ enum RetryDecision {
 /// [`SourceTuning::fallback_after`]. Invalid data is retried too, but
 /// [`SourceTuning::max_invalid_strikes`] in a row fail the sync closed. A completed step
 /// resets both.
+///
+/// A check retried later ([`StepError::is_retry_later`]) is never a strike and never a reason
+/// to fall back. A stale tip is waited out at the poll interval — on `node,p2p` it is a reason
+/// to fall back at once, as are the strikes, rather than to fail closed. An equal-work branch
+/// is re-polled no slower than the tip is.
 struct SourceRetryPolicy {
 	tuning: SourceTuning,
 	backoff: Duration,
 	strikes: u32,
 	waiting_since: Option<Instant>,
 	last_report: Option<Instant>,
+	last_later_report: Option<Instant>,
 }
 
 impl SourceRetryPolicy {
 	fn new(tuning: SourceTuning) -> Self {
 		let backoff = tuning.initial_backoff;
-		Self { tuning, backoff, strikes: 0, waiting_since: None, last_report: None }
+		Self {
+			tuning,
+			backoff,
+			strikes: 0,
+			waiting_since: None,
+			last_report: None,
+			last_later_report: None,
+		}
+	}
+
+	fn later_report(&mut self, now: Instant, interval: Duration) -> RetryReport {
+		match self.last_later_report {
+			Some(last) if now.saturating_duration_since(last) < interval => RetryReport::LaterQuiet,
+			_ => {
+				self.last_later_report = Some(now);
+				RetryReport::LaterWarn
+			},
+		}
 	}
 
 	/// A step completed. How long the source had been unavailable, if it had.
@@ -571,6 +657,10 @@ impl SourceRetryPolicy {
 	}
 
 	fn decide(&mut self, error: &StepError, now: Instant) -> RetryDecision {
+		if error.is_retry_later() {
+			let report = self.later_report(now, self.tuning.wait_report_interval);
+			return RetryDecision::Retry { backoff: self.next_backoff(), report };
+		}
 		match error {
 			StepError::Source(SourceError::Unavailable { .. })
 			| StepError::Source(SourceError::NotFound(_)) => {
@@ -583,11 +673,24 @@ impl SourceRetryPolicy {
 				RetryDecision::Retry { backoff: self.next_backoff(), report: self.wait_report(now) }
 			},
 			StepError::LessWork { .. } => {
-				RetryDecision::Retry { backoff: self.next_backoff(), report: self.wait_report(now) }
+				// An equal-work race is settled by the next block: look again at the tip poll's
+				// pace at the latest, never at the unavailable-source backoff's.
+				let backoff = self.next_backoff().min(self.tuning.poll_interval);
+				RetryDecision::Retry { backoff, report: self.wait_report(now) }
+			},
+			StepError::StaleTip { .. } => {
+				if self.tuning.fallback_after.is_some() {
+					return RetryDecision::FallBack;
+				}
+				let report = self.later_report(now, self.tuning.stale_report_interval);
+				RetryDecision::Retry { backoff: self.tuning.poll_interval, report }
 			},
 			StepError::Source(SourceError::Invalid(_)) | StepError::Verify(_) => {
 				self.strikes += 1;
 				if self.strikes >= self.tuning.max_invalid_strikes {
+					if self.tuning.fallback_after.is_some() {
+						return RetryDecision::FallBack;
+					}
 					return RetryDecision::Fail;
 				}
 				RetryDecision::Retry { backoff: self.next_backoff(), report: RetryReport::Invalid }
@@ -699,8 +802,14 @@ impl SourceSync {
 
 	/// Runs until stopped, until the applicator is gone, until the source is given up on, or —
 	/// on `node,p2p` — until it is time to fall back to kyoto.
+	///
+	/// With [`SourceTuning::restart_backoff`], failing closed on invalid data is not the end:
+	/// the failure is published and logged, and after the backoff the loop starts over with a
+	/// clean slate — no strikes, and no filter header taken as verified, so the next span's
+	/// predecessor is taken from the source again. The headers held stay: they verified.
 	pub(crate) async fn run(mut self) -> SourceSyncEnd {
 		let mut policy = SourceRetryPolicy::new(self.tuning.clone());
+		let mut restart_backoff = self.tuning.restart_backoff.map(|(first, _)| first);
 		loop {
 			if *self.stop_rx.borrow() {
 				return SourceSyncEnd::Stopped;
@@ -721,8 +830,11 @@ impl SourceSync {
 							waited.as_secs()
 						);
 					}
-					if progress == Progress::Idle && !self.sleep(self.tuning.poll_interval).await {
-						return SourceSyncEnd::Stopped;
+					if progress == Progress::Idle {
+						restart_backoff = self.tuning.restart_backoff.map(|(first, _)| first);
+						if !self.sleep(self.tuning.poll_interval).await {
+							return SourceSyncEnd::Stopped;
+						}
 					}
 				},
 				Err(StepError::ApplicatorGone) => return SourceSyncEnd::ApplicatorGone,
@@ -745,31 +857,77 @@ impl SourceSync {
 							}
 						},
 						RetryDecision::FallBack => {
+							let why = if error.is_invalid() {
+								format!("kept sending data that failed verification ({})", error)
+							} else if matches!(error, StepError::StaleTip { .. }) {
+								format!("is not following the chain: {}", error)
+							} else {
+								format!(
+									"has been unavailable for {}s ({})",
+									policy.waiting_for(now).as_secs(),
+									error
+								)
+							};
 							log_warn!(
 								self.logger,
-								"CBF filter source '{}' has been unavailable for {}s ({}); falling back to the P2P network.",
+								"CBF filter source '{}' {}; falling back to the P2P network.",
 								self.source.name(),
-								policy.waiting_for(now).as_secs(),
-								error
+								why
 							);
 							return SourceSyncEnd::FallBack;
 						},
 						RetryDecision::Fail => {
 							let reason = error.to_string();
-							log_error!(
-								self.logger,
-								"CBF filter source '{}': {}; nothing from it was applied. Giving up on it: the CBF sync has failed closed.",
-								self.source.name(),
-								reason
-							);
 							self.sync_state_tx
 								.send_replace(CbfSyncState::Failed(Error::TxSyncFailed));
-							return SourceSyncEnd::Failed(reason);
+							let restart = restart_backoff.filter(|_| error.is_invalid());
+							let Some(wait) = restart else {
+								log_error!(
+									self.logger,
+									"CBF filter source '{}': {}; nothing from it was applied. Giving up on it: the CBF sync has failed closed.",
+									self.source.name(),
+									reason
+								);
+								return SourceSyncEnd::Failed(reason);
+							};
+							log_error!(
+								self.logger,
+								"CBF filter source '{}': {}; nothing from it was applied. The CBF sync has failed closed; starting over in {}s.",
+								self.source.name(),
+								reason,
+								wait.as_secs()
+							);
+							if !self.sleep(wait).await {
+								return SourceSyncEnd::Stopped;
+							}
+							restart_backoff = self
+								.tuning
+								.restart_backoff
+								.map(|(_, max)| wait.saturating_mul(2).min(max));
+							policy = SourceRetryPolicy::new(self.tuning.clone());
+							self.start_over();
 						},
 					}
 				},
 			}
 		}
+	}
+
+	/// After failing closed: forget every filter header taken as verified, and publish that
+	/// the sync is running again, from the blocks already queued.
+	fn start_over(&mut self) {
+		lock_headers(&self.chain).clear_filter_headers();
+		self.synced_at = None;
+		self.sync_state_tx.send_replace(CbfSyncState::Active {
+			applied_tip: Some(self.filters_through),
+			synced_to_tip: false,
+		});
+		log_info!(
+			self.logger,
+			"CBF starting over with filter source '{}' from height {}.",
+			self.source.name(),
+			self.filters_through
+		);
 	}
 
 	fn report_retry(
@@ -786,12 +944,19 @@ impl SourceSync {
 				waited.as_secs(),
 				backoff.as_secs().max(1)
 			),
-			RetryReport::WaitingQuiet => log_debug!(
+			RetryReport::WaitingQuiet | RetryReport::LaterQuiet => log_debug!(
 				self.logger,
 				"CBF filter source '{}' still cannot serve the sync: {}; next retry in {}ms.",
 				name,
 				error,
 				backoff.as_millis()
+			),
+			RetryReport::LaterWarn => log_warn!(
+				self.logger,
+				"CBF filter source '{}': {}; not synced, not held against the source; retrying in {}s.",
+				name,
+				error,
+				backoff.as_secs().max(1)
 			),
 			RetryReport::Invalid => log_error!(
 				self.logger,
@@ -855,7 +1020,15 @@ impl SourceSync {
 					return self.reorg(tip, ours).await;
 				}
 				let headers = &headers[..headers.len().min(count as usize)];
-				self.extend(ours.height + 1, headers)?;
+				if let Err(error) = self.extend(ours.height + 1, headers) {
+					// A header to retry later (one from the future, say) need not hold up the
+					// filters of the headers below it: take those first.
+					let held = lock_headers(&self.chain).tip().expect("resumed").height;
+					if !error.is_retry_later() || self.filters_through >= held {
+						return Err(error);
+					}
+					self.filter_batch(held).await?;
+				}
 				return Ok(Progress::Advanced);
 			}
 		}
@@ -869,6 +1042,13 @@ impl SourceSync {
 			return Ok(Progress::Advanced);
 		}
 
+		if let Some(after) = self.tuning.stale_tip_after {
+			let time = lock_headers(&self.chain).header(ours.height).map(|h| u64::from(h.time));
+			let age_secs = time.map_or(0, |time| now_secs().saturating_sub(time));
+			if age_secs > after.as_secs() {
+				return Err(StepError::StaleTip { height: ours.height, age_secs });
+			}
+		}
 		if self.synced_at != Some(ours.hash) {
 			log_info!(
 				self.logger,
@@ -1202,6 +1382,8 @@ pub(crate) struct SourceFeeSource {
 	chain: SharedHeaderChain,
 	sync_state_rx: watch::Receiver<CbfSyncState>,
 	full_block_permits: Arc<Semaphore>,
+	/// Bound on a block fetch, as on every call the sync loop makes.
+	call_timeout: Duration,
 }
 
 impl SourceFeeSource {
@@ -1209,7 +1391,7 @@ impl SourceFeeSource {
 		source: Arc<dyn FilterSource>, chain: SharedHeaderChain,
 		sync_state_rx: watch::Receiver<CbfSyncState>, full_block_permits: Arc<Semaphore>,
 	) -> Self {
-		Self { source, chain, sync_state_rx, full_block_permits }
+		Self { source, chain, sync_state_rx, full_block_permits, call_timeout: SOURCE_CALL_TIMEOUT }
 	}
 }
 
@@ -1239,10 +1421,12 @@ impl FeeBlockSource for SourceFeeSource {
 			.try_acquire_owned()
 			.map_err(|_| SampleFailure::NoPermit)?;
 		let source = Arc::clone(&self.source);
+		let call_timeout = self.call_timeout;
 		Ok(Box::pin(async move {
 			let _permit = permit;
-			let block =
-				source.block(hash).await.map_err(|e| SampleFailure::FetchFailed(e.to_string()))?;
+			let block = bounded(call_timeout, source.block(hash))
+				.await
+				.map_err(|e| SampleFailure::FetchFailed(e.to_string()))?;
 			verify_block(&block, height, &header).map_err(|_| SampleFailure::Mismatch)?;
 			Ok((height, block))
 		}))
@@ -1349,6 +1533,8 @@ pub(crate) mod test_support {
 		pub(crate) filter_headers_cap: Option<usize>,
 		/// Most filters one answer carries: a prefix of the span beyond.
 		pub(crate) filters_cap: Option<usize>,
+		/// `block` never answers.
+		pub(crate) hang_blocks: bool,
 	}
 
 	pub(crate) struct FakeSource {
@@ -1368,6 +1554,7 @@ pub(crate) mod test_support {
 					calls: HashMap::new(),
 					filter_headers_cap: None,
 					filters_cap: None,
+					hang_blocks: false,
 				}),
 			};
 			source.mine(len, matched, 0);
@@ -1393,6 +1580,16 @@ pub(crate) mod test_support {
 				st.all.insert(block.block_hash(), block.clone());
 				st.blocks.push(block);
 			}
+		}
+
+		/// Mines one block on the best chain, timestamped `time`.
+		pub(crate) fn mine_at(&self, time: u32) {
+			let mut st = self.st();
+			let height = st.blocks.len() as u32;
+			let prev = st.blocks.last().map_or(BlockHash::all_zeros(), |b| b.block_hash());
+			let block = mine(prev, height, time, other_script(height as u8), 0);
+			st.all.insert(block.block_hash(), block.clone());
+			st.blocks.push(block);
 		}
 
 		/// Replaces the top `depth` blocks with `new_len` others.
@@ -1532,7 +1729,11 @@ pub(crate) mod test_support {
 		}
 
 		async fn block(&self, hash: BlockHash) -> Result<Block, SourceError> {
-			let st = self.enter("block")?;
+			let hang = self.enter("block")?.hang_blocks;
+			if hang {
+				std::future::pending::<()>().await;
+			}
+			let st = self.st();
 			let mut block =
 				st.all.get(&hash).cloned().ok_or_else(|| SourceError::NotFound("block".into()))?;
 			if let Lie::MerkleAt(height) = st.lie {
@@ -1568,6 +1769,9 @@ pub(crate) mod test_support {
 			fallback_after: None,
 			header_lookahead: HEADER_LOOKAHEAD,
 			held_headers: HELD_HEADERS,
+			stale_tip_after: None,
+			stale_report_interval: Duration::from_secs(60),
+			restart_backoff: None,
 		}
 	}
 }
@@ -1950,6 +2154,152 @@ mod tests {
 		assert_eq!(h.end().await, SourceSyncEnd::FallBack);
 	}
 
+	fn now_u32() -> u32 {
+		now_secs() as u32
+	}
+
+	#[tokio::test]
+	async fn a_header_from_the_future_is_waited_out_not_struck() {
+		let source = FakeSource::new(30, &[]);
+		source.mine_at(now_u32() + 3 * 60 * 60);
+		let mut h = start(source, 10, fast_tuning());
+		// The filters below the header from the future are taken...
+		let mut ops = Vec::new();
+		for _ in 11..=29 {
+			ops.push(h.next_op().await);
+		}
+		assert_eq!(ops, filtered(11..=29));
+		// ...then the loop waits, far past what three strikes would take, without failing.
+		h.assert_quiet().await;
+		assert!(
+			matches!(*h.sync_state_tx.borrow(), CbfSyncState::Active { synced_to_tip: false, .. }),
+			"waiting, neither synced nor failed"
+		);
+		assert_eq!(lock_headers(&h.chain).tip().map(|t| t.height), Some(29));
+
+		// The source moves to a branch with a sane timestamp and more work: followed.
+		h.source.reorg(1, 2);
+		assert_eq!(
+			h.ops_until_synced().await,
+			vec![Op::Filtered(30), Op::Filtered(31), Op::Synced(31)]
+		);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[test]
+	fn a_clock_or_bookkeeping_check_is_never_a_strike() {
+		let now = Instant::now();
+		let mut policy = SourceRetryPolicy::new(fast_tuning());
+		for check in [
+			HeaderCheck::FutureTime { height: 5, time: u32::MAX },
+			HeaderCheck::MissingAncestor { height: 5, needed: 4 },
+		] {
+			let error = StepError::Verify(VerifyFailure::Header(check));
+			for _ in 0..100 {
+				assert!(matches!(policy.decide(&error, now), RetryDecision::Retry { .. }));
+			}
+		}
+		assert_eq!(policy.strikes, 0);
+		// On `node,p2p` it is no reason to fall back either.
+		let tuning = SourceTuning { fallback_after: Some(Duration::ZERO), ..fast_tuning() };
+		let mut policy = SourceRetryPolicy::new(tuning);
+		let future = StepError::Verify(VerifyFailure::Header(HeaderCheck::FutureTime {
+			height: 5,
+			time: u32::MAX,
+		}));
+		assert!(matches!(policy.decide(&future, now), RetryDecision::Retry { .. }));
+	}
+
+	#[test]
+	fn an_equal_work_race_is_polled_no_slower_than_the_tip() {
+		let now = Instant::now();
+		let tuning = SourceTuning {
+			poll_interval: Duration::from_secs(30),
+			max_backoff: Duration::from_secs(300),
+			initial_backoff: Duration::from_secs(1),
+			..fast_tuning()
+		};
+		let mut policy = SourceRetryPolicy::new(tuning);
+		for _ in 0..20 {
+			match policy.decide(&StepError::LessWork { fork: 3 }, now) {
+				RetryDecision::Retry { backoff, .. } => {
+					assert!(backoff <= Duration::from_secs(30), "{:?}", backoff)
+				},
+				other => panic!("{:?}", other),
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn a_stale_tip_is_not_reported_synced_until_a_fresh_block_arrives() {
+		// The fake chain is timestamped in 2023: stale by any clock today.
+		let tuning = SourceTuning { stale_tip_after: Some(STALE_TIP_AFTER), ..fast_tuning() };
+		let mut h = start(FakeSource::new(30, &[]), 10, tuning);
+		let mut ops = Vec::new();
+		for _ in 11..=29 {
+			ops.push(h.next_op().await);
+		}
+		assert_eq!(ops, filtered(11..=29));
+		h.assert_quiet().await;
+		assert!(
+			matches!(*h.sync_state_tx.borrow(), CbfSyncState::Active { synced_to_tip: false, .. }),
+			"syncing, not synced"
+		);
+
+		h.source.mine_at(now_u32());
+		assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(30), Op::Synced(30)]);
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn node_then_p2p_falls_back_on_a_stale_tip() {
+		let tuning = SourceTuning {
+			stale_tip_after: Some(STALE_TIP_AFTER),
+			fallback_after: Some(Duration::from_secs(3600)),
+			..fast_tuning()
+		};
+		let h = start(FakeSource::new(30, &[]), 10, tuning);
+		assert_eq!(h.end().await, SourceSyncEnd::FallBack);
+	}
+
+	#[tokio::test]
+	async fn node_then_p2p_falls_back_on_invalid_data_instead_of_failing_closed() {
+		let source = FakeSource::new(30, &[]);
+		source.set_lie(Lie::FilterHeaderAt(25));
+		let tuning =
+			SourceTuning { fallback_after: Some(Duration::from_secs(3600)), ..fast_tuning() };
+		let mut h = start(source, 10, tuning);
+		let task = &mut h.task;
+		let end = tokio::time::timeout(WAIT, task).await.expect("ended in time").unwrap();
+		assert_eq!(end, SourceSyncEnd::FallBack);
+		assert!(h.ops_rx.try_recv().is_err(), "nothing was queued from unverified data");
+	}
+
+	#[tokio::test]
+	async fn node_mode_starts_over_after_failing_closed() {
+		let source = FakeSource::new(30, &[]);
+		source.set_lie(Lie::FilterHeaderAt(25));
+		let tuning = SourceTuning {
+			restart_backoff: Some((Duration::from_millis(50), Duration::from_millis(100))),
+			..fast_tuning()
+		};
+		let mut h = start(source, 10, tuning);
+		let mut state = h.sync_state_tx.subscribe();
+		tokio::time::timeout(WAIT, state.wait_for(|s| matches!(s, CbfSyncState::Failed(_))))
+			.await
+			.expect("failed closed in time")
+			.expect("the sender is alive");
+		assert!(!h.task.is_finished(), "failed, but supervised: the loop runs on");
+
+		// The source stops lying: the next start-over syncs.
+		h.source.set_lie(Lie::None);
+		let mut expected = filtered(11..=29);
+		expected.push(Op::Synced(29));
+		assert_eq!(h.ops_until_synced().await, expected);
+		assert!(matches!(*h.sync_state_tx.borrow(), CbfSyncState::Active { .. }));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
 	#[test]
 	fn invalid_data_fails_closed_after_the_strikes_and_unavailable_never_does() {
 		let now = Instant::now();
@@ -2193,5 +2543,18 @@ mod tests {
 			fee.request_block(BlockHash::all_zeros()),
 			Err(SampleFailure::FetchFailed(_))
 		));
+
+		// A fetch the source never answers is cut at the call bound, and its permit freed.
+		source.set_lie(Lie::None);
+		source.state.lock().unwrap().hang_blocks = true;
+		let fee = SourceFeeSource { call_timeout: Duration::from_millis(50), ..fee };
+		let fetch = fee.request_block(hash).unwrap();
+		match tokio::time::timeout(WAIT, fetch).await.expect("bounded") {
+			Err(SampleFailure::FetchFailed(reason)) => {
+				assert!(reason.contains("no answer within"), "{}", reason)
+			},
+			other => panic!("{:?}", other.map(|(h, _)| h)),
+		}
+		assert_eq!(permits.available_permits(), 1);
 	}
 }

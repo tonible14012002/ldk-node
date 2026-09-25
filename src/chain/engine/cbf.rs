@@ -473,7 +473,7 @@ impl CbfSyncEngine {
 			self.sync_state_tx.clone(),
 			Arc::clone(&self.full_block_permits),
 			stop_rx,
-			SourceTuning::production(fall_back),
+			SourceTuning::production(fall_back, self.config.network),
 			Arc::clone(&self.logger),
 		);
 		log_info!(
@@ -1256,7 +1256,7 @@ impl KyotoFallback {
 		self.active_source.store(ACTIVE_P2P, Ordering::Release);
 		log_warn!(
 			self.logger,
-			"CBF fell back to the P2P network (kyoto) for the rest of this run: the node source stayed unavailable."
+			"CBF fell back to the P2P network (kyoto) for the rest of this run: the node source could not serve the sync (see the warning above)."
 		);
 
 		let kyoto_loop = KyotoLoop {
