@@ -256,8 +256,14 @@ pub(crate) enum VerifyFailure {
 	MerkleRoot { height: u32 },
 	/// A block that lists a transaction twice (the CVE-2012-2459 malleation).
 	DuplicateTransactions { height: u32 },
-	/// A block whose witness data does not match its coinbase commitment.
+	/// A block whose witness data does not match its coinbase commitment, or that carries
+	/// witness data without a commitment (Core's `CheckWitnessMalleation`).
 	WitnessCommitment { height: u32 },
+	/// A block whose first transaction is not its only coinbase.
+	Coinbase { height: u32 },
+	/// A block with a transaction exactly 64 bytes long without its witness: such a
+	/// transaction can pass for an inner merkle node (CVE-2017-12842).
+	SixtyFourByteTransaction { height: u32 },
 }
 
 impl VerifyFailure {
@@ -277,6 +283,8 @@ impl VerifyFailure {
 			Self::MerkleRoot { .. } => "merkle root",
 			Self::DuplicateTransactions { .. } => "duplicate transactions",
 			Self::WitnessCommitment { .. } => "witness commitment",
+			Self::Coinbase { .. } => "coinbase",
+			Self::SixtyFourByteTransaction { .. } => "64-byte transaction",
 		}
 	}
 }
@@ -310,14 +318,58 @@ impl fmt::Display for VerifyFailure {
 			| Self::BlockHeader { height }
 			| Self::MerkleRoot { height }
 			| Self::DuplicateTransactions { height }
-			| Self::WitnessCommitment { height } => {
+			| Self::WitnessCommitment { height }
+			| Self::Coinbase { height }
+			| Self::SixtyFourByteTransaction { height } => {
 				write!(f, "{} check failed at height {}", self.name(), height)
 			},
 		}
 	}
 }
 
-/// Checks a full block against the header our chain holds at `height`.
+/// The first bytes of a witness commitment output: `OP_RETURN`, a 36-byte push, and the
+/// BIP141 commitment header `aa21a9ed`.
+const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+
+/// The shortest script a witness commitment output can have: the prefix and 32 bytes.
+const WITNESS_COMMITMENT_MIN_LEN: usize = 38;
+
+/// The size, without witness, a transaction must not have: 64 bytes is the size of an inner
+/// merkle node, so such a transaction could stand in for one (CVE-2017-12842).
+const MERKLE_NODE_SIZED_TX: usize = 64;
+
+/// Bitcoin Core's `CheckWitnessMalleation`, for a block whose coinbase is `txdata[0]`.
+///
+/// rust-bitcoin's `Block::check_witness_commitment` accepts any block in which no input
+/// carries a witness, so a block with its witnesses stripped would pass it. Here, as in
+/// Core: when the coinbase has a commitment (its last output starting with
+/// [`WITNESS_COMMITMENT_PREFIX`]), the coinbase input must carry exactly one 32-byte witness
+/// item — the reserved value — and the witness merkle root (coinbase wtxid zero) hashed with
+/// it must equal the commitment; without a commitment, no transaction may carry a witness.
+fn witness_data_is_committed(block: &Block) -> bool {
+	let Some(coinbase) = block.txdata.first() else { return false };
+	let commitment = coinbase.output.iter().rev().find_map(|output| {
+		let script = output.script_pubkey.as_bytes();
+		(script.len() >= WITNESS_COMMITMENT_MIN_LEN
+			&& script[..WITNESS_COMMITMENT_PREFIX.len()] == WITNESS_COMMITMENT_PREFIX)
+			.then(|| &script[WITNESS_COMMITMENT_PREFIX.len()..WITNESS_COMMITMENT_MIN_LEN])
+	});
+	let Some(commitment) = commitment else {
+		return block.txdata.iter().all(|tx| tx.input.iter().all(|input| input.witness.is_empty()));
+	};
+	let Some(input) = coinbase.input.first() else { return false };
+	let reserved = match input.witness.nth(0) {
+		Some(item) if input.witness.len() == 1 && item.len() == 32 => item,
+		_ => return false,
+	};
+	let Some(root) = block.witness_root() else { return false };
+	Block::compute_witness_commitment(&root, reserved).as_byte_array()[..] == *commitment
+}
+
+/// Checks a full block against the header our chain holds at `height`: the header, the
+/// merkle root, the coinbase, no merkle-node-sized transaction, no duplicate transaction, and
+/// the witness data against its commitment. What this cannot show — that the block's
+/// transactions are valid — the header's proof of work vouches for.
 pub(crate) fn verify_block(
 	block: &Block, height: u32, header: &Header,
 ) -> Result<(), VerifyFailure> {
@@ -327,11 +379,19 @@ pub(crate) fn verify_block(
 	if !block.check_merkle_root() {
 		return Err(VerifyFailure::MerkleRoot { height });
 	}
+	let only_first_is_coinbase = block.txdata.first().is_some_and(|tx| tx.is_coinbase())
+		&& !block.txdata.iter().skip(1).any(|tx| tx.is_coinbase());
+	if !only_first_is_coinbase {
+		return Err(VerifyFailure::Coinbase { height });
+	}
+	if block.txdata.iter().any(|tx| tx.base_size() == MERKLE_NODE_SIZED_TX) {
+		return Err(VerifyFailure::SixtyFourByteTransaction { height });
+	}
 	let mut txids = HashSet::with_capacity(block.txdata.len());
 	if !block.txdata.iter().all(|tx| txids.insert(tx.compute_txid())) {
 		return Err(VerifyFailure::DuplicateTransactions { height });
 	}
-	if !block.check_witness_commitment() {
+	if !witness_data_is_committed(block) {
 		return Err(VerifyFailure::WitnessCommitment { height });
 	}
 	Ok(())
@@ -1866,6 +1926,159 @@ mod tests {
 		assert_eq!(chain.tip().map(|t| t.height), Some(6));
 		chain.prune_below(100);
 		assert_eq!(chain.tip().map(|t| t.height), Some(6), "pruning keeps the tip");
+	}
+
+	/// A block with a segwit spend: the coinbase carries the reserved value and the commitment.
+	fn segwit_block() -> Block {
+		use bitcoin::block::Version;
+		use bitcoin::{
+			absolute, transaction, Amount, OutPoint, Sequence, Transaction, TxIn, TxOut,
+		};
+		use bitcoin::{Txid, Witness};
+
+		let reserved = [0u8; 32];
+		let coinbase = Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint::null(),
+				script_sig: ScriptBuf::from_bytes(vec![0x01, 0x07, 0x51]),
+				sequence: Sequence::MAX,
+				witness: Witness::from_slice(&[reserved.to_vec()]),
+			}],
+			output: vec![TxOut { value: Amount::from_sat(50_000), script_pubkey: other_script(1) }],
+		};
+		let spend = Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint { txid: Txid::from_byte_array([9; 32]), vout: 0 },
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::MAX,
+				witness: Witness::from_slice(&[vec![0xaa; 72], vec![0x02; 33]]),
+			}],
+			output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: watched_script() }],
+		};
+		let mut block = Block {
+			header: Header {
+				version: Version::TWO,
+				prev_blockhash: BlockHash::all_zeros(),
+				merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+				time: BASE_TIME,
+				bits: CompactTarget::from_consensus(REGTEST_BITS),
+				nonce: 0,
+			},
+			txdata: vec![coinbase, spend],
+		};
+		// The coinbase's wtxid counts as zero, so adding the commitment does not move the root.
+		let root = block.witness_root().expect("transactions");
+		let commitment = Block::compute_witness_commitment(&root, &reserved);
+		let mut script = WITNESS_COMMITMENT_PREFIX.to_vec();
+		script.extend_from_slice(commitment.as_byte_array());
+		block.txdata[0]
+			.output
+			.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(script) });
+		reseal(&mut block);
+		block
+	}
+
+	fn reseal(block: &mut Block) {
+		block.header.merkle_root = block.compute_merkle_root().expect("transactions");
+	}
+
+	fn verify(block: &Block) -> Result<(), VerifyFailure> {
+		verify_block(block, 7, &block.header)
+	}
+
+	#[test]
+	fn an_intact_segwit_block_passes() {
+		let block = segwit_block();
+		assert!(block.check_witness_commitment());
+		assert_eq!(verify(&block), Ok(()));
+		// A block without witness data needs no commitment.
+		let plain = FakeSource::new(3, &[2]).block_at(2);
+		assert_eq!(verify(&plain), Ok(()));
+	}
+
+	#[test]
+	fn a_block_with_its_witnesses_stripped_is_rejected() {
+		let mut block = segwit_block();
+		for tx in &mut block.txdata {
+			for input in &mut tx.input {
+				input.witness.clear();
+			}
+		}
+		reseal(&mut block);
+		assert!(
+			block.check_witness_commitment(),
+			"rust-bitcoin's own check accepts a block with no witness at all"
+		);
+		assert_eq!(verify(&block), Err(VerifyFailure::WitnessCommitment { height: 7 }));
+
+		// Only the spend stripped: the reserved value is there, the commitment no longer holds.
+		let mut block = segwit_block();
+		block.txdata[1].input[0].witness.clear();
+		reseal(&mut block);
+		assert_eq!(verify(&block), Err(VerifyFailure::WitnessCommitment { height: 7 }));
+
+		// The reserved value must be exactly one 32-byte item.
+		let mut block = segwit_block();
+		block.txdata[0].input[0].witness.push([0u8; 32]);
+		assert_eq!(verify(&block), Err(VerifyFailure::WitnessCommitment { height: 7 }));
+	}
+
+	#[test]
+	fn a_block_with_witness_data_and_no_commitment_is_rejected() {
+		let mut block = segwit_block();
+		block.txdata[0].output.pop();
+		reseal(&mut block);
+		assert_eq!(verify(&block), Err(VerifyFailure::WitnessCommitment { height: 7 }));
+	}
+
+	#[test]
+	fn the_first_transaction_must_be_the_only_coinbase() {
+		let mut swapped = segwit_block();
+		swapped.txdata.swap(0, 1);
+		reseal(&mut swapped);
+		assert_eq!(verify(&swapped), Err(VerifyFailure::Coinbase { height: 7 }));
+
+		let mut two = segwit_block();
+		let mut second = two.txdata[0].clone();
+		second.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0x08, 0x52]);
+		two.txdata.push(second);
+		reseal(&mut two);
+		assert_eq!(verify(&two), Err(VerifyFailure::Coinbase { height: 7 }));
+	}
+
+	#[test]
+	fn a_block_with_a_64_byte_transaction_is_rejected() {
+		use bitcoin::{
+			absolute, transaction, Amount, OutPoint, Sequence, Transaction, TxIn, TxOut,
+		};
+
+		let mut block = FakeSource::new(3, &[]).block_at(2);
+		let merkle_node_sized = Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: OutPoint {
+					txid: bitcoin::Txid::from_byte_array([3; 32]),
+					vout: 1,
+				},
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::MAX,
+				witness: bitcoin::Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(1),
+				script_pubkey: ScriptBuf::from_bytes(vec![0x51; 4]),
+			}],
+		};
+		assert_eq!(merkle_node_sized.base_size(), 64);
+		block.txdata.push(merkle_node_sized);
+		reseal(&mut block);
+		assert!(block.check_merkle_root());
+		assert_eq!(verify(&block), Err(VerifyFailure::SixtyFourByteTransaction { height: 7 }));
 	}
 
 	#[tokio::test]
