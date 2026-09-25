@@ -459,13 +459,14 @@ pub struct WireLightningSyncResponse {
 /// `getheaders` batch.
 pub const MAX_HEADERS_PER_REQUEST: u32 = 2000;
 
-/// Most filters one [`WireFiltersRequest`] may span. Filters run to tens of
-/// KiB on mainnet, so this keeps a reply around a few MiB at worst; BIP157's
-/// `getcfilters` allows 1000, which is too large for one relayed message.
+/// Most filters one [`WireFiltersRequest`] may span; BIP157's `getcfilters`
+/// allows 1000. Filters run to tens of KiB on mainnet, so even 100 can outgrow
+/// one relayed message: the serving node answers as many from the start of
+/// the span as fit (at least one), and the asking node continues from there.
 pub const MAX_FILTERS_PER_REQUEST: u32 = 100;
 
 /// Most filter headers one [`WireFilterHeadersRequest`] may span — BIP157's
-/// `getcfheaders` batch.
+/// `getcfheaders` batch. The serving node may answer a prefix of the span.
 pub const MAX_FILTER_HEADERS_PER_REQUEST: u32 = 2000;
 
 /// Raw bytes per [`WireBlockChunk`]. Hex doubles it, so a chunk reply stays
@@ -523,7 +524,9 @@ pub struct WireFilterHeaders {
 	/// The filter header below the span, hex, RPC byte order; all zeros
 	/// when the span starts at genesis.
 	pub previous: String,
-	/// One filter header per block of the span, ascending, hex.
+	/// One filter header per block of the span, ascending, hex — or per
+	/// block of a non-empty prefix of it, when the serving node bounds its
+	/// reply; the asker continues from where it ends.
 	pub headers: Vec<String>,
 }
 
@@ -555,7 +558,9 @@ pub struct WireIndexedFilter {
 pub struct WireFilters {
 	/// Wire contract version; see [`CHAIN_WIRE_VERSION`].
 	pub version: u16,
-	/// One filter per block of the span.
+	/// One filter per block of the span — or of a non-empty prefix of it,
+	/// when the whole would outgrow one reply; the asker continues from where
+	/// it ends.
 	pub filters: Vec<WireIndexedFilter>,
 }
 

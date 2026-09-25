@@ -161,6 +161,11 @@ impl From<ChainProviderError> for SourceError {
 /// * **Bounded.** A serving implementation may refuse spans larger than
 ///   [`MAX_HEADERS_PER_REQUEST`], [`MAX_FILTER_HEADERS_PER_REQUEST`] or
 ///   [`MAX_FILTERS_PER_REQUEST`]; callers page.
+/// * **Prefixes.** [`FilterSource::filter_headers`] and
+///   [`FilterSource::filters`] may answer a non-empty *prefix* of the span —
+///   the first blocks of it, from `start_height` — when the whole would be
+///   too large for one reply; callers continue from where it ended. An empty
+///   answer is invalid.
 /// * **Errors are cheap; silence is not.** Implementations apply their own
 ///   timeouts.
 /// * **Idempotent.** Every call may be retried.
@@ -177,13 +182,14 @@ pub trait FilterSource: Send + Sync {
 	/// first; [`SourceError::NotFound`] when `from_height` is above the tip.
 	async fn headers(&self, from_height: u32, count: u32) -> Result<Vec<Header>, SourceError>;
 
-	/// Filter headers for `start_height..=height(stop_hash)`, with the one
-	/// below the span.
+	/// Filter headers for `start_height..=height(stop_hash)` — or a
+	/// non-empty prefix of that span — with the one below the span.
 	async fn filter_headers(
 		&self, start_height: u32, stop_hash: BlockHash,
 	) -> Result<FilterHeaders, SourceError>;
 
-	/// Basic filters for `start_height..=height(stop_hash)`, ascending.
+	/// Basic filters for `start_height..=height(stop_hash)` — or a non-empty
+	/// prefix of that span — ascending.
 	async fn filters(
 		&self, start_height: u32, stop_hash: BlockHash,
 	) -> Result<Vec<IndexedFilter>, SourceError>;

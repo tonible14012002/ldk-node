@@ -65,16 +65,32 @@
 //! the host serve timeout and the client wait with it, and none of them may
 //! reach the carrier's 60 s.
 //!
+//! The serving layer adds its own deadline to each serve on top of these —
+//! 30 s for tip, headers and filter headers, 40 s for filters, 50 s for a
+//! block — a little under the host serve timeouts above, so a serve nobody is
+//! waiting for any more is dropped, its requests with it (see
+//! [`crate::chain::raw_serve`]).
+//!
+//! # Reply sizes
+//!
+//! A filter-headers read covers at most [`FILTER_HEADERS_PER_REPLY`] blocks of
+//! the span asked, keeping only the headers of each batch it reads; a filters
+//! read stops once [`FILTER_BYTES_PER_REPLY`] of filters are held. Either
+//! answers a prefix of the span then, as [`FilterSource`] allows.
+//!
 //! # Credentials
 //!
-//! Never logged, never in a `Debug` rendering, never in an error. A URL
-//! carrying `user:password@` has them moved into the basic-auth header and
-//! removed from the URL that errors might print.
+//! Never logged, never in a `Debug` rendering, never in an error, never in
+//! [`RawSourceStatus`]. A URL carrying `user:password@` has them moved into
+//! the basic-auth header and removed from the URL that errors might print.
+//! Over plain `http://` credentials are only sent to a loopback host;
+//! anywhere else the URL must be `https://`.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
@@ -93,6 +109,7 @@ use crate::chain::cbf::source::{
 use crate::chain::provider::{
 	MAX_FILTERS_PER_REQUEST, MAX_FILTER_HEADERS_PER_REQUEST, MAX_HEADERS_PER_REQUEST,
 };
+use crate::chain::raw_serve::{FILTER_BYTES_PER_REPLY, FILTER_HEADERS_PER_REPLY};
 
 /// Connecting (TCP + TLS) to the RPC endpoint.
 pub(crate) const RAW_RPC_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -124,6 +141,98 @@ const NO_FILTER_INDEX_MARKER: &str = "Index is not enabled for filtertype";
 /// The reason carried by every filter call against a bitcoind without the
 /// index — stable, so logs and status can say plainly what is missing.
 pub(crate) const NO_FILTER_INDEX_REASON: &str = "rpc source has no blockfilterindex";
+
+/// How a Pro node's raw chain source is doing, for the operator; see
+/// [`Node::raw_chain_source_status`].
+///
+/// Never carries a credential: errors name the endpoint by
+/// `scheme://host:port` only.
+///
+/// [`Node::raw_chain_source_status`]: crate::Node::raw_chain_source_status
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RawSourceStatus {
+	/// `true` when a raw source serves; `false` when one was set but its
+	/// configuration was refused at build time — `last_error` says why, and
+	/// raw serving is off.
+	pub configured: bool,
+	/// When the source last answered (UNIX seconds) — data, or a clean "not
+	/// there".
+	pub last_ok_unix: Option<u64>,
+	/// The source's last failure: unreachable, refused, or malformed data.
+	pub last_error: Option<String>,
+	/// When `last_error` happened (UNIX seconds).
+	pub last_error_unix: Option<u64>,
+	/// Whether the bitcoind has `-blockfilterindex`: `None` until a filter
+	/// read answered or said the index is missing.
+	pub has_filter_index: Option<bool>,
+}
+
+/// The live [`RawSourceStatus`] a [`BitcoindRpcSource`] keeps up to date.
+#[derive(Debug)]
+pub(crate) struct RawSourceHealth {
+	status: Mutex<RawSourceStatus>,
+}
+
+fn unix_now() -> Option<u64> {
+	SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+impl RawSourceHealth {
+	/// A configured source that has not been asked anything yet.
+	pub(crate) fn new() -> Self {
+		Self { status: Mutex::new(RawSourceStatus { configured: true, ..Default::default() }) }
+	}
+
+	/// A source whose configuration was refused, for `reason`.
+	pub(crate) fn refused(reason: String) -> Self {
+		Self {
+			status: Mutex::new(RawSourceStatus {
+				configured: false,
+				last_error: Some(reason),
+				last_error_unix: unix_now(),
+				..Default::default()
+			}),
+		}
+	}
+
+	/// Notes how a call went. `filter_read` marks a `getblockfilter` read,
+	/// which is what tells whether the index is there.
+	pub(crate) fn record<T>(&self, result: &Result<T, SourceError>, filter_read: bool) {
+		let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+		match result {
+			Ok(_) => {
+				status.last_ok_unix = unix_now();
+				if filter_read {
+					status.has_filter_index = Some(true);
+				}
+			},
+			Err(SourceError::NotFound(_)) => status.last_ok_unix = unix_now(),
+			Err(e) => {
+				if let SourceError::Unavailable { reason, .. } = e {
+					if reason.starts_with(NO_FILTER_INDEX_REASON) {
+						status.has_filter_index = Some(false);
+					}
+				}
+				status.last_error = Some(e.to_string());
+				status.last_error_unix = unix_now();
+			},
+		}
+	}
+
+	pub(crate) fn snapshot(&self) -> RawSourceStatus {
+		self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+}
+
+/// Whether `host` (as a URL renders it) is this machine: `127.0.0.0/8`,
+/// `::1` or `localhost`.
+fn is_loopback_host(host: &str) -> bool {
+	let bare = host.trim_start_matches('[').trim_end_matches(']');
+	match bare.parse::<IpAddr>() {
+		Ok(ip) => ip.is_loopback(),
+		Err(_) => bare.eq_ignore_ascii_case("localhost"),
+	}
+}
 
 /// Fold a JSON-RPC error into a [`SourceError`].
 ///
@@ -244,6 +353,7 @@ pub(crate) struct BitcoindRpcSource {
 	/// `scheme://host:port`, for logs.
 	endpoint: String,
 	next_id: AtomicU64,
+	health: Arc<RawSourceHealth>,
 }
 
 impl fmt::Debug for BitcoindRpcSource {
@@ -259,9 +369,12 @@ impl BitcoindRpcSource {
 	/// A source reading `url` (`http://` or `https://`).
 	///
 	/// `user`/`password` are sent as basic auth when `user` is non-empty;
-	/// otherwise any `user:password@` in the URL is used. `cert_sha256` pins
-	/// the server's leaf certificate and requires `https://`. The error is a
-	/// reason fit for a log: it never carries a credential.
+	/// otherwise any `user:password@` in the URL is used. Credentials over
+	/// `http://` are refused unless the host is loopback (`127.0.0.0/8`,
+	/// `::1`, `localhost`): they would cross the network in the clear.
+	/// `cert_sha256` pins the server's leaf certificate and requires
+	/// `https://`. The error is a reason fit for a log: it never carries a
+	/// credential.
 	pub(crate) fn new(
 		url: &str, user: Option<String>, password: Option<String>, cert_sha256: Option<&str>,
 	) -> Result<Self, String> {
@@ -284,6 +397,14 @@ impl BitcoindRpcSource {
 			Some(user) => Some((user, password.unwrap_or_default())),
 			None => url_auth,
 		};
+
+		if !https && auth.is_some() && !is_loopback_host(&host) {
+			return Err(format!(
+				"refusing to send rpc credentials over plain http:// to {}: use https://, \
+				 or a loopback host (127.0.0.0/8, ::1, localhost)",
+				host
+			));
+		}
 
 		let endpoint = match url.port_or_known_default() {
 			Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
@@ -308,12 +429,24 @@ impl BitcoindRpcSource {
 		}
 		let client = builder.build().map_err(|e| format!("http client setup failed: {}", e))?;
 
-		Ok(Self { client, url, auth, endpoint, next_id: AtomicU64::new(1) })
+		Ok(Self {
+			client,
+			url,
+			auth,
+			endpoint,
+			next_id: AtomicU64::new(1),
+			health: Arc::new(RawSourceHealth::new()),
+		})
 	}
 
 	/// `scheme://host:port` of the RPC endpoint, credential-free.
 	pub(crate) fn endpoint(&self) -> &str {
 		&self.endpoint
+	}
+
+	/// The status this source keeps up to date as it is asked.
+	pub(crate) fn health(&self) -> Arc<RawSourceHealth> {
+		Arc::clone(&self.health)
 	}
 
 	fn transport_error(&self, e: reqwest::Error) -> SourceError {
@@ -493,11 +626,14 @@ impl BitcoindRpcSource {
 		Ok(hashes)
 	}
 
-	/// `getblockfilter` for each hash, in batches, as (filter, header).
-	async fn block_filters(
+	/// `getblockfilter` for each hash, in batches of [`FILTER_RPC_BATCH`],
+	/// handing each (filter, header) to `each` in order and dropping it
+	/// there: only what `each` keeps is held. Stops after the batch in which
+	/// `each` first answers `false`.
+	async fn for_each_block_filter(
 		&self, hashes: &[BlockHash],
-	) -> Result<Vec<(BlockFilter, FilterHeader)>, SourceError> {
-		let mut out = Vec::with_capacity(hashes.len());
+		mut each: impl FnMut(BlockFilter, FilterHeader) -> Result<bool, SourceError>,
+	) -> Result<(), SourceError> {
 		for batch in hashes.chunks(FILTER_RPC_BATCH) {
 			let params = batch.iter().map(|h| json!([h.to_string(), "basic"])).collect();
 			let results = self
@@ -521,45 +657,15 @@ impl BitcoindRpcSource {
 					.map_err(|e| SourceError::Invalid(format!("getblockfilter header: {}", e)))?;
 				let content = Vec::<u8>::from_hex(filter_hex)
 					.map_err(|e| SourceError::Invalid(format!("getblockfilter filter: {}", e)))?;
-				out.push((BlockFilter { content }, header));
+				if !each(BlockFilter { content }, header)? {
+					return Ok(());
+				}
 			}
 		}
-		Ok(out)
-	}
-}
-
-fn parse_block_hash(value: &Value, what: &str) -> Result<BlockHash, SourceError> {
-	value
-		.as_str()
-		.ok_or_else(|| SourceError::Invalid(format!("{}: not a string", what)))?
-		.parse::<BlockHash>()
-		.map_err(|e| SourceError::Invalid(format!("{}: {}", what, e)))
-}
-
-fn parse_height(header: &Value) -> Result<u32, SourceError> {
-	header
-		.get("height")
-		.and_then(Value::as_u64)
-		.and_then(|h| u32::try_from(h).ok())
-		.ok_or_else(|| SourceError::Invalid("getblockheader: no height".into()))
-}
-
-fn parse_hex<T: bitcoin::consensus::Decodable>(
-	value: &Value, what: &str,
-) -> Result<T, SourceError> {
-	let hex = value.as_str().ok_or_else(|| SourceError::Invalid(format!("{}: not hex", what)))?;
-	let bytes =
-		Vec::<u8>::from_hex(hex).map_err(|e| SourceError::Invalid(format!("{}: {}", what, e)))?;
-	deserialize(&bytes).map_err(|e| SourceError::Invalid(format!("{}: {}", what, e)))
-}
-
-#[async_trait]
-impl FilterSource for BitcoindRpcSource {
-	fn name(&self) -> &'static str {
-		"bitcoind_rpc"
+		Ok(())
 	}
 
-	async fn tip(&self) -> Result<BlockId, SourceError> {
+	async fn read_tip(&self) -> Result<BlockId, SourceError> {
 		let timeout = Duration::from_secs(RAW_RPC_CALL_TIMEOUT_SECS);
 		let hash = parse_block_hash(
 			&self.call("getbestblockhash", json!([]), timeout).await?,
@@ -569,8 +675,7 @@ impl FilterSource for BitcoindRpcSource {
 		Ok(BlockId { height: parse_height(&header)?, hash })
 	}
 
-	/// Clamped to [`MAX_HEADERS_PER_REQUEST`]; the contract allows fewer.
-	async fn headers(&self, from_height: u32, count: u32) -> Result<Vec<Header>, SourceError> {
+	async fn read_headers(&self, from_height: u32, count: u32) -> Result<Vec<Header>, SourceError> {
 		let count = count.min(MAX_HEADERS_PER_REQUEST);
 		if count == 0 {
 			return Ok(Vec::new());
@@ -602,7 +707,10 @@ impl FilterSource for BitcoindRpcSource {
 		Ok(headers)
 	}
 
-	async fn filter_headers(
+	/// The span's filter headers, or those of its first
+	/// [`FILTER_HEADERS_PER_REPLY`] blocks: each batch of filters read is
+	/// checked against its headers and dropped, only the headers kept.
+	async fn read_filter_headers(
 		&self, start_height: u32, stop_hash: BlockHash,
 	) -> Result<FilterHeaders, SourceError> {
 		// Read one block below the span too, for `previous`.
@@ -617,45 +725,58 @@ impl FilterSource for BitcoindRpcSource {
 				stop_hash, start_height
 			)));
 		}
-		let fetched = self.block_filters(&hashes).await?;
+		let below = usize::from(start_height > 0);
+		let read = hashes.len().min(FILTER_HEADERS_PER_REPLY as usize + below);
 
 		let mut previous = FilterHeader::all_zeros();
-		let mut headers = Vec::with_capacity(fetched.len());
-		for (i, (filter, header)) in fetched.into_iter().enumerate() {
-			if i == 0 && start_height > 0 {
+		let mut headers: Vec<FilterHeader> = Vec::with_capacity(read - below);
+		let mut height = first_height;
+		self.for_each_block_filter(&hashes[..read], |filter, header| {
+			if height < start_height {
 				previous = header;
-				continue;
+			} else {
+				let expected_prev = headers.last().copied().unwrap_or(previous);
+				if filter.filter_header(&expected_prev) != header {
+					return Err(SourceError::Invalid(format!(
+						"filter header at height {} does not commit to its filter",
+						height
+					)));
+				}
+				headers.push(header);
 			}
-			let expected_prev = headers.last().copied().unwrap_or(previous);
-			if filter.filter_header(&expected_prev) != header {
-				return Err(SourceError::Invalid(format!(
-					"filter header at height {} does not commit to its filter",
-					first_height as usize + i
-				)));
-			}
-			headers.push(header);
-		}
+			height += 1;
+			Ok(true)
+		})
+		.await?;
 		Ok(FilterHeaders { previous, headers })
 	}
 
-	async fn filters(
+	/// The span's filters, or as many from its start as fit in
+	/// [`FILTER_BYTES_PER_REPLY`] — at least one.
+	async fn read_filters(
 		&self, start_height: u32, stop_hash: BlockHash,
 	) -> Result<Vec<IndexedFilter>, SourceError> {
 		let hashes = self.resolve_span(start_height, stop_hash, MAX_FILTERS_PER_REQUEST).await?;
-		let fetched = self.block_filters(&hashes).await?;
-		Ok(hashes
-			.into_iter()
-			.zip(fetched)
-			.enumerate()
-			.map(|(i, (block_hash, (filter, _)))| IndexedFilter {
+		let mut out: Vec<IndexedFilter> = Vec::with_capacity(hashes.len());
+		let mut bytes = 0usize;
+		self.for_each_block_filter(&hashes, |filter, _header| {
+			bytes = bytes.saturating_add(filter.content.len());
+			if !out.is_empty() && bytes > FILTER_BYTES_PER_REPLY {
+				return Ok(false);
+			}
+			let i = out.len();
+			out.push(IndexedFilter {
 				height: start_height + i as u32,
-				block_hash,
+				block_hash: hashes[i],
 				filter,
-			})
-			.collect())
+			});
+			Ok(true)
+		})
+		.await?;
+		Ok(out)
 	}
 
-	async fn block(&self, hash: BlockHash) -> Result<Block, SourceError> {
+	async fn read_block(&self, hash: BlockHash) -> Result<Block, SourceError> {
 		let value = self
 			.call(
 				"getblock",
@@ -671,6 +792,74 @@ impl FilterSource for BitcoindRpcSource {
 			)));
 		}
 		Ok(block)
+	}
+}
+
+fn parse_block_hash(value: &Value, what: &str) -> Result<BlockHash, SourceError> {
+	value
+		.as_str()
+		.ok_or_else(|| SourceError::Invalid(format!("{}: not a string", what)))?
+		.parse::<BlockHash>()
+		.map_err(|e| SourceError::Invalid(format!("{}: {}", what, e)))
+}
+
+fn parse_height(header: &Value) -> Result<u32, SourceError> {
+	header
+		.get("height")
+		.and_then(Value::as_u64)
+		.and_then(|h| u32::try_from(h).ok())
+		.ok_or_else(|| SourceError::Invalid("getblockheader: no height".into()))
+}
+
+fn parse_hex<T: bitcoin::consensus::Decodable>(
+	value: &Value, what: &str,
+) -> Result<T, SourceError> {
+	let hex = value.as_str().ok_or_else(|| SourceError::Invalid(format!("{}: not hex", what)))?;
+	let bytes =
+		Vec::<u8>::from_hex(hex).map_err(|e| SourceError::Invalid(format!("{}: {}", what, e)))?;
+	deserialize(&bytes).map_err(|e| SourceError::Invalid(format!("{}: {}", what, e)))
+}
+
+/// Every read is noted in the source's [`RawSourceHealth`].
+#[async_trait]
+impl FilterSource for BitcoindRpcSource {
+	fn name(&self) -> &'static str {
+		"bitcoind_rpc"
+	}
+
+	async fn tip(&self) -> Result<BlockId, SourceError> {
+		let result = self.read_tip().await;
+		self.health.record(&result, false);
+		result
+	}
+
+	/// Clamped to [`MAX_HEADERS_PER_REQUEST`]; the contract allows fewer.
+	async fn headers(&self, from_height: u32, count: u32) -> Result<Vec<Header>, SourceError> {
+		let result = self.read_headers(from_height, count).await;
+		self.health.record(&result, false);
+		result
+	}
+
+	async fn filter_headers(
+		&self, start_height: u32, stop_hash: BlockHash,
+	) -> Result<FilterHeaders, SourceError> {
+		let result = self.read_filter_headers(start_height, stop_hash).await;
+		self.health.record(&result, true);
+		result
+	}
+
+	async fn filters(
+		&self, start_height: u32, stop_hash: BlockHash,
+	) -> Result<Vec<IndexedFilter>, SourceError> {
+		let result = self.read_filters(start_height, stop_hash).await;
+		self.health.record(&result, true);
+		result
+	}
+
+	async fn block(&self, hash: BlockHash) -> Result<Block, SourceError> {
+		let result = self.read_block(hash).await;
+		self.health.record(&result, false);
+		result
 	}
 }
 
@@ -787,9 +976,42 @@ mod tests {
 		assert_eq!(source.auth.as_ref().unwrap().0, "user", "explicit credentials win");
 
 		let source =
-			BitcoindRpcSource::new("http://urluser:urlsecret@host", None, None, None).unwrap();
+			BitcoindRpcSource::new("http://urluser:urlsecret@127.0.0.1", None, None, None).unwrap();
 		assert_eq!(source.auth, Some(("urluser".into(), "urlsecret".into())));
 		assert!(!source.url.as_str().contains("urlsecret"));
+	}
+
+	#[test]
+	fn credentials_go_over_plain_http_only_to_a_loopback_host() {
+		let with_creds = |url: &str| {
+			BitcoindRpcSource::new(url, Some("user".into()), Some("s3cret".into()), None)
+		};
+		for remote in ["http://10.0.0.5:8332", "http://node.example:8332", "http://[2001:db8::1]"] {
+			let err = with_creds(remote).expect_err(remote);
+			assert!(err.contains("plain http://") && err.contains("https://"), "{}", err);
+			assert!(!err.contains("s3cret"), "{}", err);
+		}
+		let err = BitcoindRpcSource::new("http://u:urlsecret@10.0.0.5", None, None, None)
+			.expect_err("credentials in the URL count too");
+		assert!(!err.contains("urlsecret"), "{}", err);
+
+		for local in [
+			"http://127.0.0.1:8332",
+			"http://127.3.2.1:8332",
+			"http://[::1]:8332",
+			"http://localhost:8332",
+			"http://LocalHost:8332",
+			"https://node.example:8443",
+		] {
+			assert!(with_creds(local).is_ok(), "{}", local);
+		}
+		// No credentials, nothing to leak: any host.
+		assert!(BitcoindRpcSource::new("http://node.example:8332", None, None, None).is_ok());
+		assert!(
+			BitcoindRpcSource::new("http://node.example:8332", Some(String::new()), None, None)
+				.is_ok(),
+			"an empty user is no credential"
+		);
 	}
 
 	// ── a canned bitcoind ────────────────────────────────────────────────
@@ -823,6 +1045,27 @@ mod tests {
 				})
 				.collect();
 			Self { blocks, filters, filter_headers, filter_index }
+		}
+
+		/// Every filter `len` bytes long, the filter headers chained over them.
+		fn with_filter_bytes(mut self, len: usize) -> Self {
+			self.filters = (0..self.blocks.len())
+				.map(|i| {
+					let mut content = vec![0xab; len];
+					content[..4].copy_from_slice(&(i as u32).to_le_bytes());
+					BlockFilter::new(&content)
+				})
+				.collect();
+			let mut prev = FilterHeader::all_zeros();
+			self.filter_headers = self
+				.filters
+				.iter()
+				.map(|f| {
+					prev = f.filter_header(&prev);
+					prev
+				})
+				.collect();
+			self
 		}
 
 		fn height_of(&self, hash: &str) -> Option<usize> {
@@ -1033,6 +1276,78 @@ mod tests {
 			"only the stop hash was resolved"
 		);
 		assert!(source.filters(5, tip.hash).await.is_ok(), "exactly the limit is fine");
+	}
+
+	#[tokio::test]
+	async fn filter_reads_answer_a_prefix_when_the_span_is_large() {
+		let chain = MockChain::new(260, true).with_filter_bytes(20_000);
+		let blocks = chain.blocks.clone();
+		let filter_headers = chain.filter_headers.clone();
+		let mock = mock_bitcoind(chain, None);
+		let source = BitcoindRpcSource::new(&mock.url, None, None, None).unwrap();
+
+		let fh = source.filter_headers(1, blocks[250].block_hash()).await.unwrap();
+		assert_eq!(fh.previous, filter_headers[0]);
+		assert_eq!(fh.headers, filter_headers[1..=FILTER_HEADERS_PER_REPLY as usize].to_vec());
+		let from_genesis = source.filter_headers(0, blocks[259].block_hash()).await.unwrap();
+		assert_eq!(from_genesis.headers.len(), FILTER_HEADERS_PER_REPLY as usize);
+
+		let filters = source.filters(100, blocks[199].block_hash()).await.unwrap();
+		assert_eq!(filters.len(), FILTER_BYTES_PER_REPLY / 20_000, "as many as fit");
+		for (i, f) in filters.iter().enumerate() {
+			assert_eq!((f.height, f.block_hash), (100 + i as u32, blocks[100 + i].block_hash()));
+		}
+	}
+
+	#[tokio::test]
+	async fn the_status_follows_the_reads_and_never_shows_credentials() {
+		let chain = MockChain::new(4, false);
+		let tip_hash = chain.blocks[3].block_hash();
+		let mock = mock_bitcoind(chain, None);
+		let source =
+			BitcoindRpcSource::new(&mock.url, Some("u".into()), Some("s3cret".into()), None)
+				.unwrap();
+		let health = source.health();
+		assert_eq!(
+			health.snapshot(),
+			RawSourceStatus { configured: true, ..Default::default() },
+			"nothing asked yet"
+		);
+
+		source.tip().await.unwrap();
+		let status = health.snapshot();
+		assert!(status.last_ok_unix.is_some() && status.last_error.is_none());
+		assert_eq!(status.has_filter_index, None, "not a filter read");
+
+		assert!(source.filters(0, tip_hash).await.is_err());
+		let status = health.snapshot();
+		assert_eq!(status.has_filter_index, Some(false));
+		let error = status.last_error.expect("the failure");
+		assert!(error.contains(NO_FILTER_INDEX_REASON), "{}", error);
+		assert!(status.last_error_unix.is_some());
+
+		let indexed = mock_bitcoind(MockChain::new(4, true), None);
+		let source =
+			BitcoindRpcSource::new(&indexed.url, Some("u".into()), Some("s3cret".into()), None)
+				.unwrap();
+		source.filters(0, tip_hash).await.unwrap();
+		assert_eq!(source.health().snapshot().has_filter_index, Some(true));
+
+		// Unreachable: an error that names the endpoint, not the credentials.
+		let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		drop(listener);
+		let source =
+			BitcoindRpcSource::new(&url, Some("u".into()), Some("s3cret".into()), None).unwrap();
+		assert!(source.tip().await.is_err());
+		let status = source.health().snapshot();
+		assert!(!format!("{:?}", status).contains("s3cret"), "{:?}", status);
+		assert!(status.last_error.is_some());
+		assert_eq!(status.last_ok_unix, None);
+
+		let refused = RawSourceHealth::refused("invalid rpc url".into()).snapshot();
+		assert!(!refused.configured);
+		assert_eq!(refused.last_error.as_deref(), Some("invalid rpc url"));
 	}
 
 	#[tokio::test]

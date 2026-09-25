@@ -5,7 +5,6 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::adapters::bitcoind_raw::BitcoindRpcSource;
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::birthday::birthday_checkpoint;
 #[cfg(feature = "cbf")]
@@ -585,9 +584,12 @@ impl NodeBuilder {
 	/// `-blockfilterindex=1`; without it headers and blocks are still served
 	/// and filter requests fail.
 	///
-	/// A URL or pin that does not parse fails the build with
-	/// [`BuildError::ChainSourceSetupFailed`]. Nothing is contacted until the
-	/// first request.
+	/// Credentials over plain `http://` are only sent to a loopback host;
+	/// anywhere else use `https://`. A configuration that is refused — a URL
+	/// or pin that does not parse, credentials over `http://` to another host
+	/// — does not fail the build: it is logged at error, raw serving is off,
+	/// and [`Node::raw_chain_source_status`] says why. Nothing is contacted
+	/// until the first request.
 	pub fn set_raw_chain_source_bitcoind_rpc(
 		&mut self, url: String, user: String, password: String, cert_sha256: Option<String>,
 	) -> &mut Self {
@@ -1692,23 +1694,13 @@ fn build_with_store_internal(
 
 	let mut chain_source = chain_source;
 	if let Some(raw) = raw_chain_source_config {
-		let source = BitcoindRpcSource::new(
+		// A refused configuration turns raw serving off and is logged; the node still builds.
+		chain_source.set_raw_source_bitcoind_rpc(
 			&raw.url,
 			Some(raw.user.clone()),
 			Some(raw.password.clone()),
 			raw.cert_sha256.as_deref(),
-		)
-		.map_err(|e| {
-			log_error!(logger, "Failed to set up the raw chain source: {}", e);
-			BuildError::ChainSourceSetupFailed
-		})?;
-		log_info!(
-			logger,
-			"Serving raw BIP157 data from bitcoind RPC at {}{}",
-			source.endpoint(),
-			if raw.cert_sha256.is_some() { " (certificate pinned)" } else { "" }
 		);
-		chain_source.set_raw_source(Arc::new(source));
 	}
 
 	let chain_source = Arc::new(chain_source);

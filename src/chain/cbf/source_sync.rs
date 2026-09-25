@@ -1058,11 +1058,16 @@ impl SourceSync {
 
 	/// Verifies the next span of filter headers and filters up to `top`, then queues one op per
 	/// block: the full block when its filter matches a watched script, the header otherwise.
-	/// Nothing is queued unless the whole span verified.
+	/// Nothing is queued unless the whole span taken verified.
+	///
+	/// The source may answer a prefix of the span asked — a serving node bounds its replies
+	/// by size — and the next batch continues from where it ended. Only an empty answer, or
+	/// one longer than asked, is a failure; a prefix that is not one shows up as a filter for
+	/// the wrong block or a filter header that does not match.
 	async fn filter_batch(&mut self, top: u32) -> Result<(), StepError> {
 		let start = self.filters_through + 1;
 		let stop = top.min(start + MAX_FILTERS_PER_REQUEST - 1);
-		let expected = (stop - start + 1) as usize;
+		let asked = (stop - start + 1) as usize;
 		let (stop_hash, verified_previous) = {
 			let chain = lock_headers(&self.chain);
 			(chain.hash(stop).expect("held"), chain.filter_header(start - 1))
@@ -1070,10 +1075,10 @@ impl SourceSync {
 
 		let served =
 			bounded(self.tuning.call_timeout, self.source.filter_headers(start, stop_hash)).await?;
-		if served.headers.len() != expected {
+		if served.headers.is_empty() || served.headers.len() > asked {
 			return Err(VerifyFailure::FilterHeaderCount {
 				start,
-				expected,
+				expected: asked,
 				got: served.headers.len(),
 			}
 			.into());
@@ -1091,10 +1096,35 @@ impl SourceSync {
 			),
 		}
 
+		// Ask the filters only for the blocks whose filter headers came.
+		let with_headers = served.headers.len();
+		let filters_stop = start + with_headers as u32 - 1;
+		let filters_stop_hash = if filters_stop == stop {
+			stop_hash
+		} else {
+			lock_headers(&self.chain).hash(filters_stop).expect("held")
+		};
 		let filters =
-			bounded(self.tuning.call_timeout, self.source.filters(start, stop_hash)).await?;
-		if filters.len() != expected {
-			return Err(VerifyFailure::FilterCount { start, expected, got: filters.len() }.into());
+			bounded(self.tuning.call_timeout, self.source.filters(start, filters_stop_hash))
+				.await?;
+		if filters.is_empty() || filters.len() > with_headers {
+			return Err(VerifyFailure::FilterCount {
+				start,
+				expected: with_headers,
+				got: filters.len(),
+			}
+			.into());
+		}
+		let expected = filters.len();
+		if expected < asked {
+			log_debug!(
+				self.logger,
+				"CBF filter source '{}' served {} of {} blocks from height {}; continuing from there.",
+				self.source.name(),
+				expected,
+				asked,
+				start
+			);
 		}
 
 		// Verify and match the whole span before queueing any of it.
@@ -1315,6 +1345,10 @@ pub(crate) mod test_support {
 		pub(crate) unavailable_calls: u32,
 		pub(crate) lie: Lie,
 		pub(crate) calls: HashMap<&'static str, usize>,
+		/// Most filter headers one answer carries: a prefix of the span beyond.
+		pub(crate) filter_headers_cap: Option<usize>,
+		/// Most filters one answer carries: a prefix of the span beyond.
+		pub(crate) filters_cap: Option<usize>,
 	}
 
 	pub(crate) struct FakeSource {
@@ -1332,6 +1366,8 @@ pub(crate) mod test_support {
 					unavailable_calls: 0,
 					lie: Lie::None,
 					calls: HashMap::new(),
+					filter_headers_cap: None,
+					filters_cap: None,
 				}),
 			};
 			source.mine(len, matched, 0);
@@ -1388,6 +1424,13 @@ pub(crate) mod test_support {
 
 		pub(crate) fn set_lie(&self, lie: Lie) {
 			self.st().lie = lie;
+		}
+
+		/// Answers at most `filter_headers` filter headers and `filters` filters at a time.
+		pub(crate) fn cap_replies(&self, filter_headers: Option<usize>, filters: Option<usize>) {
+			let mut st = self.st();
+			st.filter_headers_cap = filter_headers;
+			st.filters_cap = filters;
 		}
 
 		pub(crate) fn fail_next(&self, calls: u32) {
@@ -1466,6 +1509,9 @@ pub(crate) mod test_support {
 				Lie::FilterHeaderPrevious => previous = FilterHeader::from_byte_array([0x24; 32]),
 				_ => {},
 			}
+			if let Some(cap) = st.filter_headers_cap {
+				headers.truncate(cap);
+			}
 			Ok(FilterHeaders { previous, headers })
 		}
 
@@ -1474,7 +1520,9 @@ pub(crate) mod test_support {
 		) -> Result<Vec<IndexedFilter>, SourceError> {
 			let st = self.enter("filters")?;
 			let (start, stop) = Self::span(&st, start_height, stop_hash)?;
+			let cap = st.filters_cap.unwrap_or(usize::MAX);
 			Ok((start..=stop)
+				.take(cap)
 				.map(|h| IndexedFilter {
 					height: h as u32,
 					block_hash: st.blocks[h].block_hash(),
@@ -1694,6 +1742,34 @@ mod tests {
 		assert_eq!(h.ops_until_synced().await, expected);
 		assert!(h.source.calls("headers") >= (39 - 10) / 4, "headers came in lookahead-sized runs");
 		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn a_source_answering_prefixes_is_followed_to_the_tip() {
+		let source = FakeSource::new(40, &[25]);
+		source.cap_replies(Some(7), Some(3));
+		let mut h = start(source, 10, fast_tuning());
+		let mut expected = filtered(11..=24);
+		expected.push(Op::Full(25));
+		expected.extend(filtered(26..=39));
+		expected.push(Op::Synced(39));
+		assert_eq!(h.ops_until_synced().await, expected, "every block, in order, none twice");
+		assert!(h.source.calls("filters") >= 29 / 3, "in prefix-sized steps");
+		assert!(matches!(*h.sync_state_tx.borrow(), CbfSyncState::Active { .. }), "no strike");
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn an_empty_filters_answer_is_a_strike() {
+		let source = FakeSource::new(30, &[]);
+		source.cap_replies(None, Some(0));
+		let mut h = start(source, 10, fast_tuning());
+		let end = h.end_after_no_ops().await;
+		assert!(
+			matches!(&end, SourceSyncEnd::Failed(reason) if reason.contains("filter count")),
+			"{:?}",
+			end
+		);
 	}
 
 	#[tokio::test]

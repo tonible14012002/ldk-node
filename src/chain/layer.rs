@@ -30,6 +30,7 @@ use lightning_block_sync::gossip::UtxoSource;
 use lightning_transaction_sync::EsploraSyncClient;
 
 use crate::chain::adapters::bitcoind::BitcoindChainAdapter;
+use crate::chain::adapters::bitcoind_raw::{BitcoindRpcSource, RawSourceHealth, RawSourceStatus};
 use crate::chain::adapters::dependent::DependentChainAdapter;
 use crate::chain::adapters::electrum::ElectrumChainAdapter;
 use crate::chain::adapters::esplora::EsploraChainAdapter;
@@ -290,6 +291,8 @@ pub(crate) struct ChainLayer {
 	/// Raw BIP157/158 serving, on a node configured with a raw source.
 	/// Independent of `engine`; see [`RawChainServer`].
 	raw: Option<RawChainServer>,
+	/// How the raw source is doing — or why its configuration was refused.
+	raw_health: Option<Arc<RawSourceHealth>>,
 }
 
 impl ChainLayer {
@@ -311,6 +314,7 @@ impl ChainLayer {
 			recent_own_broadcasts: Mutex::new(RecentOwnBroadcasts::default()),
 			last_unverifiable_tip: Mutex::new(None),
 			raw: None,
+			raw_health: None,
 		}
 	}
 
@@ -321,6 +325,46 @@ impl ChainLayer {
 	/// serves read `source` alone.
 	pub(crate) fn set_raw_source(&mut self, source: Arc<dyn FilterSource>) {
 		self.raw = Some(RawChainServer::new(source, Arc::clone(&self.shared.logger)));
+	}
+
+	/// Serve raw BIP157/158 data read from a bitcoind's JSON-RPC at `url`.
+	///
+	/// A configuration [`BitcoindRpcSource`] refuses — a bad URL or pin,
+	/// credentials over plain `http://` to another host — turns raw serving
+	/// off, not the node: raw serving is a service to other nodes, and this
+	/// node's own Lightning channels must not wait on it. The refusal is
+	/// logged at error and kept for [`Self::raw_source_status`].
+	pub(crate) fn set_raw_source_bitcoind_rpc(
+		&mut self, url: &str, user: Option<String>, password: Option<String>,
+		cert_sha256: Option<&str>,
+	) {
+		let logger = Arc::clone(&self.shared.logger);
+		match BitcoindRpcSource::new(url, user, password, cert_sha256) {
+			Ok(source) => {
+				log_info!(
+					logger,
+					"Serving raw BIP157 data from bitcoind RPC at {}{}",
+					source.endpoint(),
+					if cert_sha256.is_some() { " (certificate pinned)" } else { "" }
+				);
+				self.raw_health = Some(source.health());
+				self.set_raw_source(Arc::new(source));
+			},
+			Err(reason) => {
+				log_error!(
+					logger,
+					"Raw chain source refused, raw BIP157 serving is off (the node starts without it): {}",
+					reason
+				);
+				self.raw = None;
+				self.raw_health = Some(Arc::new(RawSourceHealth::refused(reason)));
+			},
+		}
+	}
+
+	/// How the raw source is doing; `None` when none was configured.
+	pub(crate) fn raw_source_status(&self) -> Option<RawSourceStatus> {
+		self.raw_health.as_ref().map(|health| health.snapshot())
 	}
 
 	/// Slots for a backend whose single adapter fills every action slot on
@@ -3424,6 +3468,35 @@ mod tests {
 				));
 			}
 		}
+	}
+
+	/// A raw-source configuration that is refused leaves the node without
+	/// raw serving, not without a chain layer, and says why; a good one
+	/// serves and reports its health.
+	#[tokio::test]
+	async fn a_refused_raw_source_turns_raw_serving_off_not_the_node() {
+		let mut layer = esplora_preset();
+		assert_eq!(layer.raw_source_status(), None, "none configured");
+
+		layer.set_raw_source_bitcoind_rpc(
+			"http://10.1.2.3:8332",
+			Some("user".into()),
+			Some("s3cret".into()),
+			None,
+		);
+		assert!(matches!(layer.serve_tip().await, Err(Error::ChainServeUnsupported)));
+		let status = layer.raw_source_status().expect("the refusal is reported");
+		assert!(!status.configured);
+		let reason = status.last_error.expect("why");
+		assert!(reason.contains("https://") && !reason.contains("s3cret"), "{}", reason);
+
+		layer.set_raw_source_bitcoind_rpc("ftp://nowhere", None, None, None);
+		assert!(!layer.raw_source_status().unwrap().configured);
+
+		layer.set_raw_source_bitcoind_rpc("http://127.0.0.1:1", None, None, None);
+		let status = layer.raw_source_status().unwrap();
+		assert!(status.configured && status.last_error.is_none());
+		assert!(layer.raw.is_some(), "raw serving is on");
 	}
 
 	/// The raw serves answer only on a node with a raw source, whatever its

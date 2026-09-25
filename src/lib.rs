@@ -118,6 +118,8 @@ pub use crate::chain::provider as chain_provider;
 /// over its own transport to consume it.
 pub use crate::chain::cbf::source as chain_filter_source;
 
+pub use crate::chain::adapters::bitcoind_raw::RawSourceStatus;
+
 pub use bip39;
 pub use bitcoin;
 pub use lightning;
@@ -1823,6 +1825,16 @@ impl Node {
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
 		runtime.block_on(async move { chain_source.serve_mempool(&req).await })
+	}
+
+	/// How this node's raw chain source — the bitcoind set through
+	/// [`Builder::set_raw_chain_source_bitcoind_rpc`] — is doing: when it last
+	/// answered, its last error, and whether it has the block filter index.
+	/// `configured` is `false` when the configuration was refused at build time
+	/// (raw serving is then off, and `last_error` says why). `None` when no raw
+	/// source was set. Never carries a credential.
+	pub fn raw_chain_source_status(&self) -> Option<RawSourceStatus> {
+		self.chain_source.raw_source_status()
 	}
 
 	/// Serve this node's raw source's best block to another node.
