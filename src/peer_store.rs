@@ -40,10 +40,16 @@ where
 		Self { peers, kv_store, logger }
 	}
 
+	/// Adds the peer, or updates its address if it is already known under a different one.
+	///
+	/// Every caller persists only after a connection to `peer_info.address` succeeded, so the
+	/// newest address is the one known to work. Keeping the first address instead would leave
+	/// the background reconnection loop dialling a stale address forever once a peer's address
+	/// changes (e.g. a new public IP, or a new relay port for a NAT'd peer).
 	pub(crate) fn add_peer(&self, peer_info: PeerInfo) -> Result<(), Error> {
 		let mut locked_peers = self.peers.write().unwrap();
 
-		if locked_peers.contains_key(&peer_info.node_id) {
+		if locked_peers.get(&peer_info.node_id) == Some(&peer_info) {
 			return Ok(());
 		}
 
@@ -191,5 +197,40 @@ mod tests {
 		assert_eq!(peers.len(), 1);
 		assert_eq!(peers[0], expected_peer_info);
 		assert_eq!(deser_peer_store.get_peer(&node_id), Some(expected_peer_info));
+	}
+
+	#[test]
+	fn add_peer_updates_a_changed_address() {
+		let store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let logger = Arc::new(TestLogger::new());
+		let peer_store = PeerStore::new(Arc::clone(&store), Arc::clone(&logger));
+
+		let node_id = PublicKey::from_str(
+			"0276607124ebe6a6c9338517b6f485825b27c2dcc0b9fc2aa6a4c0df91194e5993",
+		)
+		.unwrap();
+		let old = PeerInfo { node_id, address: SocketAddress::from_str("34.1.1.1:20001").unwrap() };
+		let new = PeerInfo { node_id, address: SocketAddress::from_str("34.2.2.2:20007").unwrap() };
+
+		peer_store.add_peer(old.clone()).unwrap();
+		assert_eq!(peer_store.get_peer(&node_id), Some(old.clone()));
+
+		// Same address again: unchanged.
+		peer_store.add_peer(old).unwrap();
+		assert_eq!(peer_store.list_peers().len(), 1);
+
+		// A new address replaces the old one, in memory and on disk.
+		peer_store.add_peer(new.clone()).unwrap();
+		assert_eq!(peer_store.list_peers(), vec![new.clone()]);
+		let persisted_bytes = store
+			.read(
+				PEER_INFO_PERSISTENCE_PRIMARY_NAMESPACE,
+				PEER_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
+				PEER_INFO_PERSISTENCE_KEY,
+			)
+			.unwrap();
+		let deser_peer_store =
+			PeerStore::read(&mut &persisted_bytes[..], (Arc::clone(&store), logger)).unwrap();
+		assert_eq!(deser_peer_store.get_peer(&node_id), Some(new));
 	}
 }
