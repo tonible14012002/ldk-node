@@ -59,6 +59,11 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unix_now_secs() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
 
 pub(crate) enum OnchainSendAmount {
 	ExactRetainingReserve { amount_sats: u64, cur_anchor_reserve_sats: u64 },
@@ -383,24 +388,54 @@ where
 			},
 		}
 
+		let tx = psbt.extract_tx().map_err(|e| {
+			log_error!(self.logger, "Failed to extract transaction: {}", e);
+			e
+		})?;
+
+		// Reserve the inputs. BDK keeps a coin selectable until a transaction spending it is in
+		// the wallet's graph, and LDK only broadcasts this one after the peer's `funding_signed`
+		// — so without this, a second open in that window (or before the next sync) picks the
+		// same coins and its funding transaction is a double-spend the network rejects, leaving
+		// a channel that waits for confirmations forever (upstream lightningdevkit/ldk-node#41).
+		// The reservation is released by `release_funding_transaction` when LDK discards the
+		// funding, by the BROADCAST tail when the network rejects it, and by a sync that finds
+		// it in neither the mempool nor the chain.
+		locked_wallet.apply_unconfirmed_txs(vec![(tx.clone(), unix_now_secs())]);
+
 		let mut locked_persister = self.persister.lock().unwrap();
 		locked_wallet.persist(&mut locked_persister).map_err(|e| {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
 		})?;
 
-		let tx = psbt.extract_tx().map_err(|e| {
-			log_error!(self.logger, "Failed to extract transaction: {}", e);
-			e
-		})?;
-
 		Ok(tx)
+	}
+
+	/// Hands the inputs of a funding transaction built by [`Self::create_funding_transaction`]
+	/// back to coin selection, for a funding LDK will never broadcast (the channel closed
+	/// first, or `funding_transaction_generated` refused it).
+	pub(crate) fn release_funding_transaction(&self, txid: Txid) -> Result<(), Error> {
+		let mut locked_wallet = self.inner.lock().unwrap();
+		if locked_wallet.tx_graph().get_tx(txid).is_none() {
+			return Ok(());
+		}
+		locked_wallet.apply_evicted_txs(vec![(txid, unix_now_secs())]);
+
+		let mut locked_persister = self.persister.lock().unwrap();
+		locked_wallet.persist(&mut locked_persister).map_err(|e| {
+			log_error!(self.logger, "Failed to persist wallet: {}", e);
+			Error::PersistenceFailed
+		})?;
+		log_debug!(self.logger, "Released the inputs of discarded funding transaction {}", txid);
+
+		Ok(())
 	}
 
 	/// Builds a fully-signed funding transaction paying `amount` to an arbitrary `output_script`
 	/// (e.g. a P2WSH submarine-swap HTLC output) at the fee rate implied by `confirmation_target`,
 	/// with the supplied `locktime`. The returned [`Transaction`] is signed and persisted but **not**
-	/// broadcast.
+	/// broadcast; its inputs are reserved in the wallet exactly as for a channel funding.
 	///
 	/// This is a thin swaps-gated wrapper over [`Wallet::create_funding_transaction`]; it does not
 	/// alter the existing behaviour of that method in any way.
@@ -1471,6 +1506,96 @@ mod chain_listen_tests {
 		assert_eq!(spendable, 50_000, "a deposit anchored in a block is confirmed");
 		assert!(wallet.get_unconfirmed_txids().is_empty());
 		assert!(wallet.get_cached_txs().iter().any(|tx| tx.compute_txid() == txid));
+	}
+
+	/// A wallet holding one confirmed 50 000 sat coin, the shape of a node that was just funded.
+	fn wallet_with_one_confirmed_coin() -> (Arc<Wallet>, Arc<DynStore>, bitcoin::OutPoint) {
+		let (wallet, store) = fresh_wallet();
+		let address = wallet.get_new_address().expect("address");
+		let deposit = deposit_to(address.script_pubkey());
+		let coin = bitcoin::OutPoint { txid: deposit.compute_txid(), vout: 0 };
+		let header = header_on(wallet.current_best_block().block_hash, 3);
+		wallet.filtered_block_connected(&header, &[(0, &deposit)], 1);
+		(wallet, store, coin)
+	}
+
+	fn channel_output(seed: u8) -> ScriptBuf {
+		ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::hash(&[seed]))
+	}
+
+	fn fund_channel(wallet: &Wallet, seed: u8, sats: u64) -> Result<Transaction, crate::Error> {
+		wallet.create_funding_transaction(
+			channel_output(seed),
+			Amount::from_sat(sats),
+			super::ConfirmationTarget::ChannelFunding,
+			absolute::LockTime::ZERO,
+		)
+	}
+
+	fn spends(tx: &Transaction, coin: bitcoin::OutPoint) -> bool {
+		tx.input.iter().any(|input| input.previous_output == coin)
+	}
+
+	/// Two opens before the first funding is broadcast (autopilot opened two channels 228 ms
+	/// apart on a node with one coin): the second must not be built from the coin the first
+	/// already spends — that funding is a double-spend the network rejects, and its channel
+	/// then waits for confirmations forever (lightningdevkit/ldk-node#41).
+	#[test]
+	fn back_to_back_fundings_never_spend_the_same_coin() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+
+		let first = fund_channel(&wallet, 1, 12_000).expect("the coin funds the first channel");
+		assert!(spends(&first, coin));
+
+		match fund_channel(&wallet, 2, 12_000) {
+			Ok(second) => {
+				assert!(!spends(&second, coin), "the second funding reuses the first's coin");
+				let first_txid = first.compute_txid();
+				assert!(
+					second.input.iter().all(|input| input.previous_output.txid == first_txid),
+					"with one coin, only the first funding's change is left to spend"
+				);
+			},
+			Err(e) => assert_eq!(e, crate::Error::InsufficientFunds),
+		}
+	}
+
+	#[test]
+	fn a_funding_too_big_for_what_is_left_fails_instead_of_double_spending() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+
+		let first = fund_channel(&wallet, 1, 30_000).expect("the coin funds the first channel");
+		assert!(spends(&first, coin));
+		assert_eq!(
+			fund_channel(&wallet, 2, 30_000).map(|tx| tx.compute_txid()),
+			Err(crate::Error::InsufficientFunds),
+			"the only coin is reserved by the first funding"
+		);
+	}
+
+	#[test]
+	fn releasing_a_discarded_funding_hands_its_coin_back() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+
+		let first = fund_channel(&wallet, 1, 30_000).expect("the coin funds the first channel");
+		wallet.release_funding_transaction(first.compute_txid()).expect("release");
+
+		let retry = fund_channel(&wallet, 2, 30_000).expect("the coin is spendable again");
+		assert!(spends(&retry, coin));
+		assert!(
+			!wallet.get_unconfirmed_txids().contains(&first.compute_txid()),
+			"the discarded funding no longer counts as an unconfirmed spend"
+		);
+	}
+
+	#[test]
+	fn releasing_a_transaction_the_wallet_never_built_is_a_no_op() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		wallet
+			.release_funding_transaction(bitcoin::Txid::from_byte_array([9u8; 32]))
+			.expect("an unknown txid is not an error");
+		let funding = fund_channel(&wallet, 1, 30_000).expect("the coin is untouched");
+		assert!(spends(&funding, coin));
 	}
 
 	#[test]

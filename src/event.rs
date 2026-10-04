@@ -30,7 +30,7 @@ use crate::io::{
 use crate::logger::{log_debug, log_error, log_info, LdkLogger};
 
 use lightning::events::bump_transaction::BumpTransactionEvent;
-use lightning::events::{ClosureReason, PaymentPurpose, ReplayEvent};
+use lightning::events::{ClosureReason, FundingInfo, PaymentPurpose, ReplayEvent};
 use lightning::events::{Event as LdkEvent, PaymentFailureReason};
 use lightning::impl_writeable_tlv_based_enum;
 use lightning::ln::channelmanager::PaymentId;
@@ -486,6 +486,17 @@ where
 		}
 	}
 
+	fn release_unbroadcast_funding(&self, funding_txid: bitcoin::Txid) {
+		if let Err(e) = self.wallet.release_funding_transaction(funding_txid) {
+			log_error!(
+				self.logger,
+				"Failed to release the inputs of funding transaction {}: {}",
+				funding_txid,
+				e
+			);
+		}
+	}
+
 	pub async fn handle_event(&self, event: LdkEvent) -> Result<(), ReplayEvent> {
 		match event {
 			LdkEvent::FundingGenerationReady {
@@ -512,6 +523,7 @@ where
 					locktime,
 				) {
 					Ok(final_tx) => {
+						let funding_txid = final_tx.compute_txid();
 						// Give the funding transaction back to LDK for opening the channel.
 						match self.channel_manager.funding_transaction_generated(
 							temporary_channel_id,
@@ -528,14 +540,16 @@ where
 									self.logger,
 									"Failed to process funding transaction as channel went away before we could fund it: {}",
 									err
-								)
+								);
+								self.release_unbroadcast_funding(funding_txid);
 							},
 							Err(err) => {
 								log_error!(
 									self.logger,
 									"Failed to process funding transaction: {:?}",
 									err
-								)
+								);
+								self.release_unbroadcast_funding(funding_txid);
 							},
 						}
 					},
@@ -1450,7 +1464,19 @@ where
 					},
 				};
 			},
-			LdkEvent::DiscardFunding { .. } => {},
+			LdkEvent::DiscardFunding { channel_id, funding_info } => {
+				// LDK will never broadcast this funding: hand its inputs back to the wallet, which
+				// reserved them when it built the transaction.
+				if let FundingInfo::Tx { transaction } = funding_info {
+					log_info!(
+						self.logger,
+						"Discarding funding transaction {} of channel {}",
+						transaction.compute_txid(),
+						channel_id
+					);
+					self.release_unbroadcast_funding(transaction.compute_txid());
+				}
+			},
 			LdkEvent::HTLCIntercepted {
 				requested_next_hop_scid,
 				intercept_id,
