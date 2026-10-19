@@ -8,6 +8,7 @@
 use persist::KVStoreWalletPersister;
 
 use crate::config::Config;
+use crate::dead_funding::{find_dead_fundings, DeadFundingProof};
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger};
 
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator};
@@ -55,7 +56,7 @@ use bitcoin::bip32::{ChildNumber, Xpriv};
 #[cfg(feature = "swaps")]
 use bitcoin::secp256k1::Keypair;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -430,6 +431,25 @@ where
 		log_debug!(self.logger, "Released the inputs of discarded funding transaction {}", txid);
 
 		Ok(())
+	}
+
+	/// Which of `candidates` — funding transactions this wallet built — can never confirm, by
+	/// the wallet's own view of the chain, each with the proof. See [`crate::dead_funding`].
+	///
+	/// `known_dead` are fundings proven dead on an earlier pass, so a child of one is still
+	/// caught once its parent's monitor is gone.
+	pub(crate) fn find_dead_fundings(
+		&self, candidates: impl IntoIterator<Item = Txid>, known_dead: &HashSet<Txid>,
+	) -> HashMap<Txid, DeadFundingProof> {
+		let locked_wallet = self.inner.lock().unwrap();
+		let tip = locked_wallet.latest_checkpoint().block_id();
+		find_dead_fundings(
+			locked_wallet.tx_graph(),
+			locked_wallet.local_chain(),
+			tip,
+			candidates,
+			known_dead,
+		)
 	}
 
 	/// Builds a fully-signed funding transaction paying `amount` to an arbitrary `output_script`
@@ -1391,6 +1411,7 @@ mod broadcast_eviction_tests {
 #[cfg(test)]
 mod chain_listen_tests {
 	//! `Listen` on the on-chain wallet, driven the way a filter-driven engine drives it.
+	use std::collections::{HashMap, HashSet};
 	use std::sync::Arc;
 
 	use bdk_wallet::{KeychainKind, Wallet as BdkWallet};
@@ -1405,6 +1426,7 @@ mod chain_listen_tests {
 
 	use super::persist::KVStoreWalletPersister;
 	use crate::config::Config;
+	use crate::dead_funding::DeadFundingProof;
 	use crate::fee_estimator::OnchainFeeEstimator;
 	use crate::io::{
 		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
@@ -1610,5 +1632,157 @@ mod chain_listen_tests {
 		let with_index = wallet.revealed_spk_index();
 		assert_eq!(with_index.get(&revealed), Some(&(KeychainKind::External, 0)));
 		assert!(wallet.list_watched_scripts().len() >= before.len());
+	}
+
+	/// Mines `tx` (if any) into the next block on the wallet's chain and returns its height.
+	fn mine(wallet: &Wallet, tx: Option<&Transaction>, nonce: u32) -> u32 {
+		let best = wallet.current_best_block();
+		let header = header_on(best.block_hash, nonce);
+		let height = best.height + 1;
+		match tx {
+			Some(tx) => wallet.filtered_block_connected(&header, &[(0, tx)], height),
+			None => wallet.filtered_block_connected(&header, &[], height),
+		}
+		height
+	}
+
+	fn mine_empty(wallet: &Wallet, blocks: u32) {
+		for i in 0..blocks {
+			mine(wallet, None, 1_000 + i);
+		}
+	}
+
+	fn dead(
+		wallet: &Wallet, candidates: &[&Transaction],
+	) -> HashMap<bitcoin::Txid, DeadFundingProof> {
+		wallet.find_dead_fundings(candidates.iter().map(|tx| tx.compute_txid()), &HashSet::new())
+	}
+
+	/// A funding of `sats` to channel `seed` spending `coin`, built the way the other open in
+	/// a race built it: from the same coin, outside this wallet's coin selection.
+	fn competing_funding(coin: bitcoin::OutPoint, seed: u8, sats: u64) -> Transaction {
+		Transaction {
+			version: transaction::Version::TWO,
+			lock_time: absolute::LockTime::ZERO,
+			input: vec![TxIn {
+				previous_output: coin,
+				script_sig: ScriptBuf::new(),
+				sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(sats),
+				script_pubkey: channel_output(seed),
+			}],
+		}
+	}
+
+	/// The chain seen live on 2026-10-19: funding A spent the only coin; A2 was built on A's
+	/// change; the network rejected A, and B — the other open in the race — spent the same
+	/// coin and confirmed. A and A2 can never confirm; B is a real channel.
+	fn phantom_chain(
+		wallet: &Wallet, coin: bitcoin::OutPoint,
+	) -> (Transaction, Transaction, Transaction, u32) {
+		let a = fund_channel(wallet, 1, 30_000).expect("the coin funds A");
+		assert!(spends(&a, coin));
+		let a2 = fund_channel(wallet, 2, 10_000).expect("A's change funds A2");
+		assert!(
+			a2.input.iter().all(|input| input.previous_output.txid == a.compute_txid()),
+			"A2 is built on the change of A"
+		);
+		// The network rejected A: the BROADCAST tail hands its inputs back. A2 is still
+		// "seen" as far as the wallet knows, which must not shield either of them.
+		wallet.release_funding_transaction(a.compute_txid()).expect("release");
+		let b = competing_funding(coin, 3, 30_000);
+		let b_height = mine(wallet, Some(&b), 77);
+		(a, a2, b, b_height)
+	}
+
+	#[test]
+	fn a_funding_whose_coin_another_buried_spend_took_is_dead_and_so_is_its_child() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let (a, a2, b, b_height) = phantom_chain(&wallet, coin);
+		mine_empty(&wallet, 5);
+		assert_eq!(wallet.current_best_block().height, b_height + 5, "B is six deep");
+
+		let found = dead(&wallet, &[&a, &a2, &b]);
+		assert_eq!(
+			found.get(&a.compute_txid()),
+			Some(&DeadFundingProof::ConflictingSpend {
+				input: coin,
+				conflicting_txid: b.compute_txid(),
+				confirmation_height: b_height,
+			}),
+			"A lost its coin to B"
+		);
+		assert_eq!(
+			found.get(&a2.compute_txid()),
+			Some(&DeadFundingProof::DeadParent { parent_txid: a.compute_txid() }),
+			"A2 spends the change of a dead funding"
+		);
+		assert!(!found.contains_key(&b.compute_txid()), "B is the channel that made it");
+		assert_eq!(found.len(), 2);
+	}
+
+	#[test]
+	fn five_confirmations_of_the_conflict_do_not_prove_a_funding_dead_yet() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let (a, a2, b, b_height) = phantom_chain(&wallet, coin);
+		mine_empty(&wallet, 4);
+		assert_eq!(wallet.current_best_block().height, b_height + 4, "B is five deep");
+		assert!(dead(&wallet, &[&a, &a2, &b]).is_empty(), "not buried: no proof yet");
+
+		mine_empty(&wallet, 1);
+		assert_eq!(dead(&wallet, &[&a, &a2, &b]).len(), 2, "the sixth confirmation proves it");
+	}
+
+	#[test]
+	fn a_pending_funding_with_no_conflict_is_not_dead() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let a = fund_channel(&wallet, 1, 30_000).expect("the coin funds A");
+		assert!(spends(&a, coin));
+		let a2 = fund_channel(&wallet, 2, 10_000).expect("A's change funds A2");
+		mine_empty(&wallet, 20);
+		assert!(dead(&wallet, &[&a, &a2]).is_empty(), "unconfirmed, but nothing took its coin");
+
+		// Released, and another spend of the coin seen in the mempool: still no proof.
+		wallet.release_funding_transaction(a.compute_txid()).expect("release");
+		let b = competing_funding(coin, 3, 30_000);
+		wallet.apply_mempool_txs(vec![(b.clone(), 5)], Vec::new()).expect("apply");
+		assert!(dead(&wallet, &[&a, &a2, &b]).is_empty(), "two pending spends prove nothing");
+	}
+
+	#[test]
+	fn a_confirmed_funding_is_never_dead() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let a = fund_channel(&wallet, 1, 30_000).expect("the coin funds A");
+		assert!(spends(&a, coin));
+		mine(&wallet, Some(&a), 5);
+		mine_empty(&wallet, 10);
+		assert!(dead(&wallet, &[&a]).is_empty());
+	}
+
+	#[test]
+	fn a_funding_the_wallet_did_not_build_is_left_alone() {
+		let (wallet, _store, _coin) = wallet_with_one_confirmed_coin();
+		let foreign = bitcoin::Txid::from_byte_array([0x55u8; 32]);
+		let found = wallet.find_dead_fundings([foreign], &HashSet::new());
+		assert!(found.is_empty(), "an inbound channel's funding is not in our graph");
+	}
+
+	#[test]
+	fn a_child_of_a_funding_recorded_dead_earlier_is_dead_without_the_parent_in_the_set() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let (a, a2, _b, _) = phantom_chain(&wallet, coin);
+		mine_empty(&wallet, 5);
+
+		// A's monitor was archived after an earlier pass: A is no longer a candidate, but the
+		// store still knows it.
+		let known_dead: HashSet<_> = [a.compute_txid()].into_iter().collect();
+		let found = wallet.find_dead_fundings([a2.compute_txid()], &known_dead);
+		assert_eq!(
+			found.get(&a2.compute_txid()),
+			Some(&DeadFundingProof::DeadParent { parent_txid: a.compute_txid() })
+		);
 	}
 }

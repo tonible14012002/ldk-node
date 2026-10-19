@@ -78,3 +78,10 @@ pub(crate) const BDK_WALLET_TX_GRAPH_KEY: &str = "tx_graph";
 pub(crate) const BDK_WALLET_INDEXER_PRIMARY_NAMESPACE: &str = "bdk_wallet";
 pub(crate) const BDK_WALLET_INDEXER_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const BDK_WALLET_INDEXER_KEY: &str = "indexer";
+
+/// The funding outpoints of channels proven dead by the chain will be persisted under this key.
+///
+/// See [`crate::dead_funding`].
+pub(crate) const DEAD_FUNDING_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
+pub(crate) const DEAD_FUNDING_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
+pub(crate) const DEAD_FUNDING_PERSISTENCE_KEY: &str = "dead_fundings";

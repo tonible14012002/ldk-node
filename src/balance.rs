@@ -56,6 +56,18 @@ pub struct BalanceDetails {
 	/// [`ChannelDetails::next_outbound_htlc_limit_msat`]: crate::ChannelDetails::next_outbound_htlc_limit_msat
 	/// [`Node::list_channels`]: crate::Node::list_channels
 	pub lightning_balances: Vec<LightningBalance>,
+	/// The Lightning balances of channels whose funding transaction can never confirm.
+	///
+	/// A funding this node built is proven dead once the chain shows one of its inputs spent
+	/// by another transaction, or once it spends the output of a dead transaction. Its
+	/// `ChannelMonitor` still reports the holder balance until the monitor is archived at the
+	/// next restart, but the coins it would have spent are still in the on-chain wallet, so
+	/// counting both would double count. These balances are left out of
+	/// [`total_lightning_balance_sats`] and [`lightning_balances`] and summed here instead.
+	///
+	/// [`total_lightning_balance_sats`]: Self::total_lightning_balance_sats
+	/// [`lightning_balances`]: Self::lightning_balances
+	pub dead_funding_balance_sats: u64,
 	/// A detailed list of balances currently being swept from the Lightning to the on-chain
 	/// wallet.
 	///

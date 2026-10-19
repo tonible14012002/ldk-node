@@ -642,6 +642,7 @@ dictionary BalanceDetails {
 	u64 total_anchor_channels_reserve_sats;
 	u64 total_lightning_balance_sats;
 	sequence<LightningBalance> lightning_balances;
+	u64 dead_funding_balance_sats;
 	sequence<PendingSweepBalance> pending_balances_from_channel_closures;
 };
 
