@@ -60,6 +60,7 @@ use crate::chain::{
 	ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS,
 };
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
+use crate::dead_funding::{reap_dead_fundings, DeadFundingStore};
 use crate::fee_estimator::{
 	conf_target_wire_name, get_all_conf_targets, FeeEstimator, OnchainFeeEstimator,
 };
@@ -293,6 +294,8 @@ pub(crate) struct ChainLayer {
 	raw: Option<RawChainServer>,
 	/// How the raw source is doing — or why its configuration was refused.
 	raw_health: Option<Arc<RawSourceHealth>>,
+	/// Fundings the chain has proven can never confirm; see [`crate::dead_funding`].
+	dead_fundings: Arc<DeadFundingStore>,
 }
 
 impl ChainLayer {
@@ -301,6 +304,8 @@ impl ChainLayer {
 		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
+		let dead_fundings =
+			Arc::new(DeadFundingStore::read_or_empty(Arc::clone(&kv_store), Arc::clone(&logger)));
 		Self {
 			slots,
 			engine,
@@ -315,6 +320,7 @@ impl ChainLayer {
 			last_unverifiable_tip: Mutex::new(None),
 			raw: None,
 			raw_health: None,
+			dead_fundings,
 		}
 	}
 
@@ -1160,7 +1166,40 @@ impl ChainLayer {
 		output_sweeper: Arc<Sweeper>,
 	) -> Result<(), Error> {
 		self.update_fee_rate_estimates().await?;
-		self.engine.sync_once(self, channel_manager, chain_monitor, output_sweeper).await
+		self.engine
+			.sync_once(
+				self,
+				Arc::clone(&channel_manager),
+				Arc::clone(&chain_monitor),
+				output_sweeper,
+			)
+			.await?;
+		self.reap_dead_fundings(&channel_manager, &chain_monitor);
+		Ok(())
+	}
+
+	/// Fundings the chain has proven can never confirm; see [`crate::dead_funding`].
+	pub(crate) fn dead_fundings(&self) -> &Arc<DeadFundingStore> {
+		&self.dead_fundings
+	}
+
+	/// One dead-funding detection pass over the node's own channel monitors, run by every
+	/// engine once an on-chain wallet sync has succeeded; see [`crate::dead_funding`]. An
+	/// engine with no on-chain wallet of its own has no graph to prove anything from.
+	pub(crate) fn reap_dead_fundings(
+		&self, channel_manager: &ChannelManager, chain_monitor: &ChainMonitor,
+	) {
+		let Some(wallet) = self.engine.onchain_wallet() else {
+			return;
+		};
+		reap_dead_fundings(
+			wallet,
+			channel_manager,
+			chain_monitor,
+			&self.dead_fundings,
+			&*self.shared.kv_store,
+			&self.shared.logger,
+		);
 	}
 
 	/// Whether any adapter fills the MEMPOOL slot. An engine with no mempool

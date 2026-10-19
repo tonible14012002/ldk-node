@@ -82,6 +82,7 @@ pub mod config;
 mod connection;
 pub mod custom_gossip;
 mod data_store;
+mod dead_funding;
 mod error;
 mod event;
 mod fee_estimator;
@@ -142,12 +143,12 @@ pub use event::Event;
 
 pub use io::utils::generate_entropy_mnemonic;
 
+use path_failure::PathFailureStore;
 /// Per-payment path-failure detail captured from LDK's `PaymentPathFailed` event
 /// (cooperative cycle-balance observability). The types are always public; the
 /// accessor `Node::path_failure` is gated behind the `cycles` feature like
 /// `Node::send_along_route`.
 pub use path_failure::{PathFailureClass, PathFailureInfo, PATH_FAILURE_STORE_CAPACITY};
-use path_failure::PathFailureStore;
 
 /// Public swap fee-priority selector (Peerswap native primitives, B-series).
 ///
@@ -273,6 +274,8 @@ pub struct Node {
 	payment_store: Arc<PaymentStore>,
 	is_listening: Arc<AtomicBool>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
+	/// Fundings proven dead by the chain; see [`dead_funding`].
+	dead_fundings: Arc<dead_funding::DeadFundingStore>,
 	/// Last `PaymentPathFailed` detail per payment (bounded, in-memory). Written by
 	/// the event handler, read via `Node::path_failure`.
 	path_failures: Arc<PathFailureStore>,
@@ -2087,10 +2090,20 @@ impl Node {
 			std::cmp::min(cur_anchor_reserve_sats, total_onchain_balance_sats);
 
 		let mut total_lightning_balance_sats = 0;
+		let mut dead_funding_balance_sats = 0;
 		let mut lightning_balances = Vec::new();
 		for (funding_txo, channel_id) in self.chain_monitor.list_monitors() {
 			match self.chain_monitor.get_monitor(funding_txo) {
 				Ok(monitor) => {
+					// A monitor whose funding can never confirm still reports the holder balance
+					// until it is archived at the next restart; the coins are in the on-chain
+					// wallet, so it is reported apart rather than counted twice.
+					if self.dead_fundings.contains(&funding_txo) {
+						for ldk_balance in monitor.get_claimable_balances() {
+							dead_funding_balance_sats += ldk_balance.claimable_amount_satoshis();
+						}
+						continue;
+					}
 					// unwrap safety: `get_counterparty_node_id` will always be `Some` after 0.0.110 and
 					// LDK Node 0.1 depended on 0.0.115 already.
 					let counterparty_node_id = monitor.get_counterparty_node_id().unwrap();
@@ -2122,6 +2135,7 @@ impl Node {
 			total_anchor_channels_reserve_sats,
 			total_lightning_balance_sats,
 			lightning_balances,
+			dead_funding_balance_sats,
 			pending_balances_from_channel_closures,
 		}
 	}

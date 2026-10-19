@@ -1032,8 +1032,8 @@ impl SyncEngine for CbfSyncEngine {
 		// `launch` derives is read from the same, still untouched, state.
 		let listener = Arc::new(ChainListener::new_gated(
 			Arc::clone(&self.onchain_wallet),
-			channel_manager,
-			chain_monitor,
+			Arc::clone(&channel_manager),
+			Arc::clone(&chain_monitor),
 			output_sweeper,
 			Arc::clone(layer.tx_broadcaster()),
 			Arc::clone(layer.fee_estimator()),
@@ -1100,6 +1100,9 @@ impl SyncEngine for CbfSyncEngine {
 					}
 				}
 				_ = mempool_interval.tick() => {
+					// Blocks apply on the applicator's task; this tick is where the loop
+					// looks at what they left behind.
+					layer.reap_dead_fundings(&channel_manager, &chain_monitor);
 					let Some(evictions) = self.mempool_borrow_due(&layer) else {
 						continue;
 					};

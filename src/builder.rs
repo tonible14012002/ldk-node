@@ -21,6 +21,7 @@ use crate::config::{
 
 use crate::connection::ConnectionManager;
 use crate::custom_gossip::CustomGossipMessageHandler;
+use crate::dead_funding;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
@@ -45,6 +46,7 @@ use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
 use crate::{Node, NodeMetrics};
 
+use lightning::chain::channelmonitor::ChannelMonitor;
 use lightning::chain::{chainmonitor, BestBlock, Watch};
 use lightning::io::Cursor;
 use lightning::ln::channelmanager::{self, ChainParameters, ChannelManagerReadArgs};
@@ -55,7 +57,7 @@ use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{
 	ProbabilisticScorer, ProbabilisticScoringDecayParameters, ProbabilisticScoringFeeParameters,
 };
-use lightning::sign::EntropySource;
+use lightning::sign::{EntropySource, InMemorySigner};
 
 use lightning::util::persist::{
 	read_channel_monitors, CHANNEL_MANAGER_PERSISTENCE_KEY,
@@ -76,7 +78,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Network};
 
 use bitcoin::bip32::{ChildNumber, Xpriv};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::default::Default;
 use std::fmt;
@@ -1820,7 +1822,7 @@ fn build_with_store_internal(
 	));
 
 	// Read ChannelMonitor state from store
-	let channel_monitors = match read_channel_monitors(
+	let mut channel_monitors = match read_channel_monitors(
 		Arc::clone(&kv_store),
 		Arc::clone(&keys_manager),
 		Arc::clone(&keys_manager),
@@ -1834,6 +1836,25 @@ fn build_with_store_internal(
 				return Err(BuildError::ReadFailed);
 			}
 		},
+	};
+
+	// Archive the monitors of fundings the chain has proven dead, recorded only once their
+	// channels were gone and the `ChannelManager` persisted without them, and keep them out
+	// of the `ChannelManager` and the `ChainMonitor`: a monitor cannot leave a running
+	// `ChainMonitor`, so this is where the rebroadcast loop over a dead funding ends. See
+	// `crate::dead_funding`.
+	let dead_fundings = Arc::clone(chain_source.dead_fundings());
+	let archived_dead_monitors = if dead_fundings.is_empty() {
+		HashSet::new()
+	} else {
+		let dead: Vec<_> = channel_monitors
+			.iter()
+			.map(|(_, monitor)| monitor.get_funding_txo().0)
+			.filter(|funding_txo| dead_fundings.contains(funding_txo))
+			.collect();
+		let archived = dead_funding::archive_dead_monitors(&*kv_store, &dead, &logger);
+		channel_monitors.retain(|(_, monitor)| !archived.contains(&monitor.get_funding_txo().0));
+		archived
 	};
 
 	let mut user_config = default_user_config(&config);
@@ -1873,28 +1894,64 @@ fn build_with_store_internal(
 			CHANNEL_MANAGER_PERSISTENCE_SECONDARY_NAMESPACE,
 			CHANNEL_MANAGER_PERSISTENCE_KEY,
 		) {
-			let mut reader = Cursor::new(res);
-			let channel_monitor_references =
-				channel_monitors.iter().map(|(_, chanmon)| chanmon).collect();
-			let read_args = ChannelManagerReadArgs::new(
-				Arc::clone(&keys_manager),
-				Arc::clone(&keys_manager),
-				Arc::clone(&keys_manager),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&chain_monitor),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&router),
-				Arc::clone(&message_router),
-				Arc::clone(&logger),
-				user_config,
-				channel_monitor_references,
-			);
-			let (_hash, channel_manager) =
-				<(BlockHash, ChannelManager)>::read(&mut reader, read_args).map_err(|e| {
+			let read_manager = |monitors: &[(BlockHash, ChannelMonitor<InMemorySigner>)]| {
+				let mut reader = Cursor::new(&res);
+				let channel_monitor_references =
+					monitors.iter().map(|(_, chanmon)| chanmon).collect();
+				let read_args = ChannelManagerReadArgs::new(
+					Arc::clone(&keys_manager),
+					Arc::clone(&keys_manager),
+					Arc::clone(&keys_manager),
+					Arc::clone(&fee_estimator),
+					Arc::clone(&chain_monitor),
+					Arc::clone(&tx_broadcaster),
+					Arc::clone(&router),
+					Arc::clone(&message_router),
+					Arc::clone(&logger),
+					user_config,
+					channel_monitor_references,
+				);
+				<(BlockHash, ChannelManager)>::read(&mut reader, read_args)
+					.map(|(_hash, channel_manager)| channel_manager)
+			};
+			match read_manager(&channel_monitors) {
+				Ok(channel_manager) => channel_manager,
+				Err(e) if !archived_dead_monitors.is_empty() => {
+					// Never expected: a dead funding is recorded only after the manager was
+					// persisted without its channel. Put the monitors back, forget the
+					// outpoints and read once more with every monitor, so a recorded
+					// outpoint can never keep the node down.
+					log_error!(
+						logger,
+						"Failed to read channel manager from KVStore with {} dead-funding monitor(s) archived; restoring them and retrying: {}",
+						archived_dead_monitors.len(),
+						e
+					);
+					dead_funding::undo_dead_monitor_archive(
+						&*kv_store,
+						&dead_fundings,
+						&archived_dead_monitors,
+						&logger,
+					);
+					channel_monitors = read_channel_monitors(
+						Arc::clone(&kv_store),
+						Arc::clone(&keys_manager),
+						Arc::clone(&keys_manager),
+					)
+					.map_err(|e| {
+						log_error!(logger, "Failed to read channel monitors: {}", e.to_string());
+						BuildError::ReadFailed
+					})?;
+					read_manager(&channel_monitors).map_err(|e| {
+						log_error!(logger, "Failed to read channel manager from KVStore: {}", e);
+						BuildError::ReadFailed
+					})?
+				},
+				Err(e) => {
 					log_error!(logger, "Failed to read channel manager from KVStore: {}", e);
-					BuildError::ReadFailed
-				})?;
-			channel_manager
+					return Err(BuildError::ReadFailed);
+				},
+			}
 		} else {
 			// We're starting a fresh node.
 			let genesis_block_hash =
@@ -2249,6 +2306,7 @@ fn build_with_store_internal(
 		payment_store,
 		is_listening,
 		node_metrics,
+		dead_fundings,
 		path_failures: Arc::new(crate::path_failure::PathFailureStore::new()),
 		#[cfg(feature = "swaps")]
 		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),

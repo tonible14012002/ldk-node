@@ -118,7 +118,9 @@ pub(crate) async fn run_tx_based_sync_loop(
 				return;
 			}
 			_ = onchain_wallet_sync_interval.tick() => {
-				let _ = backend.sync_onchain_wallet().await;
+				if backend.sync_onchain_wallet().await.is_ok() {
+					layer.reap_dead_fundings(&channel_manager, &chain_monitor);
+				}
 			}
 			_ = fee_rate_update_interval.tick() => {
 				let _ = layer.update_fee_rate_estimates().await;

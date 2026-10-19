@@ -757,7 +757,9 @@ impl SyncEngine for BitcoindSyncEngine {
 					return;
 				}
 				_ = chain_polling_interval.tick() => {
-					let _ = self.sync_once(&layer, Arc::clone(&channel_manager), Arc::clone(&chain_monitor), Arc::clone(&output_sweeper)).await;
+					if self.sync_once(&layer, Arc::clone(&channel_manager), Arc::clone(&chain_monitor), Arc::clone(&output_sweeper)).await.is_ok() {
+						layer.reap_dead_fundings(&channel_manager, &chain_monitor);
+					}
 				}
 				_ = fee_rate_update_interval.tick() => {
 					let _ = layer.update_fee_rate_estimates().await;
