@@ -1522,7 +1522,7 @@ impl Node {
 	fn open_channel_inner(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
-		announce_for_forwarding: bool,
+		announce_for_forwarding: bool, counterparty_reserve_proportional_millionths: Option<u32>,
 	) -> Result<UserChannelId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -1594,6 +1594,10 @@ impl Node {
 				.channel_handshake_config
 				.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
 		}
+		if let Some(ppm) = counterparty_reserve_proportional_millionths {
+			user_config.channel_handshake_config.their_channel_reserve_proportional_millionths =
+				ppm;
+		}
 
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = rand::thread_rng().gen::<u128>();
@@ -1650,6 +1654,34 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			false,
+			None,
+		)
+	}
+
+	/// Connect to a node and open a new unannounced channel, choosing the channel reserve the
+	/// counterparty must keep: `counterparty_reserve_proportional_millionths` of the channel value
+	/// (LDK's `their_channel_reserve_proportional_millionths`; upstream clamps it to a 1,000-sat
+	/// floor).
+	///
+	/// With an LDK build that honors an explicit `0` as "no reserve" (node-app-ldk-node's
+	/// `lightning-zero-reserve.patch`), `Some(0)` opens a channel whose counterparty can spend its
+	/// whole balance at once — e.g. an LSP pushing a gift to a node, where the pushed amount must be
+	/// spendable in full. The counterparty then has nothing at stake when broadcasting a revoked
+	/// state, so use it only where the pushed balance is the opener's own gift. Otherwise as
+	/// [`Node::open_channel`].
+	pub fn open_channel_with_counterparty_reserve(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		counterparty_reserve_proportional_millionths: u32,
+	) -> Result<UserChannelId, Error> {
+		self.open_channel_inner(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			false,
+			Some(counterparty_reserve_proportional_millionths),
 		)
 	}
 
@@ -1690,6 +1722,7 @@ impl Node {
 			push_to_counterparty_msat,
 			channel_config,
 			true,
+			None,
 		)
 	}
 
