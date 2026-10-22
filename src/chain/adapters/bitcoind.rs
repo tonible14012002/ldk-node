@@ -235,7 +235,16 @@ impl BitcoindChainAdapter {
 						"Failed to retrieve fee rate estimates: {}. Falling back to default of 1 sat/vb.",
 						e,
 					);
-					FeeRate::from_sat_per_kwu(250)
+					match (target, dev_closure_fee_rate()) {
+						(
+							ConfirmationTarget::Lightning(
+								LdkConfirmationTarget::UrgentOnChainSweep
+								| LdkConfirmationTarget::OutputSpendingFee,
+							),
+							Some(rate),
+						) => rate,
+						_ => FeeRate::from_sat_per_kwu(250),
+					}
 				},
 				(Err(e), _) => {
 					// On testnet `estimatesmartfee` can be unreliable so we just skip in
@@ -626,4 +635,20 @@ mod tests {
 				> Duration::from_secs(2 * 2 * BITCOIND_TCP_STREAM_RESPONSE_TIMEOUT_SECS)
 		);
 	}
+}
+
+/// `LDK_DEV_CLOSURE_SAT_PER_VB`: a test-only fee rate for closing transactions on regtest/signet.
+///
+/// Regtest has no fee history, so every target falls back to 1 sat/vB, the commitment
+/// transaction's own fee already meets the closure target, and a force close never spends
+/// from the wallet to bump its anchor. Raising only the two closure targets (urgent sweep,
+/// used with pending HTLCs, and output spending, used without) and not the commitment rate
+/// makes the CPFP path, and with it the on-chain anchor reserve, testable. Only consulted in
+/// the regtest/signet fallback branch, so it cannot touch mainnet.
+fn dev_closure_fee_rate() -> Option<FeeRate> {
+	std::env::var("LDK_DEV_CLOSURE_SAT_PER_VB")
+		.ok()
+		.and_then(|raw| raw.trim().parse::<u64>().ok())
+		.filter(|&sat_per_vb| sat_per_vb > 0)
+		.map(FeeRate::from_sat_per_vb_unchecked)
 }

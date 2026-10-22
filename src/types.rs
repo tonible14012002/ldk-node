@@ -268,6 +268,11 @@ pub struct ChannelDetails {
 	pub is_usable: bool,
 	/// Returns `true` if this channel is (or will be) publicly-announced
 	pub is_announced: bool,
+	/// The number of HTLCs pending in either direction.
+	///
+	/// A force close with pending HTLCs has to confirm before they time out, so LDK bumps it at
+	/// the urgent fee rate; without any, it bumps at the output-spending rate.
+	pub pending_htlc_count: u64,
 	/// The difference in the CLTV value between incoming HTLCs and an outbound HTLC forwarded over
 	/// the channel.
 	pub cltv_expiry_delta: Option<u16>,
@@ -345,6 +350,8 @@ impl From<LdkChannelDetails> for ChannelDetails {
 			is_channel_ready: value.is_channel_ready,
 			is_usable: value.is_usable,
 			is_announced: value.is_announced,
+			pending_htlc_count: (value.pending_inbound_htlcs.len()
+				+ value.pending_outbound_htlcs.len()) as u64,
 			cltv_expiry_delta: value.config.map(|c| c.cltv_expiry_delta),
 			counterparty_unspendable_punishment_reserve: value
 				.counterparty

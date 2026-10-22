@@ -153,6 +153,7 @@ level = "forbid"
 # When adding a new cfg attribute, ensure that it is added to this list.
 check-cfg = [
 	"cfg(vss_test)",
+	"cfg(network_tuning_test)",
 	"cfg(ldk_bench)",
 	"cfg(tokio_unstable)",
 	"cfg(cln_test)",

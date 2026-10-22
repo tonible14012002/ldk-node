@@ -1569,7 +1569,7 @@ impl Node {
 				if init_features.requires_anchors_zero_fee_htlc_tx()
 					&& !c.trusted_peers_no_reserve.contains(&node_id)
 				{
-					c.per_channel_reserve_sats
+					c.reserve_for_new_channel_sats(cur_anchor_reserve_sats)
 				} else {
 					0
 				}
@@ -2427,7 +2427,7 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 	channel_manager: &ChannelManager, config: &Config,
 ) -> u64 {
 	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
-		channel_manager
+		let count = channel_manager
 			.list_channels()
 			.into_iter()
 			.filter(|c| {
@@ -2438,7 +2438,7 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 						.as_ref()
 						.map_or(false, |t| t.requires_anchors_zero_fee_htlc_tx())
 			})
-			.count() as u64
-			* anchor_channels_config.per_channel_reserve_sats
+			.count() as u64;
+		anchor_channels_config.total_reserve_sats(count)
 	})
 }

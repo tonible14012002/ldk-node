@@ -1243,7 +1243,8 @@ where
 						{
 							0
 						} else {
-							anchor_channels_config.per_channel_reserve_sats
+							anchor_channels_config
+								.reserve_for_new_channel_sats(cur_anchor_reserve_sats)
 						};
 
 						if spendable_amount_sats < required_amount_sats {

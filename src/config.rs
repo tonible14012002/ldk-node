@@ -356,6 +356,7 @@ pub enum CbfExternalFee {
 /// |----------------------------|--------|
 /// | `trusted_peers_no_reserve` | []     |
 /// | `per_channel_reserve_sats` | 25000  |
+/// | `max_total_reserve_sats`   | None   |
 ///
 ///
 /// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#htlc-timeout-and-htlc-success-transactions
@@ -390,6 +391,38 @@ pub struct AnchorChannelsConfig {
 	/// might not suffice to successfully spend the Anchor output and have the HTLC transactions
 	/// confirmed on-chain, i.e., you may want to adjust this value accordingly.
 	pub per_channel_reserve_sats: u64,
+	/// An upper bound on the total emergency reserve across all channels, if any.
+	///
+	/// Without it the reserve grows linearly with the channel count. With it, the first channels
+	/// each add [`AnchorChannelsConfig::per_channel_reserve_sats`] until the total reaches this
+	/// cap, and further channels add nothing: the reserve is pooled for the whole node.
+	///
+	/// This trades safety for capital. Closures are paid for from *any* on-chain funds, so the
+	/// pool only matters when the wallet holds nothing else, and then it covers as many
+	/// simultaneous closures as it can afford at the fee rate of the day; the rest wait for
+	/// more funds, which LDK picks up on its next per-block bump attempt. Set it above the
+	/// dust limit (546 sats), or the reserve cannot be kept as a change output.
+	pub max_total_reserve_sats: Option<u64>,
+}
+
+impl AnchorChannelsConfig {
+	/// The reserve a new untrusted Anchor channel adds on top of `cur_total_reserve_sats`, the
+	/// reserve already retained for the existing channels.
+	pub(crate) fn reserve_for_new_channel_sats(&self, cur_total_reserve_sats: u64) -> u64 {
+		match self.max_total_reserve_sats {
+			None => self.per_channel_reserve_sats,
+			Some(cap) => cur_total_reserve_sats
+				.saturating_add(self.per_channel_reserve_sats)
+				.min(cap)
+				.saturating_sub(cur_total_reserve_sats),
+		}
+	}
+
+	/// The total reserve to retain for `channel_count` untrusted Anchor channels.
+	pub(crate) fn total_reserve_sats(&self, channel_count: u64) -> u64 {
+		let total = channel_count.saturating_mul(self.per_channel_reserve_sats);
+		self.max_total_reserve_sats.map_or(total, |cap| total.min(cap))
+	}
 }
 
 impl Default for AnchorChannelsConfig {
@@ -397,6 +430,7 @@ impl Default for AnchorChannelsConfig {
 		Self {
 			trusted_peers_no_reserve: Vec::new(),
 			per_channel_reserve_sats: DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS,
+			max_total_reserve_sats: None,
 		}
 	}
 }
@@ -697,6 +731,7 @@ mod tests {
 	use std::str::FromStr;
 
 	use super::may_announce_channel;
+	use super::AnchorChannelsConfig;
 	use super::AnnounceError;
 	use super::Config;
 	use super::NodeAlias;
@@ -713,6 +748,37 @@ mod tests {
 			let note = source.trust_note().expect("a note to surface");
 			assert!(note.contains("trusted not to leave transactions out"), "{}", note);
 		}
+	}
+
+	fn anchors(per_channel: u64, cap: Option<u64>) -> AnchorChannelsConfig {
+		AnchorChannelsConfig {
+			trusted_peers_no_reserve: Vec::new(),
+			per_channel_reserve_sats: per_channel,
+			max_total_reserve_sats: cap,
+		}
+	}
+
+	#[test]
+	fn uncapped_anchor_reserve_grows_per_channel() {
+		let c = anchors(1_000, None);
+		assert_eq!(c.total_reserve_sats(5), 5_000);
+		assert_eq!(c.reserve_for_new_channel_sats(5_000), 1_000);
+	}
+
+	#[test]
+	fn capped_anchor_reserve_is_pooled_for_the_node() {
+		let c = anchors(1_000, Some(2_000));
+		assert_eq!(c.total_reserve_sats(0), 0);
+		assert_eq!(c.total_reserve_sats(1), 1_000);
+		assert_eq!(c.total_reserve_sats(2), 2_000);
+		assert_eq!(c.total_reserve_sats(5), 2_000);
+		// The first two channels each add their share, the third and later add nothing.
+		assert_eq!(c.reserve_for_new_channel_sats(0), 1_000);
+		assert_eq!(c.reserve_for_new_channel_sats(1_000), 1_000);
+		assert_eq!(c.reserve_for_new_channel_sats(2_000), 0);
+		// A cap that is not a multiple of the per-channel share tops the pool up exactly.
+		let c = anchors(1_000, Some(1_500));
+		assert_eq!(c.reserve_for_new_channel_sats(1_000), 500);
 	}
 
 	#[test]

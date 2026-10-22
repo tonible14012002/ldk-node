@@ -657,7 +657,7 @@ where
 						if init_features.requires_anchors_zero_fee_htlc_tx()
 							&& !c.trusted_peers_no_reserve.contains(&their_network_key)
 						{
-							c.per_channel_reserve_sats
+							c.reserve_for_new_channel_sats(cur_anchor_reserve_sats)
 						} else {
 							0
 						}
