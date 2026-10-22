@@ -18,6 +18,7 @@ dictionary Config {
 dictionary AnchorChannelsConfig {
 	sequence<PublicKey> trusted_peers_no_reserve;
 	u64 per_channel_reserve_sats;
+	u64? max_total_reserve_sats;
 };
 
 dictionary BackgroundSyncConfig {
@@ -551,6 +552,7 @@ dictionary ChannelDetails {
 	boolean is_channel_ready;
 	boolean is_usable;
 	boolean is_announced;
+	u64 pending_htlc_count;
 	u16? cltv_expiry_delta;
 	u64 counterparty_unspendable_punishment_reserve;
 	u64? counterparty_outbound_htlc_minimum_msat;
