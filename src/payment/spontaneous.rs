@@ -15,7 +15,7 @@ use crate::payment::SendingParameters;
 use crate::types::{ChannelManager, CustomTlvRecord, KeysManager, PaymentStore};
 
 use lightning::ln::channelmanager::{PaymentId, RecipientOnionFields, Retry, RetryableSendFailure};
-use lightning::routing::router::{PaymentParameters, RouteParameters};
+use lightning::routing::router::{PaymentParameters, RouteHint, RouteParameters};
 use lightning::sign::EntropySource;
 
 use lightning_types::payment::{PaymentHash, PaymentPreimage};
@@ -57,7 +57,7 @@ impl SpontaneousPayment {
 	pub fn send(
 		&self, amount_msat: u64, node_id: PublicKey, sending_parameters: Option<SendingParameters>,
 	) -> Result<PaymentId, Error> {
-		self.send_inner(amount_msat, node_id, sending_parameters, None)
+		self.send_inner(amount_msat, node_id, sending_parameters, None, Vec::new())
 	}
 
 	/// Send a spontaneous payment including a list of custom TLVs.
@@ -65,12 +65,36 @@ impl SpontaneousPayment {
 		&self, amount_msat: u64, node_id: PublicKey, sending_parameters: Option<SendingParameters>,
 		custom_tlvs: Vec<CustomTlvRecord>,
 	) -> Result<PaymentId, Error> {
-		self.send_inner(amount_msat, node_id, sending_parameters, Some(custom_tlvs))
+		self.send_inner(amount_msat, node_id, sending_parameters, Some(custom_tlvs), Vec::new())
+	}
+
+	/// Send a spontaneous payment, giving the router private last-hop route hints.
+	///
+	/// Each [`RouteHint`] describes a path ending at `node_id` over channels the router cannot
+	/// see in the public graph (e.g., an unannounced or 0-conf channel identified by its SCID
+	/// alias). An empty `route_hints` behaves exactly like [`Self::send`].
+	pub fn send_with_route_hints(
+		&self, amount_msat: u64, node_id: PublicKey, sending_parameters: Option<SendingParameters>,
+		route_hints: Vec<RouteHint>,
+	) -> Result<PaymentId, Error> {
+		self.send_inner(amount_msat, node_id, sending_parameters, None, route_hints)
+	}
+
+	/// Send a spontaneous payment including a list of custom TLVs, giving the router private
+	/// last-hop route hints.
+	///
+	/// See [`Self::send_with_route_hints`] for the hint semantics. An empty `route_hints`
+	/// behaves exactly like [`Self::send_with_custom_tlvs`].
+	pub fn send_with_custom_tlvs_and_route_hints(
+		&self, amount_msat: u64, node_id: PublicKey, sending_parameters: Option<SendingParameters>,
+		custom_tlvs: Vec<CustomTlvRecord>, route_hints: Vec<RouteHint>,
+	) -> Result<PaymentId, Error> {
+		self.send_inner(amount_msat, node_id, sending_parameters, Some(custom_tlvs), route_hints)
 	}
 
 	fn send_inner(
 		&self, amount_msat: u64, node_id: PublicKey, sending_parameters: Option<SendingParameters>,
-		custom_tlvs: Option<Vec<CustomTlvRecord>>,
+		custom_tlvs: Option<Vec<CustomTlvRecord>>, route_hints: Vec<RouteHint>,
 	) -> Result<PaymentId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -90,10 +114,12 @@ impl SpontaneousPayment {
 			}
 		}
 
-		let mut route_params = RouteParameters::from_payment_params_and_value(
-			PaymentParameters::from_node_id(node_id, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA),
-			amount_msat,
-		);
+		let payment_params = keysend_payment_params(node_id, route_hints).map_err(|e| {
+			log_error!(self.logger, "Payment error: invalid route hints for {}.", node_id);
+			e
+		})?;
+		let mut route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, amount_msat);
 
 		let override_params =
 			sending_parameters.as_ref().or(self.config.sending_parameters.as_ref());
@@ -200,5 +226,70 @@ impl SpontaneousPayment {
 			})?;
 
 		Ok(())
+	}
+}
+
+/// Builds the keysend [`PaymentParameters`] for `node_id`, attaching `route_hints` when given.
+///
+/// With no hints this is exactly `PaymentParameters::from_node_id`, so callers without hints keep
+/// the previous behaviour.
+fn keysend_payment_params(
+	node_id: PublicKey, route_hints: Vec<RouteHint>,
+) -> Result<PaymentParameters, Error> {
+	let params = PaymentParameters::from_node_id(node_id, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA);
+	if route_hints.is_empty() {
+		return Ok(params);
+	}
+	// `with_route_hints` only fails for a blinded payee, which `from_node_id` never builds.
+	params.with_route_hints(route_hints).map_err(|()| Error::PaymentSendingFailed)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use bitcoin::secp256k1::{Secp256k1, SecretKey};
+	use lightning::routing::gossip::RoutingFees;
+	use lightning::routing::router::{Payee, RouteHintHop};
+
+	fn pubkey(byte: u8) -> PublicKey {
+		let secp = Secp256k1::new();
+		PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[byte; 32]).unwrap())
+	}
+
+	fn hint(src: PublicKey, scid: u64) -> RouteHint {
+		RouteHint(vec![RouteHintHop {
+			src_node_id: src,
+			short_channel_id: scid,
+			fees: RoutingFees { base_msat: 1_000, proportional_millionths: 100 },
+			cltv_expiry_delta: 72,
+			htlc_minimum_msat: None,
+			htlc_maximum_msat: None,
+		}])
+	}
+
+	#[test]
+	fn no_hints_matches_from_node_id() {
+		let payee = pubkey(2);
+		let params = keysend_payment_params(payee, Vec::new()).unwrap();
+		assert_eq!(
+			params,
+			PaymentParameters::from_node_id(payee, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA)
+		);
+	}
+
+	#[test]
+	fn hints_are_attached_to_clear_payee() {
+		let payee = pubkey(2);
+		let hints = vec![hint(pubkey(3), 42), hint(pubkey(4), 43)];
+		let params = keysend_payment_params(payee, hints.clone()).unwrap();
+		match params.payee {
+			Payee::Clear { node_id, route_hints, final_cltv_expiry_delta, .. } => {
+				assert_eq!(node_id, payee);
+				assert_eq!(route_hints, hints);
+				assert_eq!(final_cltv_expiry_delta, LDK_DEFAULT_FINAL_CLTV_EXPIRY_DELTA);
+			},
+			_ => panic!("expected a clear payee"),
+		}
 	}
 }
