@@ -38,7 +38,7 @@ use crate::message_handler::NodeCustomMessageHandler;
 use crate::peer_store::PeerStore;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeysManager, MessageRouter,
-	OnionMessenger, PaymentStore, PeerManager,
+	OnionMessenger, P2PGossipSync, PaymentStore, PeerManager, Scorer, UtxoLookup,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
@@ -307,6 +307,11 @@ pub enum BuildError {
 	/// chain source of the node's own; the two would disagree on where the
 	/// chain comes from, so neither is picked.
 	ChainHostConflict,
+	/// A shared network graph ([`NodeBuilder::set_shared_graph`]) was given
+	/// beside a Rapid Gossip Sync source. Only the node that owns the graph
+	/// syncs it from RGS; a second one would write the same snapshots into
+	/// the same graph.
+	SharedGraphWithRgs,
 }
 
 impl fmt::Display for BuildError {
@@ -338,6 +343,9 @@ impl fmt::Display for BuildError {
 			Self::ChainHostConflict => {
 				write!(f, "A chain host and a chain source were both configured.")
 			},
+			Self::SharedGraphWithRgs => {
+				write!(f, "A shared network graph cannot be synced from Rapid Gossip Sync.")
+			},
 		}
 	}
 }
@@ -363,6 +371,7 @@ pub struct NodeBuilder {
 	raw_chain_source_config: Option<RawChainSourceConfig>,
 	raw_chain_source_allow_insecure_http: bool,
 	chain_host: Option<Arc<ChainHost>>,
+	shared_graph: Option<SharedGraph>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -395,6 +404,7 @@ impl NodeBuilder {
 			raw_chain_source_config: None,
 			raw_chain_source_allow_insecure_http: false,
 			chain_host: None,
+			shared_graph: None,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
@@ -411,6 +421,20 @@ impl NodeBuilder {
 	/// used beside this one: the build fails with [`BuildError::ChainHostConflict`].
 	pub fn set_chain_host(&mut self, host: Arc<ChainHost>) -> &mut Self {
 		self.chain_host = Some(host);
+		self
+	}
+
+	/// Routes over a network graph and scorer another [`Node`] in this process owns, from
+	/// [`Node::network_graph_handle`] and [`Node::scorer_handle`], instead of reading and
+	/// keeping a copy of its own.
+	///
+	/// This node still runs P2P gossip over the shared graph — what its peers announce
+	/// feeds the one graph — but it never prunes or persists it: that is the owner's job,
+	/// into the owner's store, and a ~130 MB second copy would buy nothing. A Rapid Gossip
+	/// Sync source beside a shared graph fails the build with
+	/// [`BuildError::SharedGraphWithRgs`]: only the owner syncs RGS.
+	pub fn set_shared_graph(&mut self, graph: Arc<Graph>, scorer: Arc<Mutex<Scorer>>) -> &mut Self {
+		self.shared_graph = Some(SharedGraph { graph, scorer });
 		self
 	}
 
@@ -1040,6 +1064,7 @@ impl NodeBuilder {
 		build_with_store_internal(
 			config,
 			self.chain_selection(&logger)?,
+			self.shared_graph.clone(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1063,6 +1088,7 @@ impl NodeBuilder {
 		build_with_store_internal(
 			config,
 			self.chain_selection(&logger)?,
+			self.shared_graph.clone(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1500,9 +1526,23 @@ enum ChainSelection {
 	Own(Box<ChainHostBuilder>),
 }
 
+/// A graph and scorer another node owns; see [`NodeBuilder::set_shared_graph`].
+#[derive(Clone)]
+struct SharedGraph {
+	graph: Arc<Graph>,
+	scorer: Arc<Mutex<Scorer>>,
+}
+
+impl std::fmt::Debug for SharedGraph {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SharedGraph").finish_non_exhaustive()
+	}
+}
+
 /// Builds a [`Node`] instance according to the options previously configured.
 fn build_with_store_internal(
-	config: Arc<Config>, chain: ChainSelection, gossip_source_config: Option<&GossipSourceConfig>,
+	config: Arc<Config>, chain: ChainSelection, shared_graph: Option<SharedGraph>,
+	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
@@ -1674,36 +1714,46 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 	));
 
-	// Initialize the network graph, scorer, and router
-	let network_graph =
-		match io::utils::read_network_graph(Arc::clone(&kv_store), Arc::clone(&logger)) {
-			Ok(graph) => Arc::new(graph),
-			Err(e) => {
-				if e.kind() == std::io::ErrorKind::NotFound {
-					Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
-				} else {
-					return Err(BuildError::ReadFailed);
-				}
-			},
-		};
+	// Initialize the network graph, scorer, and router. A shared graph is another node's:
+	// nothing of it is read from — or ever written to — this node's store.
+	let graph_is_shared = shared_graph.is_some();
+	let (network_graph, scorer) = match shared_graph {
+		Some(SharedGraph { graph, scorer }) => (graph, scorer),
+		None => {
+			let network_graph = match io::utils::read_network_graph(
+				Arc::clone(&kv_store),
+				Arc::clone(&logger),
+			) {
+				Ok(graph) => Arc::new(graph),
+				Err(e) => {
+					if e.kind() == std::io::ErrorKind::NotFound {
+						Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
+					} else {
+						return Err(BuildError::ReadFailed);
+					}
+				},
+			};
 
-	let scorer = match io::utils::read_scorer(
-		Arc::clone(&kv_store),
-		Arc::clone(&network_graph),
-		Arc::clone(&logger),
-	) {
-		Ok(scorer) => Arc::new(Mutex::new(scorer)),
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::NotFound {
-				let params = ProbabilisticScoringDecayParameters::default();
-				Arc::new(Mutex::new(ProbabilisticScorer::new(
-					params,
-					Arc::clone(&network_graph),
-					Arc::clone(&logger),
-				)))
-			} else {
-				return Err(BuildError::ReadFailed);
-			}
+			let scorer = match io::utils::read_scorer(
+				Arc::clone(&kv_store),
+				Arc::clone(&network_graph),
+				Arc::clone(&logger),
+			) {
+				Ok(scorer) => Arc::new(Mutex::new(scorer)),
+				Err(e) => {
+					if e.kind() == std::io::ErrorKind::NotFound {
+						let params = ProbabilisticScoringDecayParameters::default();
+						Arc::new(Mutex::new(ProbabilisticScorer::new(
+							params,
+							Arc::clone(&network_graph),
+							Arc::clone(&logger),
+						)))
+					} else {
+						return Err(BuildError::ReadFailed);
+					}
+				},
+			};
+			(network_graph, scorer)
 		},
 	};
 
@@ -1911,6 +1961,14 @@ fn build_with_store_internal(
 	// Use the configured gossip source, if the user set one, otherwise default to P2PNetwork.
 	let gossip_source_config = gossip_source_config.unwrap_or(&GossipSourceConfig::P2PNetwork);
 
+	if graph_is_shared && matches!(gossip_source_config, GossipSourceConfig::RapidGossipSync(_)) {
+		log_error!(
+			logger,
+			"A shared network graph was given beside a Rapid Gossip Sync source; only the node that owns the graph may sync it from RGS."
+		);
+		return Err(BuildError::SharedGraphWithRgs);
+	}
+
 	let gossip_source = match gossip_source_config {
 		GossipSourceConfig::P2PNetwork => {
 			let p2p_source =
@@ -2062,24 +2120,24 @@ fn build_with_store_internal(
 	// Extract custom gossip handler for later use
 	let custom_gossip_handler = custom_message_handler.custom_gossip_handler();
 
-	let msg_handler = match gossip_source.as_gossip_sync() {
-		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
-			chan_handler: Arc::clone(&channel_manager),
-			route_handler: Arc::clone(&p2p_gossip_sync)
-				as Arc<dyn RoutingMessageHandler + Sync + Send>,
-			onion_message_handler: Arc::clone(&onion_messenger),
-			custom_message_handler,
-		},
-		GossipSync::Rapid(_) => MessageHandler {
-			chan_handler: Arc::clone(&channel_manager),
-			route_handler: Arc::new(IgnoringMessageHandler {})
-				as Arc<dyn RoutingMessageHandler + Sync + Send>,
-			onion_message_handler: Arc::clone(&onion_messenger),
-			custom_message_handler,
-		},
-		GossipSync::None => {
-			unreachable!("We must always have a gossip sync!");
-		},
+	// The peers' gossip handler. A node without a gossip sync of its own still answers
+	// its peers' routing messages over the (shared) graph, through a P2P sync built here
+	// for that alone; nothing persists or prunes through it.
+	let route_handler: Arc<dyn RoutingMessageHandler + Sync + Send> =
+		match gossip_source.as_gossip_sync() {
+			GossipSync::P2P(p2p_gossip_sync) => p2p_gossip_sync,
+			GossipSync::Rapid(_) => Arc::new(IgnoringMessageHandler {}),
+			GossipSync::None => Arc::new(P2PGossipSync::new(
+				Arc::clone(&network_graph),
+				None::<Arc<UtxoLookup>>,
+				Arc::clone(&logger),
+			)),
+		};
+	let msg_handler = MessageHandler {
+		chan_handler: Arc::clone(&channel_manager),
+		route_handler,
+		onion_message_handler: Arc::clone(&onion_messenger),
+		custom_message_handler,
 	};
 
 	let cur_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| {
@@ -2193,6 +2251,7 @@ fn build_with_store_internal(
 		connection_manager,
 		keys_manager,
 		network_graph,
+		graph_is_shared,
 		gossip_source,
 		liquidity_source,
 		custom_gossip_handler,

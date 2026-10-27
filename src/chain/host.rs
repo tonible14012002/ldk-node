@@ -802,6 +802,42 @@ mod tests {
 		assert_eq!(host.status().attached, 0);
 	}
 
+	/// A second node built on the first's graph and scorer routes over the very same
+	/// objects, and a Rapid Gossip Sync source beside a shared graph is refused.
+	#[test]
+	fn a_secondary_shares_the_primarys_graph_and_scorer() {
+		let host = {
+			let mut b = ChainHostBuilder::new(Network::Regtest);
+			b.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None)
+				.set_logger(Arc::new(Logger::new_log_facade()));
+			b.build().unwrap()
+		};
+		let mut primary_builder = Builder::new();
+		primary_builder.set_network(Network::Regtest);
+		primary_builder.set_log_facade_logger();
+		primary_builder.set_entropy_seed_bytes([4; 64]);
+		primary_builder.set_chain_host(Arc::clone(&host));
+		let primary = primary_builder.build_with_store(Arc::new(TestStore::new(false))).unwrap();
+
+		let mut secondary_builder = Builder::new();
+		secondary_builder.set_network(Network::Regtest);
+		secondary_builder.set_log_facade_logger();
+		secondary_builder.set_entropy_seed_bytes([5; 64]);
+		secondary_builder.set_chain_host(Arc::clone(&host));
+		secondary_builder
+			.set_shared_graph(primary.network_graph_handle(), primary.scorer_handle());
+		let secondary =
+			secondary_builder.build_with_store(Arc::new(TestStore::new(false))).unwrap();
+		assert!(Arc::ptr_eq(&primary.network_graph_handle(), &secondary.network_graph_handle()));
+		assert!(Arc::ptr_eq(&primary.scorer_handle(), &secondary.scorer_handle()));
+
+		secondary_builder.set_gossip_source_rgs("http://127.0.0.1:1".to_string());
+		assert_eq!(
+			secondary_builder.build_with_store(Arc::new(TestStore::new(false))).err(),
+			Some(BuildError::SharedGraphWithRgs)
+		);
+	}
+
 	/// A node builder with both a host and a chain source of its own is refused: the two
 	/// would disagree on where the chain comes from.
 	#[test]

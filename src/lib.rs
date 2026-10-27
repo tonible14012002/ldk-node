@@ -194,6 +194,7 @@ pub use builder::BuildError;
 pub use builder::NodeBuilder as Builder;
 
 pub use chain::host::{ChainHost, ChainHostBuilder, ChainHostStatus};
+pub use types::{Graph, Scorer};
 use chain::target::{SyncTargetSpec, TargetId};
 use chain::ChainLayer;
 use config::{
@@ -205,6 +206,7 @@ use custom_gossip::CustomGossipMessageHandler;
 use event::{EventHandler, EventQueue};
 use gossip::GossipSource;
 use graph::NetworkGraph;
+use io::no_graph_persister::{BackgroundPersister, GraphPersistence};
 use io::utils::write_node_metrics;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
 use payment::{
@@ -213,8 +215,8 @@ use payment::{
 };
 use peer_store::{PeerInfo, PeerStore};
 use types::{
-	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
-	KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
+	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, GossipSync,
+	KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Sweeper, Wallet,
 };
 pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
 
@@ -267,6 +269,9 @@ pub struct Node {
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	keys_manager: Arc<KeysManager>,
 	network_graph: Arc<Graph>,
+	/// Whether `network_graph` and `scorer` are another node's
+	/// ([`Builder::set_shared_graph`]): then this node neither prunes nor persists them.
+	graph_is_shared: bool,
 	gossip_source: Arc<GossipSource>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	custom_gossip_handler: Option<Arc<CustomGossipMessageHandler<Arc<Logger>>>>,
@@ -596,12 +601,27 @@ impl Node {
 			Arc::clone(&self.config),
 		));
 
-		// Setup background processing
-		let background_persister = Arc::clone(&self.kv_store);
+		// Setup background processing. A node on a shared graph hands the processor no
+		// gossip sync and a persister that skips the graph and scorer: pruning and persisting
+		// them is the owning node's job, and a copy in this node's store would be ~130 MB
+		// nobody reads back.
+		let (background_persister, background_gossip_sync) = if self.graph_is_shared {
+			(
+				Arc::new(BackgroundPersister::new(
+					Arc::clone(&self.kv_store),
+					GraphPersistence::Shared,
+				)),
+				GossipSync::None,
+			)
+		} else {
+			(
+				Arc::new(BackgroundPersister::new(Arc::clone(&self.kv_store), GraphPersistence::Own)),
+				self.gossip_source.as_gossip_sync(),
+			)
+		};
 		let background_event_handler = Arc::clone(&event_handler);
 		let background_chain_mon = Arc::clone(&self.chain_monitor);
 		let background_chan_man = Arc::clone(&self.channel_manager);
-		let background_gossip_sync = self.gossip_source.as_gossip_sync();
 		let background_peer_man = Arc::clone(&self.peer_manager);
 		let background_onion_messenger = Arc::clone(&self.onion_messenger);
 		let background_logger = Arc::clone(&self.logger);
@@ -2172,6 +2192,18 @@ impl Node {
 		}
 
 		peers
+	}
+
+	/// The routing graph this node routes over, for another [`Node`] in this process to
+	/// share through [`Builder::set_shared_graph`].
+	pub fn network_graph_handle(&self) -> Arc<Graph> {
+		Arc::clone(&self.network_graph)
+	}
+
+	/// The pathfinding scorer this node routes with, for another [`Node`] in this process
+	/// to share through [`Builder::set_shared_graph`].
+	pub fn scorer_handle(&self) -> Arc<Mutex<Scorer>> {
+		Arc::clone(&self.scorer)
 	}
 
 	/// Returns a handler allowing to query the network graph.
