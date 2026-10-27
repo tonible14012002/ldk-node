@@ -281,6 +281,7 @@ enum NodeError {
 	"TxSyncTimeout",
 	"EventHandlingStopFailed",
 	"ListenFailed",
+	"InvalidShutdownScript",
 	"GossipUpdateFailed",
 	"GossipUpdateTimeout",
 	"LiquidityRequestFailed",

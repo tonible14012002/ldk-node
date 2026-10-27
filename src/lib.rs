@@ -234,11 +234,13 @@ use lightning::impl_writeable_tlv_based;
 use lightning::ln::channel_state::ChannelShutdownState;
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::SocketAddress;
+use lightning::ln::script::ShutdownScript;
 use lightning::routing::gossip::NodeAlias;
 
 use lightning_background_processor::process_events_async;
 
 use bitcoin::secp256k1::PublicKey;
+use bitcoin::ScriptBuf;
 
 use rand::Rng;
 
@@ -2049,7 +2051,45 @@ impl Node {
 	pub fn close_channel(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 	) -> Result<(), Error> {
-		self.close_channel_internal(user_channel_id, counterparty_node_id, false, None)
+		self.close_channel_internal(
+			user_channel_id,
+			counterparty_node_id,
+			ChannelClose::Cooperative {
+				target_feerate_sat_per_1000_weight: None,
+				shutdown_script: None,
+			},
+		)
+	}
+
+	/// Close a previously opened channel cooperatively, paying our side out to
+	/// `shutdown_script` instead of this node's own wallet — e.g. the address of another
+	/// wallet in the process — at `target_feerate_sat_per_1000_weight` if given.
+	///
+	/// The script must be a segwit output LDK will send in `shutdown` (P2WPKH, P2WSH, or a
+	/// v1+ witness program such as P2TR; LDK refuses legacy P2PKH and P2SH for its own side);
+	/// anything else is refused with [`Error::InvalidShutdownScript`] before the channel is
+	/// touched. A segwit v1+ script (e.g. taproot) also needs the
+	/// counterparty to support `option_shutdown_anysegwit`, and a channel opened with an
+	/// upfront shutdown script cannot be redirected: both fail with
+	/// [`Error::ChannelClosingFailed`]. `None` pays out to this node's wallet, as
+	/// [`Node::close_channel`] does. As there, the peer is forgotten when this was its last
+	/// channel.
+	pub fn close_channel_to(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		shutdown_script: Option<ScriptBuf>, target_feerate_sat_per_1000_weight: Option<u32>,
+	) -> Result<(), Error> {
+		let shutdown_script = match shutdown_script {
+			Some(script) => Some(shutdown_script_from(script).map_err(|e| {
+				log_error!(self.logger, "Refusing to close channel to a non-standard script");
+				e
+			})?),
+			None => None,
+		};
+		self.close_channel_internal(
+			user_channel_id,
+			counterparty_node_id,
+			ChannelClose::Cooperative { target_feerate_sat_per_1000_weight, shutdown_script },
+		)
 	}
 
 	/// Force-close a previously opened channel.
@@ -2069,23 +2109,23 @@ impl Node {
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 		reason: Option<String>,
 	) -> Result<(), Error> {
-		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason)
+		self.close_channel_internal(
+			user_channel_id,
+			counterparty_node_id,
+			ChannelClose::Force { reason },
+		)
 	}
 
 	fn close_channel_internal(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, force: bool,
-		force_close_reason: Option<String>,
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		close: ChannelClose,
 	) -> Result<(), Error> {
-		debug_assert!(
-			force_close_reason.is_none() || force,
-			"Reason can only be set for force closures"
-		);
 		let open_channels =
 			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			if force {
+			if let ChannelClose::Force { reason: force_close_reason } = close {
 				if self.config.anchor_channels_config.as_ref().map_or(false, |acc| {
 					acc.trusted_peers_no_reserve.contains(&counterparty_node_id)
 				}) {
@@ -2115,9 +2155,18 @@ impl Node {
 							Error::ChannelClosingFailed
 						})?;
 				}
-			} else {
+			} else if let ChannelClose::Cooperative {
+				target_feerate_sat_per_1000_weight,
+				shutdown_script,
+			} = close
+			{
 				self.channel_manager
-					.close_channel(&channel_details.channel_id, &counterparty_node_id)
+					.close_channel_with_feerate_and_script(
+						&channel_details.channel_id,
+						&counterparty_node_id,
+						target_feerate_sat_per_1000_weight,
+						shutdown_script,
+					)
 					.map_err(|e| {
 						log_error!(self.logger, "Failed to close channel: {:?}", e);
 						Error::ChannelClosingFailed
@@ -2551,6 +2600,23 @@ impl_writeable_tlv_based!(NodeMetrics, {
 	(10, latest_channel_monitor_archival_height, option),
 });
 
+/// How [`Node::close_channel_internal`] closes a channel.
+enum ChannelClose {
+	/// Cooperatively; `None`s are LDK's defaults (its fee estimate, the node's own wallet).
+	Cooperative {
+		target_feerate_sat_per_1000_weight: Option<u32>,
+		shutdown_script: Option<ShutdownScript>,
+	},
+	/// Unilaterally, with the reason given to the peer.
+	Force { reason: Option<String> },
+}
+
+/// A caller's payout script as a `shutdown` script: only the segwit forms LDK sends for its own
+/// side of a close (P2WPKH, P2WSH, v1+ witness programs).
+pub(crate) fn shutdown_script_from(script: ScriptBuf) -> Result<ShutdownScript, Error> {
+	ShutdownScript::try_from(script).map_err(|_| Error::InvalidShutdownScript)
+}
+
 /// Whether a node runs the periodic node-announcement broadcast: only one that may announce,
 /// which includes its [`config::AnnouncePolicy`].
 pub(crate) fn broadcasts_node_announcements(config: &Config) -> bool {
@@ -2633,6 +2699,77 @@ mod announce_policy_tests {
 	fn an_unannounced_node_never_broadcasts_its_announcement() {
 		assert!(broadcasts_node_announcements(&announcing_config(true)));
 		assert!(!broadcasts_node_announcements(&announcing_config(false)));
+	}
+}
+
+#[cfg(test)]
+mod close_to_tests {
+	use super::*;
+
+	use bitcoin::hashes::Hash;
+	use bitcoin::key::TweakedPublicKey;
+	use bitcoin::opcodes::all::OP_RETURN;
+	use bitcoin::script::Builder as ScriptBuilder;
+	use bitcoin::{PubkeyHash, ScriptHash, WPubkeyHash, WScriptHash, XOnlyPublicKey};
+	use lightning::util::test_utils::TestStore;
+
+	fn xonly() -> XOnlyPublicKey {
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let key = bitcoin::secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+		key.x_only_public_key(&secp).0
+	}
+
+	/// Every segwit payout form converts, unchanged.
+	#[test]
+	fn segwit_payout_scripts_are_accepted() {
+		for script in [
+			ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([1u8; 20])),
+			ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([2u8; 32])),
+			ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly())),
+		] {
+			let shutdown = shutdown_script_from(script.clone()).expect("a segwit script");
+			let back: ScriptBuf = shutdown.into();
+			assert_eq!(back, script);
+		}
+	}
+
+	/// Legacy outputs, which LDK will not send for its own side, and anything non-standard.
+	#[test]
+	fn other_scripts_are_refused() {
+		for script in [
+			ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([3u8; 20])),
+			ScriptBuf::new_p2sh(&ScriptHash::from_byte_array([4u8; 20])),
+			ScriptBuf::new(),
+			ScriptBuilder::new().push_opcode(OP_RETURN).push_slice([0u8; 8]).into_script(),
+			ScriptBuf::from_bytes(vec![0x00, 0x05, 1, 2, 3, 4, 5]),
+		] {
+			assert_eq!(shutdown_script_from(script).err(), Some(Error::InvalidShutdownScript));
+		}
+	}
+
+	/// The script is checked before anything else, so a bad one is refused even for a
+	/// channel that does not exist; a good one for an unknown channel is the no-op
+	/// `close_channel` has always been.
+	#[test]
+	fn close_channel_to_checks_the_script_first() {
+		let mut builder = Builder::new();
+		builder.set_network(bitcoin::Network::Regtest);
+		builder.set_log_facade_logger();
+		builder.set_entropy_seed_bytes([81u8; 64]);
+		builder.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None);
+		let node = builder.build_with_store(Arc::new(TestStore::new(false))).unwrap();
+		let peer = {
+			let secp = bitcoin::secp256k1::Secp256k1::new();
+			let key = bitcoin::secp256k1::SecretKey::from_slice(&[8u8; 32]).unwrap();
+			PublicKey::from_secret_key(&secp, &key)
+		};
+		let unknown = UserChannelId(42);
+		assert_eq!(
+			node.close_channel_to(&unknown, peer, Some(ScriptBuf::new()), None),
+			Err(Error::InvalidShutdownScript)
+		);
+		let payout = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([1u8; 20]));
+		assert_eq!(node.close_channel_to(&unknown, peer, Some(payout), Some(253)), Ok(()));
 	}
 }
 

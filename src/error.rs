@@ -135,6 +135,8 @@ pub enum Error {
 	EventHandlingStopFailed,
 	/// None of the listening addresses could be bound — something else listens there.
 	ListenFailed,
+	/// The given script is not one a channel may close to (BOLT 2 `shutdown`).
+	InvalidShutdownScript,
 }
 
 impl fmt::Display for Error {
@@ -144,6 +146,9 @@ impl fmt::Display for Error {
 			Self::NotRunning => write!(f, "Node is not running."),
 			Self::EventHandlingStopFailed => {
 				write!(f, "Stopping event handling failed; the node may not have quiesced.")
+			},
+			Self::InvalidShutdownScript => {
+				write!(f, "The given script is not a standard channel shutdown script.")
 			},
 			Self::ListenFailed => {
 				write!(f, "Failed to bind to the listening addresses.")
