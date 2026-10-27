@@ -34,7 +34,7 @@ use crate::chain::adapters::bitcoind_raw::{BitcoindRpcSource, RawSourceHealth, R
 use crate::chain::adapters::dependent::DependentChainAdapter;
 use crate::chain::adapters::electrum::ElectrumChainAdapter;
 use crate::chain::adapters::esplora::EsploraChainAdapter;
-use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache};
+use crate::chain::bitcoind::BitcoindClient;
 use crate::chain::cbf::source::FilterSource;
 use crate::chain::engine::bitcoind::{BitcoindSyncEngine, DependentScanServer};
 use crate::chain::engine::dependent::DependentSyncEngine;
@@ -48,6 +48,7 @@ use crate::chain::provider::{
 	WireMempoolRequest, WireMempoolResponse, WireSyncRequest, WireUpdate, CHAIN_WIRE_VERSION,
 };
 use crate::chain::raw_serve::RawChainServer;
+use crate::chain::target::{SyncTarget, SyncTargetSpec, TargetId, TargetRegistry};
 use crate::chain::seam::{
 	accepted_txids, package_result, ActionChain, ActionResult, Anchored, Answered, BroadcastAction,
 	BroadcastRejection, ChainActionError, FeeAction, FeeUpdate, MempoolAction, MempoolAnswer,
@@ -57,17 +58,17 @@ use crate::chain::seam::{
 use crate::chain::wire_convert::{mempool_answer_to_wire, wire_to_mempool_query};
 use crate::chain::{
 	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
-	ElectrumRuntimeStatus, WalletSyncStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS,
+	ElectrumRuntimeStatus, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS,
 };
 use crate::config::{BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig};
-use crate::dead_funding::{reap_dead_fundings, DeadFundingStore};
+use crate::dead_funding::reap_dead_fundings;
 use crate::fee_estimator::{
 	conf_target_wire_name, get_all_conf_targets, FeeEstimator, OnchainFeeEstimator,
 };
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogger, Logger};
-use crate::types::{Broadcaster, ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::types::Broadcaster;
+use crate::Error;
 
 #[cfg(all(feature = "cbf", feature = "swaps"))]
 use crate::chain::adapters::cbf::CbfWatchTxStatus;
@@ -205,9 +206,7 @@ struct BroadcastRun {
 pub(crate) struct SharedChainCtx {
 	pub(crate) fee_estimator: Arc<OnchainFeeEstimator>,
 	pub(crate) tx_broadcaster: Arc<Broadcaster>,
-	pub(crate) kv_store: Arc<DynStore>,
 	pub(crate) logger: Arc<Logger>,
-	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
 }
 
 /// How long a transaction this node itself broadcast is shielded from a
@@ -294,35 +293,104 @@ pub(crate) struct ChainLayer {
 	raw: Option<RawChainServer>,
 	/// How the raw source is doing — or why its configuration was refused.
 	raw_health: Option<Arc<RawSourceHealth>>,
-	/// Fundings the chain has proven can never confirm; see [`crate::dead_funding`].
-	dead_fundings: Arc<DeadFundingStore>,
+	/// The nodes this layer keeps in step; see [`crate::chain::target`]. Shared with the
+	/// engine, which iterates it on every pass.
+	targets: Arc<TargetRegistry>,
+	/// When the shared fee cache was last refreshed, as the layer itself knows it. Each
+	/// target's metrics carry the same stamp; this one is for a target registered after the
+	/// last refresh, whose own metrics would otherwise say "never" about a cache that is
+	/// fresh.
+	fee_cache_updated_at: RwLock<Option<u64>>,
 }
 
 impl ChainLayer {
 	fn new(
 		slots: ChainSlots, engine: Arc<dyn SyncEngine>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		tx_broadcaster: Arc<Broadcaster>, logger: Arc<Logger>, targets: Arc<TargetRegistry>,
 	) -> Self {
-		let dead_fundings =
-			Arc::new(DeadFundingStore::read_or_empty(Arc::clone(&kv_store), Arc::clone(&logger)));
 		Self {
 			slots,
 			engine,
-			shared: SharedChainCtx {
-				fee_estimator,
-				tx_broadcaster,
-				kv_store,
-				logger,
-				node_metrics,
-			},
+			shared: SharedChainCtx { fee_estimator, tx_broadcaster, logger },
 			recent_own_broadcasts: Mutex::new(RecentOwnBroadcasts::default()),
 			last_unverifiable_tip: Mutex::new(None),
 			raw: None,
 			raw_health: None,
-			dead_fundings,
+			targets,
+			fee_cache_updated_at: RwLock::new(None),
 		}
 	}
+
+	/// The nodes this layer keeps in step.
+	pub(crate) fn targets(&self) -> &Arc<TargetRegistry> {
+		&self.targets
+	}
+
+	/// Add a node to what this layer keeps in step.
+	///
+	/// The target is in the registry before the engine hears of it, so a background
+	/// pass that starts in between simply includes it. An engine that cannot take it —
+	/// see [`SyncEngine::target_registered`] — has it removed again, and the error says why.
+	///
+	/// A fee cache refreshed before this registration is as fresh for the new target as
+	/// for the others, so its stamp is written into the target's metrics now rather than
+	/// left to the next refresh: `Node::chain_freshness` must not report "never" for a
+	/// cache that is filled.
+	pub(crate) fn register_target(&self, spec: SyncTargetSpec) -> Result<Arc<SyncTarget>, Error> {
+		let target = self.targets.register(spec);
+		if let Err(e) = self.engine.target_registered(&target) {
+			self.targets.unregister(target.id);
+			log_error!(
+				self.shared.logger,
+				"The {} sync engine refused to take on node {}: {}",
+				self.engine.name(),
+				target.label,
+				e
+			);
+			return Err(e);
+		}
+		let fee_stamp = *self.fee_cache_updated_at.read().unwrap_or_else(|e| e.into_inner());
+		if let Some(stamp) = fee_stamp {
+			let mut locked_node_metrics =
+				target.node_metrics.write().unwrap_or_else(|e| e.into_inner());
+			if locked_node_metrics.latest_fee_rate_cache_update_timestamp.map_or(true, |t| t < stamp)
+			{
+				locked_node_metrics.latest_fee_rate_cache_update_timestamp = Some(stamp);
+				let _ = write_node_metrics(
+					&*locked_node_metrics,
+					Arc::clone(&target.kv_store),
+					Arc::clone(&self.shared.logger),
+				);
+			}
+		}
+		log_debug!(
+			self.shared.logger,
+			"Node {} joined the {} sync engine as target {} ({} now).",
+			target.label,
+			self.engine.name(),
+			target.id,
+			self.targets.len()
+		);
+		Ok(target)
+	}
+
+	/// Remove a node from what this layer keeps in step. A pass already running on a
+	/// snapshot finishes with it.
+	pub(crate) fn unregister_target(&self, id: TargetId) {
+		let label = self.targets.get(id).map(|t| t.label.clone());
+		self.targets.unregister(id);
+		self.engine.target_unregistered(id);
+		if let Some(label) = label {
+			log_debug!(
+				self.shared.logger,
+				"Node {} left the {} sync engine ({} left).",
+				label,
+				self.engine.name(),
+				self.targets.len()
+			);
+		}
+	}
+
 
 	/// Serve raw BIP157/158 data to other nodes from `source`.
 	///
@@ -433,10 +501,8 @@ impl ChainLayer {
 	}
 
 	pub(crate) fn new_esplora(
-		server_url: String, sync_config: EsploraSyncConfig, onchain_wallet: Arc<Wallet>,
-		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
-		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		server_url: String, sync_config: EsploraSyncConfig, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, config: Arc<Config>, logger: Arc<Logger>,
 	) -> Self {
 		// FIXME / TODO: We introduced this to make `bdk_esplora` work separately without updating
 		// `lightning-transaction-sync`. We should revert this as part of of the upgrade to LDK 0.2.
@@ -456,23 +522,14 @@ impl ChainLayer {
 			Arc::clone(&logger),
 		));
 
-		let engine = Arc::new(EsploraSyncEngine {
-			sync_config,
-			esplora_client,
-			onchain_wallet,
-			onchain_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
-			tx_sync,
-			lightning_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
-			kv_store: Arc::clone(&kv_store),
-			logger: Arc::clone(&logger),
-			node_metrics: Arc::clone(&node_metrics),
-		});
+		let engine =
+			Arc::new(EsploraSyncEngine { sync_config, esplora_client, tx_sync, logger: Arc::clone(&logger) });
 
 		// Esplora exposes no UTXO-set lookup, so channel announcements cannot
 		// be verified against one. Its sync carries the mempool itself.
 		let slots = Self::slots_for_single_adapter(adapter, Vec::new(), None, &logger);
 
-		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, logger, Arc::new(TargetRegistry::new()))
 	}
 
 	/// A node with no chain source of its own: every slot is filled from one
@@ -484,35 +541,25 @@ impl ChainLayer {
 	/// occupies.
 	pub(crate) fn new_dependent(
 		provider: Arc<dyn ChainDataProvider>, sync_config: EsploraSyncConfig,
-		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		logger: Arc<Logger>,
 	) -> Self {
 		let adapter =
 			Arc::new(DependentChainAdapter::new(Arc::clone(&provider), Arc::clone(&logger)));
 
-		let engine = Arc::new(DependentSyncEngine::new(
-			provider,
-			sync_config,
-			onchain_wallet,
-			Arc::clone(&kv_store),
-			Arc::clone(&logger),
-			Arc::clone(&node_metrics),
-		));
+		let engine = Arc::new(DependentSyncEngine::new(provider, sync_config, Arc::clone(&logger)));
 
 		// A Dependent node cannot verify BOLT-7 channel announcements; see the
 		// adapter module docs for why it does not ask its provider to. Its
 		// sync carries the mempool itself, through the provider's wallet sync.
 		let slots = Self::slots_for_single_adapter(adapter, Vec::new(), None, &logger);
 
-		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, logger, Arc::new(TargetRegistry::new()))
 	}
 
 	pub(crate) fn new_electrum(
-		server_url: String, sync_config: ElectrumSyncConfig, onchain_wallet: Arc<Wallet>,
-		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
-		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		server_url: String, sync_config: ElectrumSyncConfig, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, config: Arc<Config>, logger: Arc<Logger>,
 	) -> Self {
 		let electrum_runtime_status = Arc::new(RwLock::new(ElectrumRuntimeStatus::new()));
 
@@ -525,13 +572,8 @@ impl ChainLayer {
 			server_url,
 			sync_config,
 			electrum_runtime_status,
-			onchain_wallet,
-			onchain_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
-			lightning_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
-			kv_store: Arc::clone(&kv_store),
 			config,
 			logger: Arc::clone(&logger),
-			node_metrics: Arc::clone(&node_metrics),
 		});
 
 		// Electrum exposes no UTXO-set lookup, so channel announcements cannot
@@ -543,38 +585,25 @@ impl ChainLayer {
 		let mempool = vec![Arc::clone(&adapter) as Arc<dyn MempoolAction>];
 		let slots = Self::slots_for_single_adapter(adapter, mempool, None, &logger);
 
-		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, logger, Arc::new(TargetRegistry::new()))
 	}
 
 	pub(crate) fn new_bitcoind_rpc(
 		rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
-		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		config: Arc<Config>, logger: Arc<Logger>,
 	) -> Self {
 		let scan_server =
 			Self::dependent_scan_server(&rpc_host, rpc_port, &rpc_user, &rpc_password, &logger);
 		let api_client =
 			Arc::new(BitcoindClient::new_rpc(rpc_host, rpc_port, rpc_user, rpc_password));
-		Self::from_bitcoind_client(
-			api_client,
-			scan_server,
-			onchain_wallet,
-			fee_estimator,
-			tx_broadcaster,
-			kv_store,
-			config,
-			logger,
-			node_metrics,
-		)
+		Self::from_bitcoind_client(api_client, scan_server, fee_estimator, tx_broadcaster, config, logger)
 	}
 
 	pub(crate) fn new_bitcoind_rest(
 		rpc_host: String, rpc_port: u16, rpc_user: String, rpc_password: String,
-		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		rest_client_config: BitcoindRestClientConfig, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		config: Arc<Config>, rest_client_config: BitcoindRestClientConfig, logger: Arc<Logger>,
 	) -> Self {
 		let scan_server =
 			Self::dependent_scan_server(&rpc_host, rpc_port, &rpc_user, &rpc_password, &logger);
@@ -586,17 +615,7 @@ impl ChainLayer {
 			rpc_user,
 			rpc_password,
 		));
-		Self::from_bitcoind_client(
-			api_client,
-			scan_server,
-			onchain_wallet,
-			fee_estimator,
-			tx_broadcaster,
-			kv_store,
-			config,
-			logger,
-			node_metrics,
-		)
+		Self::from_bitcoind_client(api_client, scan_server, fee_estimator, tx_broadcaster, config, logger)
 	}
 
 	/// The client a bitcoind-backed node scans with when it serves Dependent
@@ -634,12 +653,10 @@ impl ChainLayer {
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
 	fn from_bitcoind_client(
 		api_client: Arc<BitcoindClient>, scan_server: Option<Arc<DependentScanServer>>,
-		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		config: Arc<Config>, logger: Arc<Logger>,
 	) -> Self {
 		let latest_chain_tip = Arc::new(RwLock::new(None));
 
@@ -650,24 +667,19 @@ impl ChainLayer {
 			Arc::clone(&logger),
 		));
 
-		let engine = Arc::new(BitcoindSyncEngine {
+		let engine = Arc::new(BitcoindSyncEngine::new(
 			api_client,
-			header_cache: tokio::sync::Mutex::new(BoundedHeaderCache::new()),
 			latest_chain_tip,
-			onchain_wallet,
-			wallet_polling_status: Mutex::new(WalletSyncStatus::Completed),
-			kv_store: Arc::clone(&kv_store),
 			config,
-			logger: Arc::clone(&logger),
-			node_metrics: Arc::clone(&node_metrics),
+			Arc::clone(&logger),
 			scan_server,
-		});
+		));
 
 		let mempool = vec![Arc::clone(&adapter) as Arc<dyn MempoolAction>];
 		let utxo = Some(Arc::clone(&adapter) as Arc<dyn UtxoCapability>);
 		let slots = Self::slots_for_single_adapter(adapter, mempool, utxo, &logger);
 
-		Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics)
+		Self::new(slots, engine, fee_estimator, tx_broadcaster, logger, Arc::new(TargetRegistry::new()))
 	}
 
 	/// A node following the chain by compact block filters over P2P, borrowing
@@ -717,11 +729,10 @@ impl ChainLayer {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_cbf(
 		peers: Vec<String>, cbf_config: CbfConfig, fallback: Option<Arc<dyn ChainDataProvider>>,
-		filter_source: Option<Arc<dyn FilterSource>>, onchain_wallet: Arc<Wallet>,
-		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
-		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		filter_source: Option<Arc<dyn FilterSource>>, fee_estimator: Arc<OnchainFeeEstimator>,
+		tx_broadcaster: Arc<Broadcaster>, config: Arc<Config>, logger: Arc<Logger>,
 	) -> Result<Self, Error> {
+		let targets = Arc::new(TargetRegistry::new());
 		let mut fee: Vec<Arc<dyn FeeAction>> = Vec::new();
 		let mut external_electrum = None;
 		match cbf_config.external_fee {
@@ -756,11 +767,9 @@ impl ChainLayer {
 			cbf_config.source,
 			filter_source,
 			external_electrum,
-			onchain_wallet,
-			Arc::clone(&kv_store),
+			Arc::clone(&targets),
 			config,
 			Arc::clone(&logger),
-			Arc::clone(&node_metrics),
 		)?);
 
 		let provider = fallback
@@ -818,7 +827,7 @@ impl ChainLayer {
 			utxo,
 		};
 
-		Ok(Self::new(slots, engine, fee_estimator, tx_broadcaster, kv_store, logger, node_metrics))
+		Ok(Self::new(slots, engine, fee_estimator, tx_broadcaster, logger, targets))
 	}
 
 	/// Which adapters currently occupy each slot. For logs and diagnostics;
@@ -896,21 +905,13 @@ impl ChainLayer {
 		self.slots.utxo.as_ref().and_then(|u| u.utxo_source()).map(|(source, _)| source)
 	}
 
+	/// Keep every registered target in step until `stop_sync_receiver` fires. Spawned once
+	/// per layer, however many nodes share it.
 	pub(crate) async fn continuously_sync_wallets(
 		self: Arc<Self>, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
 	) {
 		let engine = Arc::clone(&self.engine);
-		engine
-			.run_background(
-				self,
-				stop_sync_receiver,
-				channel_manager,
-				chain_monitor,
-				output_sweeper,
-			)
-			.await
+		engine.run_background(self, stop_sync_receiver).await
 	}
 
 	/// Refresh the fee-rate cache from the FEE chain.
@@ -957,14 +958,19 @@ impl ChainLayer {
 			);
 		}
 
+		// One cache, one stamp, written into every node's metrics: each node's
+		// `chain_freshness` answers for the cache it actually estimates with. The
+		// layer keeps the stamp too, for a node that registers after this refresh.
 		let unix_time_secs_opt =
 			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-		{
-			let mut locked_node_metrics = self.shared.node_metrics.write().unwrap();
+		*self.fee_cache_updated_at.write().unwrap_or_else(|e| e.into_inner()) = unix_time_secs_opt;
+		for target in self.targets.snapshot() {
+			let mut locked_node_metrics =
+				target.node_metrics.write().unwrap_or_else(|e| e.into_inner());
 			locked_node_metrics.latest_fee_rate_cache_update_timestamp = unix_time_secs_opt;
 			write_node_metrics(
 				&*locked_node_metrics,
-				Arc::clone(&self.shared.kv_store),
+				Arc::clone(&target.kv_store),
 				Arc::clone(&self.shared.logger),
 			)?;
 		}
@@ -1138,7 +1144,13 @@ impl ChainLayer {
 			}
 		}
 
-		let Some(wallet) = self.engine.onchain_wallet() else {
+		// Which wallet's package this was: the one whose coins it spends or pays. A
+		// transaction nobody claims — one whose inputs and outputs no wallet here owns,
+		// as a channel's commitment transaction is — goes to every wallet, exactly as it
+		// went to the one wallet before there could be several: an unrelated
+		// transaction in a wallet's graph is filtered out of everything it reports.
+		let targets = self.targets.snapshot();
+		if targets.is_empty() {
 			log_debug!(
 				self.shared.logger,
 				"No on-chain wallet to record a broadcast package in ({} unconfirmed, {} evicted)",
@@ -1146,13 +1158,27 @@ impl ChainLayer {
 				evicted.len()
 			);
 			return;
-		};
-		if let Err(e) = wallet.apply_mempool_txs(unconfirmed, evicted) {
-			log_error!(
-				self.shared.logger,
-				"Failed to record a broadcast package in the on-chain wallet: {}",
-				e
-			);
+		}
+		let owners: Vec<&Arc<SyncTarget>> = targets
+			.iter()
+			.filter(|t| {
+				unconfirmed.iter().any(|(tx, _)| t.onchain_wallet.is_relevant_tx(tx))
+					|| evicted.iter().any(|(txid, _)| t.onchain_wallet.knows_tx(txid))
+			})
+			.collect();
+		let recipients: Vec<&Arc<SyncTarget>> =
+			if owners.is_empty() { targets.iter().collect() } else { owners };
+		for target in recipients {
+			if let Err(e) =
+				target.onchain_wallet.apply_mempool_txs(unconfirmed.clone(), evicted.clone())
+			{
+				log_error!(
+					self.shared.logger,
+					"Failed to record a broadcast package in the on-chain wallet of {}: {}",
+					target.label,
+					e
+				);
+			}
 		}
 	}
 
@@ -1161,43 +1187,33 @@ impl ChainLayer {
 	/// Fees first, then the engine — in both engine shapes, exactly as
 	/// pre-seam. Which engine is running is the engine's own business; this
 	/// does not branch on it.
-	pub(crate) async fn sync_wallets_once(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
+	///
+	/// `target_id` names the node asking; a node that is not registered — stopped since —
+	/// is told so with [`Error::NotRunning`].
+	pub(crate) async fn sync_wallets_once(&self, target_id: TargetId) -> Result<(), Error> {
+		let target = self.targets.get(target_id).ok_or(Error::NotRunning)?;
 		self.update_fee_rate_estimates().await?;
-		self.engine
-			.sync_once(
-				self,
-				Arc::clone(&channel_manager),
-				Arc::clone(&chain_monitor),
-				output_sweeper,
-			)
-			.await?;
-		self.reap_dead_fundings(&channel_manager, &chain_monitor);
+		self.engine.sync_once(self, &target).await?;
+		self.reap_dead_fundings_of(&target);
 		Ok(())
 	}
 
-	/// Fundings the chain has proven can never confirm; see [`crate::dead_funding`].
-	pub(crate) fn dead_fundings(&self) -> &Arc<DeadFundingStore> {
-		&self.dead_fundings
+	/// One dead-funding detection pass over every target's own channel monitors, run by
+	/// every engine once a chain pass has succeeded; see [`crate::dead_funding`].
+	pub(crate) fn reap_dead_fundings(&self) {
+		for target in self.targets.snapshot() {
+			self.reap_dead_fundings_of(&target);
+		}
 	}
 
-	/// One dead-funding detection pass over the node's own channel monitors, run by every
-	/// engine once an on-chain wallet sync has succeeded; see [`crate::dead_funding`]. An
-	/// engine with no on-chain wallet of its own has no graph to prove anything from.
-	pub(crate) fn reap_dead_fundings(
-		&self, channel_manager: &ChannelManager, chain_monitor: &ChainMonitor,
-	) {
-		let Some(wallet) = self.engine.onchain_wallet() else {
-			return;
-		};
+	/// [`ChainLayer::reap_dead_fundings`] for one target, after its own wallet synced.
+	pub(crate) fn reap_dead_fundings_of(&self, target: &SyncTarget) {
 		reap_dead_fundings(
-			wallet,
-			channel_manager,
-			chain_monitor,
-			&self.dead_fundings,
-			&*self.shared.kv_store,
+			&target.onchain_wallet,
+			&target.channel_manager,
+			&target.chain_monitor,
+			&target.dead_fundings,
+			&*target.kv_store,
 			&self.shared.logger,
 		);
 	}
@@ -1316,13 +1332,9 @@ impl ChainLayer {
 	/// and the result counts no evictions.
 	#[cfg(feature = "cbf")]
 	pub(crate) async fn borrow_mempool(
-		&self, query: &MempoolQuery, evictions: MempoolEvictions,
+		&self, target: &SyncTarget, query: &MempoolQuery, evictions: MempoolEvictions,
 	) -> ActionResult<BorrowedMempool> {
-		let Some(wallet) = self.engine.onchain_wallet() else {
-			return Err(ChainActionError::unavailable(
-				"no on-chain wallet to apply a mempool view to",
-			));
-		};
+		let wallet = &target.onchain_wallet;
 		let answered = self.mempool(query).await?;
 		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 		let (unconfirmed, mut evicted) = stamp_locally(answered.value.value, now);
@@ -1783,7 +1795,9 @@ mod tests {
 	use lightning::util::test_utils::TestStore;
 
 	use crate::chain::seam::{ActionResult, MempoolScope, PackageOutcomes, TxBroadcastOutcome};
+	use crate::chain::target::test_support::target_spec;
 	use crate::chain::test_wallet::fresh_regtest_wallet;
+	use crate::types::{DynStore, Wallet};
 	use crate::chain::wire_convert::{script_to_wire, tx_to_wire, txid_to_wire};
 	use crate::tx_broadcaster::TransactionBroadcaster;
 
@@ -1991,7 +2005,6 @@ mod tests {
 	/// An engine that syncs nothing and only answers the questions the
 	/// BROADCAST tail, the hybrid tails and the serving path ask it.
 	struct FakeEngine {
-		wallet: Arc<Wallet>,
 		tracks_own_broadcasts: bool,
 		serves_mempool: bool,
 		serves_peers: bool,
@@ -2010,10 +2023,6 @@ mod tests {
 			self.tracks_own_broadcasts
 		}
 
-		fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
-			Some(&self.wallet)
-		}
-
 		fn serves_mempool(&self) -> bool {
 			self.serves_mempool
 		}
@@ -2027,16 +2036,13 @@ mod tests {
 		}
 
 		async fn sync_once(
-			&self, _layer: &ChainLayer, _channel_manager: Arc<ChannelManager>,
-			_chain_monitor: Arc<ChainMonitor>, _output_sweeper: Arc<Sweeper>,
+			&self, _layer: &ChainLayer, _target: &Arc<SyncTarget>,
 		) -> Result<(), Error> {
 			Ok(())
 		}
 
 		async fn run_background(
 			&self, _layer: Arc<ChainLayer>, _stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-			_channel_manager: Arc<ChannelManager>, _chain_monitor: Arc<ChainMonitor>,
-			_output_sweeper: Arc<Sweeper>,
 		) {
 		}
 	}
@@ -2045,6 +2051,13 @@ mod tests {
 		layer: ChainLayer,
 		wallet: Arc<Wallet>,
 		broadcaster: Arc<Broadcaster>,
+	}
+
+	impl Harness {
+		/// The one target the harness registered.
+		fn target(&self) -> Arc<SyncTarget> {
+			self.layer.targets().snapshot().remove(0)
+		}
 	}
 
 	/// Which fakes fill which slots, and what the fake engine answers.
@@ -2100,7 +2113,6 @@ mod tests {
 			.unwrap_or_else(|| fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger));
 
 		let engine = Arc::new(FakeEngine {
-			wallet: Arc::clone(&wallet),
 			tracks_own_broadcasts: spec.tracks_own_broadcasts,
 			serves_mempool: spec.serves_mempool,
 			serves_peers: spec.serves_peers,
@@ -2133,12 +2145,22 @@ mod tests {
 		let layer = ChainLayer::new(
 			slots,
 			engine,
-			fee_estimator,
+			Arc::clone(&fee_estimator),
 			Arc::clone(&broadcaster),
-			kv_store,
-			logger,
-			Arc::new(RwLock::new(NodeMetrics::default())),
+			Arc::clone(&logger),
+			Arc::new(TargetRegistry::new()),
 		);
+		// The one node this layer keeps in step, over the test wallet.
+		layer
+			.register_target(target_spec(
+				"test",
+				Arc::clone(&wallet),
+				kv_store,
+				Arc::clone(&broadcaster),
+				fee_estimator,
+				logger,
+			))
+			.expect("the fake engine takes any target");
 
 		Harness { layer, wallet, broadcaster }
 	}
@@ -2643,23 +2665,18 @@ mod tests {
 		filter_source: Option<Arc<dyn FilterSource>>,
 	) -> Result<ChainLayer, Error> {
 		let logger = Arc::new(Logger::new_log_facade());
-		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
 		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
-		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
 		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
 		ChainLayer::new_cbf(
 			peers,
 			cbf_config,
 			fallback,
 			filter_source,
-			wallet,
 			fee_estimator,
 			broadcaster,
-			kv_store,
 			config,
 			logger,
-			Arc::new(RwLock::new(NodeMetrics::default())),
 		)
 	}
 
@@ -2764,21 +2781,16 @@ mod tests {
 	#[tokio::test]
 	async fn new_electrum_serves_its_own_mempool() {
 		let logger = Arc::new(Logger::new_log_facade());
-		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
 		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
-		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
 		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
 		let layer = ChainLayer::new_electrum(
 			"tcp://127.0.0.1:1".into(),
 			ElectrumSyncConfig::default(),
-			wallet,
 			fee_estimator,
 			broadcaster,
-			kv_store,
 			config,
 			logger,
-			Arc::new(RwLock::new(NodeMetrics::default())),
 		);
 
 		let slots = layer.slot_adapters();
@@ -2799,26 +2811,18 @@ mod tests {
 	/// construction: the Esplora and bitcoind clients are plain HTTP clients,
 	/// the Electrum status waits for `start`, and the provider is silent.
 	struct PresetFixture {
-		wallet: Arc<Wallet>,
 		fee_estimator: Arc<OnchainFeeEstimator>,
 		broadcaster: Arc<Broadcaster>,
-		kv_store: Arc<DynStore>,
 		config: Arc<Config>,
 		logger: Arc<Logger>,
 	}
 
 	fn preset_fixture() -> PresetFixture {
 		let logger = Arc::new(Logger::new_log_facade());
-		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
 		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
 		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
-		let wallet = fresh_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
 		let config = Arc::new(Config { network: Network::Regtest, ..Config::default() });
-		PresetFixture { wallet, fee_estimator, broadcaster, kv_store, config, logger }
-	}
-
-	fn metrics() -> Arc<RwLock<NodeMetrics>> {
-		Arc::new(RwLock::new(NodeMetrics::default()))
+		PresetFixture { fee_estimator, broadcaster, config, logger }
 	}
 
 	fn esplora_preset() -> ChainLayer {
@@ -2826,13 +2830,10 @@ mod tests {
 		ChainLayer::new_esplora(
 			"http://127.0.0.1:1".into(),
 			EsploraSyncConfig::default(),
-			f.wallet,
 			f.fee_estimator,
 			f.broadcaster,
-			f.kv_store,
 			f.config,
 			f.logger,
-			metrics(),
 		)
 	}
 
@@ -2841,13 +2842,10 @@ mod tests {
 		ChainLayer::new_electrum(
 			"tcp://127.0.0.1:1".into(),
 			ElectrumSyncConfig::default(),
-			f.wallet,
 			f.fee_estimator,
 			f.broadcaster,
-			f.kv_store,
 			f.config,
 			f.logger,
-			metrics(),
 		)
 	}
 
@@ -2858,13 +2856,10 @@ mod tests {
 			1,
 			"user".into(),
 			"password".into(),
-			f.wallet,
 			f.fee_estimator,
 			f.broadcaster,
-			f.kv_store,
 			f.config,
 			f.logger,
-			metrics(),
 		)
 	}
 
@@ -2875,14 +2870,11 @@ mod tests {
 			1,
 			"user".into(),
 			"password".into(),
-			f.wallet,
 			f.fee_estimator,
 			f.broadcaster,
-			f.kv_store,
 			f.config,
 			BitcoindRestClientConfig { rest_host: "127.0.0.1".into(), rest_port: 2 },
 			f.logger,
-			metrics(),
 		)
 	}
 
@@ -2891,12 +2883,9 @@ mod tests {
 		ChainLayer::new_dependent(
 			Arc::new(SilentProvider),
 			EsploraSyncConfig::default(),
-			f.wallet,
 			f.fee_estimator,
 			f.broadcaster,
-			f.kv_store,
 			f.logger,
-			metrics(),
 		)
 	}
 
@@ -3341,7 +3330,7 @@ mod tests {
 		});
 		let borrowed = h
 			.layer
-			.borrow_mempool(&complete_query(Vec::new()), MempoolEvictions::Apply)
+			.borrow_mempool(&h.target(), &complete_query(Vec::new()), MempoolEvictions::Apply)
 			.await
 			.unwrap();
 		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
@@ -3358,7 +3347,7 @@ mod tests {
 		});
 		assert!(h
 			.layer
-			.borrow_mempool(&complete_query(Vec::new()), MempoolEvictions::Apply)
+			.borrow_mempool(&h.target(), &complete_query(Vec::new()), MempoolEvictions::Apply)
 			.await
 			.is_err());
 	}
@@ -3395,7 +3384,7 @@ mod tests {
 		});
 		let query = complete_query(vec![known.compute_txid()]);
 
-		let borrowed = h.layer.borrow_mempool(&query, MempoolEvictions::Withhold).await.unwrap();
+		let borrowed = h.layer.borrow_mempool(&h.target(), &query, MempoolEvictions::Withhold).await.unwrap();
 		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 0 });
 		let mut both = vec![known.compute_txid(), incoming.compute_txid()];
 		both.sort();
@@ -3405,7 +3394,7 @@ mod tests {
 			"the new payment is seen; the missing one is kept until our blocks say otherwise"
 		);
 
-		let borrowed = h.layer.borrow_mempool(&query, MempoolEvictions::Apply).await.unwrap();
+		let borrowed = h.layer.borrow_mempool(&h.target(), &query, MempoolEvictions::Apply).await.unwrap();
 		assert_eq!(borrowed, BorrowedMempool { by: "provider", unconfirmed: 1, evicted: 1 });
 		assert_eq!(unconfirmed_txids(&wallet), vec![incoming.compute_txid()]);
 	}

@@ -1118,22 +1118,10 @@ mod tests {
 	// ------------------------------------------------------------------------------------------
 
 	fn stopped_engine() -> (Arc<CbfSyncEngine>, Arc<Logger>) {
-		use std::sync::RwLock;
-
-		use lightning::util::test_utils::TestStore;
-
-		use crate::chain::test_wallet::fresh_regtest_wallet;
+		use crate::chain::target::TargetRegistry;
 		use crate::config::Config;
-		use crate::fee_estimator::OnchainFeeEstimator;
-		use crate::tx_broadcaster::TransactionBroadcaster;
-		use crate::types::DynStore;
-		use crate::NodeMetrics;
 
 		let logger = Arc::new(test_logger());
-		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
-		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
-		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
-		let wallet = fresh_regtest_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
 		let config = Arc::new(Config { network: bitcoin::Network::Regtest, ..Config::default() });
 		let engine = CbfSyncEngine::new(
 			Vec::new(),
@@ -1142,11 +1130,9 @@ mod tests {
 			crate::config::CbfSource::P2p,
 			None,
 			None,
-			wallet,
-			kv_store,
+			Arc::new(TargetRegistry::new()),
 			config,
 			Arc::clone(&logger),
-			Arc::new(RwLock::new(NodeMetrics::default())),
 		)
 		.expect("an engine that connects to nothing");
 		(Arc::new(engine), logger)

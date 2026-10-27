@@ -11,7 +11,7 @@
 //! registrations — but shares no code with it, because the Electrum client owns
 //! its own runtime, batching and timeouts.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{Script, Txid};
@@ -21,19 +21,17 @@ use lightning::chain::{Confirm, WatchedOutput};
 use bdk_wallet::Update as BdkUpdate;
 
 use crate::chain::electrum::ElectrumRuntimeClient;
+use crate::chain::engine::esplora::LightningPass;
 use crate::chain::engine::{run_tx_based_sync_loop, SyncEngine, TxBasedBackend};
 use crate::chain::provider::{
 	WireLightningSyncRequest, WireLightningSyncResponse, WireSyncRequest, WireUpdate,
 };
-use crate::chain::{
-	periodically_archive_fully_resolved_monitors, ChainLayer, ElectrumRuntimeStatus,
-	WalletSyncStatus,
-};
+use crate::chain::target::SyncTarget;
+use crate::chain::{ChainLayer, ElectrumRuntimeStatus};
 use crate::config::{Config, ElectrumSyncConfig};
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::Error;
 
 use async_trait::async_trait;
 
@@ -41,13 +39,8 @@ pub(crate) struct ElectrumSyncEngine {
 	pub(crate) server_url: String,
 	pub(crate) sync_config: ElectrumSyncConfig,
 	pub(crate) electrum_runtime_status: Arc<RwLock<ElectrumRuntimeStatus>>,
-	pub(crate) onchain_wallet: Arc<Wallet>,
-	pub(crate) onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
-	pub(crate) lightning_wallet_sync_status: Mutex<WalletSyncStatus>,
-	pub(crate) kv_store: Arc<DynStore>,
 	pub(crate) config: Arc<Config>,
 	pub(crate) logger: Arc<Logger>,
-	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
 }
 
 impl ElectrumSyncEngine {
@@ -71,16 +64,10 @@ impl ElectrumSyncEngine {
 
 #[async_trait]
 impl TxBasedBackend for ElectrumSyncEngine {
-	async fn sync_onchain_wallet(&self) -> Result<(), Error> {
-		let Self {
-			electrum_runtime_status,
-			onchain_wallet,
-			onchain_wallet_sync_status,
-			kv_store,
-			logger,
-			node_metrics,
-			..
-		} = self;
+	async fn sync_onchain_wallet(&self, target: &SyncTarget) -> Result<(), Error> {
+		let Self { electrum_runtime_status, logger, .. } = self;
+		let SyncTarget { onchain_wallet, onchain_wallet_sync_status, kv_store, node_metrics, .. } =
+			target;
 		let electrum_client: Arc<ElectrumRuntimeClient> =
 			if let Some(client) = electrum_runtime_status.read().unwrap().client().as_ref() {
 				Arc::clone(client)
@@ -162,18 +149,8 @@ impl TxBasedBackend for ElectrumSyncEngine {
 		res
 	}
 
-	async fn sync_lightning_wallet(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
-		let Self {
-			electrum_runtime_status,
-			lightning_wallet_sync_status,
-			kv_store,
-			logger,
-			node_metrics,
-			..
-		} = self;
+	async fn sync_lightning_wallets(&self, targets: &[Arc<SyncTarget>]) -> Result<(), Error> {
+		let Self { electrum_runtime_status, logger, .. } = self;
 		let electrum_client: Arc<ElectrumRuntimeClient> =
 			if let Some(client) = electrum_runtime_status.read().unwrap().client().as_ref() {
 				Arc::clone(client)
@@ -185,53 +162,28 @@ impl TxBasedBackend for ElectrumSyncEngine {
 				return Err(Error::TxSyncFailed);
 			};
 
-		let sync_cman = Arc::clone(&channel_manager);
-		let sync_cmon = Arc::clone(&chain_monitor);
-		let sync_sweeper = Arc::clone(&output_sweeper);
-		let confirmables = vec![
-			sync_cman as Arc<dyn Confirm + Sync + Send>,
-			sync_cmon as Arc<dyn Confirm + Sync + Send>,
-			sync_sweeper as Arc<dyn Confirm + Sync + Send>,
-		];
-
-		let receiver_res = {
-			let mut status_lock = lightning_wallet_sync_status.lock().unwrap();
-			status_lock.register_or_subscribe_pending_sync()
+		let Some(pass) = LightningPass::begin(targets, logger).await? else {
+			return Ok(());
 		};
-		if let Some(mut sync_receiver) = receiver_res {
-			log_info!(logger, "Sync in progress, skipping.");
-			return sync_receiver.recv().await.map_err(|e| {
-				debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
-				log_error!(logger, "Failed to receive wallet sync result: {:?}", e);
-				Error::TxSyncFailed
-			})?;
-		}
+		let confirmables: Vec<Arc<dyn Confirm + Sync + Send>> = pass
+			.targets
+			.iter()
+			.flat_map(|t| {
+				[
+					Arc::clone(&t.channel_manager) as Arc<dyn Confirm + Sync + Send>,
+					Arc::clone(&t.chain_monitor) as Arc<dyn Confirm + Sync + Send>,
+					Arc::clone(&t.output_sweeper) as Arc<dyn Confirm + Sync + Send>,
+				]
+			})
+			.collect();
 
-		let res = electrum_client.sync_confirmables(confirmables).await;
+		let mut res = electrum_client.sync_confirmables(confirmables).await;
 
 		if let Ok(_) = res {
-			let unix_time_secs_opt =
-				SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-			{
-				let mut locked_node_metrics = node_metrics.write().unwrap();
-				locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
-				write_node_metrics(
-					&*locked_node_metrics,
-					Arc::clone(&kv_store),
-					Arc::clone(&logger),
-				)?;
-			}
-
-			periodically_archive_fully_resolved_monitors(
-				Arc::clone(&channel_manager),
-				Arc::clone(&chain_monitor),
-				Arc::clone(&kv_store),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			)?;
+			res = pass.record_success(logger);
 		}
 
-		lightning_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
+		pass.finish(res);
 
 		res
 	}
@@ -241,10 +193,6 @@ impl TxBasedBackend for ElectrumSyncEngine {
 impl SyncEngine for ElectrumSyncEngine {
 	fn name(&self) -> &'static str {
 		"electrum-tx-sync"
-	}
-
-	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
-		Some(&self.onchain_wallet)
 	}
 
 	/// The MEMPOOL chain over this engine is its own Electrum server, whose
@@ -286,29 +234,21 @@ impl SyncEngine for ElectrumSyncEngine {
 		self.serving_client()?.serve_lightning_sync(req).await
 	}
 
-	async fn sync_once(
-		&self, _layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
-		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
+	async fn sync_once(&self, _layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error> {
 		// ORDER IS LOAD-BEARING: Lightning wallet before on-chain wallet.
-		self.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper).await?;
-		self.sync_onchain_wallet().await?;
+		self.sync_lightning_wallets(std::slice::from_ref(target)).await?;
+		self.sync_onchain_wallet(target).await?;
 		Ok(())
 	}
 
 	async fn run_background(
 		&self, layer: Arc<ChainLayer>, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
 	) {
 		if let Some(background_sync_config) = self.sync_config.background_sync_config.as_ref() {
 			run_tx_based_sync_loop(
 				self,
 				layer,
 				stop_sync_receiver,
-				channel_manager,
-				chain_monitor,
-				output_sweeper,
 				background_sync_config,
 				Arc::clone(&self.logger),
 			)

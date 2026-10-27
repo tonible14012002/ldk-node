@@ -1897,6 +1897,7 @@ mod tests {
 					Op::Disconnect(heights)
 				},
 				ChainOp::Synced { tip_height } => Op::Synced(tip_height),
+				ChainOp::Rescan { .. } => unreachable!("the node source never asks for a rescan"),
 			}
 		}
 

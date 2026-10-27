@@ -25,6 +25,7 @@ mod layer;
 pub mod provider;
 pub(crate) mod raw_serve;
 pub(crate) mod seam;
+pub(crate) mod target;
 pub(crate) mod wire_convert;
 
 pub(crate) use layer::ChainLayer;

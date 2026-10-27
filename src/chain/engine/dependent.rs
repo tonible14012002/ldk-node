@@ -49,7 +49,7 @@
 //! per sync; the next sync continues from wherever that left off.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{BlockHash, Script, ScriptBuf, Txid};
@@ -58,6 +58,7 @@ use bdk_chain::BlockId;
 
 use lightning::chain::{BestBlock, Confirm, WatchedOutput};
 
+use crate::chain::engine::esplora::LightningPass;
 use crate::chain::engine::{run_tx_based_sync_loop, SyncEngine, TxBasedBackend};
 use crate::chain::provider::{
 	ChainDataProvider, WireLightningSyncRequest, WireSyncRequest, WireUpdate, WireWatchedOutput,
@@ -68,15 +69,16 @@ use crate::chain::wire_convert::{
 	full_scan_request_batch_to_wire, header_from_wire, outpoint_to_wire, script_to_wire,
 	sync_request_to_wire, tx_from_wire, txid_from_wire, txid_to_wire, wire_update_to_bdk,
 };
-use crate::chain::{ChainLayer, WalletSyncStatus};
+use crate::chain::target::SyncTarget;
+use crate::chain::ChainLayer;
 use crate::config::{
 	EsploraSyncConfig, BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS,
 	LDK_WALLET_SYNC_TIMEOUT_SECS,
 };
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_error, log_info, log_trace, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::types::Wallet;
+use crate::Error;
 
 use async_trait::async_trait;
 
@@ -132,12 +134,10 @@ impl WatchedSet {
 pub(crate) struct DependentSyncEngine {
 	pub(crate) provider: Arc<dyn ChainDataProvider>,
 	pub(crate) sync_config: EsploraSyncConfig,
-	pub(crate) onchain_wallet: Arc<Wallet>,
-	pub(crate) onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
-	pub(crate) lightning_wallet_sync_status: Mutex<WalletSyncStatus>,
-	pub(crate) kv_store: Arc<DynStore>,
 	pub(crate) logger: Arc<Logger>,
-	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
+	/// What `Filter` registered. One set for every target: a registration names a script
+	/// and a transaction, not the node that watches them, and the serving node answers
+	/// the same whichever node asked.
 	watched: Mutex<WatchedSet>,
 	/// The block each tracked transaction was last seen confirmed in. Sent
 	/// with every request so the serving node can report only what changed.
@@ -145,21 +145,13 @@ pub(crate) struct DependentSyncEngine {
 }
 
 impl DependentSyncEngine {
-	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
-		provider: Arc<dyn ChainDataProvider>, sync_config: EsploraSyncConfig,
-		onchain_wallet: Arc<Wallet>, kv_store: Arc<DynStore>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		provider: Arc<dyn ChainDataProvider>, sync_config: EsploraSyncConfig, logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			provider,
 			sync_config,
-			onchain_wallet,
-			onchain_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
-			lightning_wallet_sync_status: Mutex::new(WalletSyncStatus::Completed),
-			kv_store,
 			logger,
-			node_metrics,
 			watched: Mutex::new(WatchedSet::default()),
 			confirmed_in: Mutex::new(HashMap::new()),
 		}
@@ -170,26 +162,27 @@ impl DependentSyncEngine {
 	/// Returns whether the wallet is known to have reached the provider's tip.
 	/// A first sync that did not is not recorded as done, so the next one is
 	/// a full scan again, from where this one stopped.
-	async fn run_onchain_sync(&self) -> Result<bool, Error> {
+	async fn run_onchain_sync(&self, target: &SyncTarget) -> Result<bool, Error> {
+		let onchain_wallet = &target.onchain_wallet;
 		// First sync is a full scan with the configured gap limit; after that,
 		// incremental. Same rule as every other engine.
 		let incremental_sync =
-			self.node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
+			target.node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
 
 		for _round in 0..ONCHAIN_SYNC_MAX_ROUNDS {
-			let from = self.onchain_wallet.current_best_block().height;
+			let from = onchain_wallet.current_best_block().height;
 			let server_tip = if incremental_sync {
-				let spk_map = self.onchain_wallet.revealed_spk_index();
+				let spk_map = onchain_wallet.revealed_spk_index();
 				let mut request =
-					sync_request_to_wire(self.onchain_wallet.get_incremental_sync_request());
-				request.owned_outpoints = self.owned_outpoints();
+					sync_request_to_wire(onchain_wallet.get_incremental_sync_request());
+				request.owned_outpoints = Self::owned_outpoints(onchain_wallet);
 				let wire_update = self.ask_wallet_sync(request).await?;
-				self.apply_wallet_update(&wire_update, &spk_map)?;
+				self.apply_wallet_update(onchain_wallet, &wire_update, &spk_map)?;
 				wire_update.server_tip
 			} else {
-				self.run_full_scan().await?
+				self.run_full_scan(onchain_wallet).await?
 			};
-			let reached = self.onchain_wallet.current_best_block().height;
+			let reached = onchain_wallet.current_best_block().height;
 			if !stopped_short(server_tip.as_ref(), reached) {
 				return Ok(true);
 			}
@@ -206,10 +199,12 @@ impl DependentSyncEngine {
 
 	/// One full scan, driven here in bounded batches of scripts. Returns the
 	/// provider's tip when an answer stopped short of it.
-	async fn run_full_scan(&self) -> Result<Option<crate::chain::provider::WireBlockId>, Error> {
+	async fn run_full_scan(
+		&self, onchain_wallet: &Wallet,
+	) -> Result<Option<crate::chain::provider::WireBlockId>, Error> {
 		let mut server_tip = None;
-		let spk_map = self.onchain_wallet.revealed_spk_index();
-		let mut full_scan = self.onchain_wallet.get_full_scan_request();
+		let spk_map = onchain_wallet.revealed_spk_index();
+		let mut full_scan = onchain_wallet.get_full_scan_request();
 		for batch in 0..FULL_SCAN_MAX_BATCHES {
 			let mut request = full_scan_request_batch_to_wire(
 				&mut full_scan,
@@ -219,14 +214,14 @@ impl DependentSyncEngine {
 			if request.spks.is_empty() {
 				break;
 			}
-			request.owned_outpoints = self.owned_outpoints();
+			request.owned_outpoints = Self::owned_outpoints(onchain_wallet);
 
 			let wire_update = self.ask_wallet_sync(request).await?;
 			// Every batch is applied as it arrives rather than accumulated:
 			// a later batch failing then leaves the wallet with the progress
 			// already made instead of discarding all of it.
 			let had_activity = !wire_update.txs.is_empty();
-			self.apply_wallet_update(&wire_update, &spk_map)?;
+			self.apply_wallet_update(onchain_wallet, &wire_update, &spk_map)?;
 			// Every batch scans the same blocks; any one capped means all were.
 			server_tip = server_tip.or(wire_update.server_tip);
 
@@ -250,8 +245,8 @@ impl DependentSyncEngine {
 
 	/// The wallet's outputs whose spends a filter-scanning provider must
 	/// recognise, in wire form.
-	fn owned_outpoints(&self) -> Vec<crate::chain::provider::WireOutPoint> {
-		self.onchain_wallet
+	fn owned_outpoints(onchain_wallet: &Wallet) -> Vec<crate::chain::provider::WireOutPoint> {
+		onchain_wallet
 			.outpoints_for_spend_watch(SPEND_WATCH_REORG_DEPTH)
 			.iter()
 			.map(outpoint_to_wire)
@@ -259,14 +254,14 @@ impl DependentSyncEngine {
 	}
 
 	fn apply_wallet_update(
-		&self, wire_update: &WireUpdate,
+		&self, onchain_wallet: &Wallet, wire_update: &WireUpdate,
 		spk_map: &HashMap<ScriptBuf, (bdk_wallet::KeychainKind, u32)>,
 	) -> Result<(), Error> {
 		let update = wire_update_to_bdk(wire_update, spk_map).map_err(|e| {
 			log_error!(self.logger, "Chain provider returned an unusable update: {}", e);
 			Error::WalletOperationFailed
 		})?;
-		self.onchain_wallet.apply_update(update)
+		onchain_wallet.apply_update(update)
 	}
 
 	async fn ask_wallet_sync(&self, request: WireSyncRequest) -> Result<WireUpdate, Error> {
@@ -296,9 +291,9 @@ impl DependentSyncEngine {
 
 #[async_trait]
 impl TxBasedBackend for DependentSyncEngine {
-	async fn sync_onchain_wallet(&self) -> Result<(), Error> {
+	async fn sync_onchain_wallet(&self, target: &SyncTarget) -> Result<(), Error> {
 		let receiver_res = {
-			let mut status_lock = self.onchain_wallet_sync_status.lock().unwrap();
+			let mut status_lock = target.onchain_wallet_sync_status.lock().unwrap();
 			status_lock.register_or_subscribe_pending_sync()
 		};
 		if let Some(mut sync_receiver) = receiver_res {
@@ -311,16 +306,16 @@ impl TxBasedBackend for DependentSyncEngine {
 		}
 
 		let incremental_sync =
-			self.node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
+			target.node_metrics.read().unwrap().latest_onchain_wallet_sync_timestamp.is_some();
 		let now = Instant::now();
 
-		let res = match self.run_onchain_sync().await {
+		let res = match self.run_onchain_sync(target).await {
 			Ok(false) if !incremental_sync => {
 				// Not recorded as done: the next sync scans on from here.
 				log_info!(
 					self.logger,
 					"First sync of on-chain wallet reached height {} in {}ms and continues next time.",
-					self.onchain_wallet.current_best_block().height,
+					target.onchain_wallet.current_best_block().height,
 					now.elapsed().as_millis()
 				);
 				Ok(())
@@ -334,48 +329,47 @@ impl TxBasedBackend for DependentSyncEngine {
 				);
 				let unix_time_secs_opt =
 					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-				let mut locked_node_metrics = self.node_metrics.write().unwrap();
+				let mut locked_node_metrics = target.node_metrics.write().unwrap();
 				locked_node_metrics.latest_onchain_wallet_sync_timestamp = unix_time_secs_opt;
 				write_node_metrics(
 					&*locked_node_metrics,
-					Arc::clone(&self.kv_store),
+					Arc::clone(&target.kv_store),
 					Arc::clone(&self.logger),
 				)
 			},
 			Err(e) => Err(e),
 		};
 
-		self.onchain_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
+		target.onchain_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
 
 		res
 	}
 
-	async fn sync_lightning_wallet(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
-		let receiver_res = {
-			let mut status_lock = self.lightning_wallet_sync_status.lock().unwrap();
-			status_lock.register_or_subscribe_pending_sync()
+	/// One request per target. Each request carries the asking node's own best block as
+	/// `scan_from`, and a filter-scanning provider answers from exactly there, so the
+	/// targets cannot share one request until the wire carries several scan anchors.
+	// TODO(multi-wallet P2): batch the targets' requests into one round trip.
+	async fn sync_lightning_wallets(&self, targets: &[Arc<SyncTarget>]) -> Result<(), Error> {
+		let Some(pass) = LightningPass::begin(targets, &self.logger).await? else {
+			return Ok(());
 		};
-		if let Some(mut sync_receiver) = receiver_res {
-			log_info!(self.logger, "Sync in progress, skipping.");
-			return sync_receiver.recv().await.map_err(|e| {
-				debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
-				log_error!(self.logger, "Failed to receive wallet sync result: {:?}", e);
-				Error::WalletOperationFailed
-			})?;
-		}
 
 		let now = Instant::now();
-		let confirmables: Vec<&(dyn Confirm + Sync + Send)> = vec![
-			&*channel_manager as &(dyn Confirm + Sync + Send),
-			&*chain_monitor as &(dyn Confirm + Sync + Send),
-			&*output_sweeper as &(dyn Confirm + Sync + Send),
-		];
-
-		let res =
-			self.run_lightning_sync(&confirmables, channel_manager.current_best_block()).await;
+		let mut res = Ok(());
+		for target in &pass.targets {
+			let confirmables: Vec<&(dyn Confirm + Sync + Send)> = vec![
+				&*target.channel_manager as &(dyn Confirm + Sync + Send),
+				&*target.chain_monitor as &(dyn Confirm + Sync + Send),
+				&*target.output_sweeper as &(dyn Confirm + Sync + Send),
+			];
+			if let Err(e) = self
+				.run_lightning_sync(&confirmables, target.channel_manager.current_best_block())
+				.await
+			{
+				res = Err(e);
+				break;
+			}
+		}
 
 		match res {
 			Ok(()) => {
@@ -386,20 +380,22 @@ impl TxBasedBackend for DependentSyncEngine {
 				);
 				let unix_time_secs_opt =
 					SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-				let mut locked_node_metrics = self.node_metrics.write().unwrap();
-				locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
-				let _ = write_node_metrics(
-					&*locked_node_metrics,
-					Arc::clone(&self.kv_store),
-					Arc::clone(&self.logger),
-				);
+				for target in &pass.targets {
+					let mut locked_node_metrics = target.node_metrics.write().unwrap();
+					locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
+					let _ = write_node_metrics(
+						&*locked_node_metrics,
+						Arc::clone(&target.kv_store),
+						Arc::clone(&self.logger),
+					);
+				}
 			},
 			Err(ref e) => {
 				log_error!(self.logger, "Sync of Lightning wallet failed: {:?}", e);
 			},
 		}
 
-		self.lightning_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
+		pass.finish(res);
 
 		res
 	}
@@ -572,24 +568,15 @@ impl SyncEngine for DependentSyncEngine {
 		"dependent-tx-sync"
 	}
 
-	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
-		Some(&self.onchain_wallet)
-	}
-
-	async fn sync_once(
-		&self, _layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
-		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
+	async fn sync_once(&self, _layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error> {
 		// Transaction-based order: Lightning first, then on-chain. Matches
 		// the Esplora and Electrum engines.
-		self.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper).await?;
-		self.sync_onchain_wallet().await
+		self.sync_lightning_wallets(std::slice::from_ref(target)).await?;
+		self.sync_onchain_wallet(target).await
 	}
 
 	async fn run_background(
 		&self, layer: Arc<ChainLayer>, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
 	) {
 		let Some(background_sync_config) = self.sync_config.background_sync_config.as_ref() else {
 			log_info!(
@@ -603,9 +590,6 @@ impl SyncEngine for DependentSyncEngine {
 			self,
 			layer,
 			stop_sync_receiver,
-			channel_manager,
-			chain_monitor,
-			output_sweeper,
 			background_sync_config,
 			Arc::clone(&self.logger),
 		)

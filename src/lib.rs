@@ -193,6 +193,7 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 
+use chain::target::{SyncTargetSpec, TargetId};
 use chain::ChainLayer;
 use config::{
 	default_user_config, may_announce_channel, ChannelConfig, Config, NODE_ANN_BCAST_INTERVAL,
@@ -276,6 +277,11 @@ pub struct Node {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	/// Fundings proven dead by the chain; see [`dead_funding`].
 	dead_fundings: Arc<dead_funding::DeadFundingStore>,
+	/// This node's handle in the chain layer's target registry, from `start` to `stop`.
+	chain_target: Mutex<Option<TargetId>>,
+	/// Where a filter scan for this node's wallet may start; see
+	/// [`chain::target::SyncTargetSpec::birthday_height`].
+	wallet_birthday_height: Option<u32>,
 	/// Last `PaymentPathFailed` detail per payment (bounded, in-memory). Written by
 	/// the event handler, read via `Node::path_failure`.
 	path_failures: Arc<PathFailureStore>,
@@ -324,6 +330,14 @@ impl Node {
 			log_error!(self.logger, "Failed to start chain syncing: {}", e);
 			e
 		})?;
+
+		// Join the chain layer's targets before anything syncs, so the first pass and the
+		// fee stamp below cover this node.
+		let target = self.chain_source.register_target(self.sync_target_spec()).map_err(|e| {
+			log_error!(self.logger, "Failed to join the chain sync: {}", e);
+			e
+		})?;
+		*self.chain_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.id);
 
 		// Record which adapters occupy each chain ability slot, in chain order,
 		// so a support question about a fee or broadcast answer can be traced
@@ -391,13 +405,8 @@ impl Node {
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 		let stop_sync_receiver = self.stop_sender.subscribe();
 		let chain_source = Arc::clone(&self.chain_source);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
 		runtime.spawn(async move {
-			chain_source
-				.continuously_sync_wallets(stop_sync_receiver, sync_cman, sync_cmon, sync_sweeper)
-				.await;
+			chain_source.continuously_sync_wallets(stop_sync_receiver).await;
 		});
 
 		if self.gossip_source.is_rgs() {
@@ -788,6 +797,9 @@ impl Node {
 
 		// Stop any runtime-dependant chain sources.
 		self.chain_source.stop();
+		if let Some(id) = self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).take() {
+			self.chain_source.unregister_target(id);
+		}
 
 		// Stop the runtime.
 		match self.stop_sender.send(()) {
@@ -1754,14 +1766,30 @@ impl Node {
 		// one per call.
 		let rt_lock = self.runtime.read().unwrap();
 		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+		let target_id = self
+			.chain_target
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.ok_or(Error::NotRunning)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		runtime.block_on(async move {
-			chain_source.sync_wallets_once(sync_cman, sync_cmon, sync_sweeper).await
-		})
+		runtime.block_on(async move { chain_source.sync_wallets_once(target_id).await })
+	}
+
+	/// Everything of this node the chain layer keeps in step; see [`chain::target`].
+	fn sync_target_spec(&self) -> SyncTargetSpec {
+		let node_id = self.node_id().to_string();
+		SyncTargetSpec {
+			label: node_id.chars().take(8).collect(),
+			onchain_wallet: Arc::clone(&self.wallet),
+			channel_manager: Arc::clone(&self.channel_manager),
+			chain_monitor: Arc::clone(&self.chain_monitor),
+			output_sweeper: Arc::clone(&self.output_sweeper),
+			kv_store: Arc::clone(&self.kv_store),
+			node_metrics: Arc::clone(&self.node_metrics),
+			dead_fundings: Arc::clone(&self.dead_fundings),
+			birthday_height: self.wallet_birthday_height,
+		}
 	}
 
 	/// Serve this node's fee-rate cache to another node.

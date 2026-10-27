@@ -167,6 +167,30 @@ where
 			.collect()
 	}
 
+	/// Whether `tx` touches this wallet: it pays one of the wallet's scripts, or spends an
+	/// output the wallet's graph holds as its own.
+	///
+	/// The BROADCAST tail asks this to tell which of several wallets a package belongs to.
+	/// Ownership is decided on the graph as it stands, so a funding transaction built by this
+	/// wallet is its own (it spends the wallet's coins) even before it is inserted.
+	pub(crate) fn is_relevant_tx(&self, tx: &Transaction) -> bool {
+		let locked_wallet = self.inner.lock().unwrap();
+		if tx.output.iter().any(|o| locked_wallet.is_mine(o.script_pubkey.clone())) {
+			return true;
+		}
+		let graph = locked_wallet.tx_graph();
+		tx.input.iter().any(|i| {
+			graph
+				.get_txout(i.previous_output)
+				.map_or(false, |txout| locked_wallet.is_mine(txout.script_pubkey.clone()))
+		})
+	}
+
+	/// Whether the wallet's graph holds a transaction with `txid`.
+	pub(crate) fn knows_tx(&self, txid: &Txid) -> bool {
+		self.inner.lock().unwrap().tx_graph().get_tx(*txid).is_some()
+	}
+
 	pub(crate) fn get_cached_txs(&self) -> Vec<Arc<Transaction>> {
 		self.inner.lock().unwrap().tx_graph().full_txs().map(|tx_node| tx_node.tx).collect()
 	}

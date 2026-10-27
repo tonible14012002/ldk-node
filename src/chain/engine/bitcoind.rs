@@ -32,13 +32,16 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
+use bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 
 use lightning::chain::Listen;
 
 use lightning_block_sync::init::{synchronize_listeners, validate_best_block_header};
 use lightning_block_sync::poll::{ChainPoller, ChainTip, ValidatedBlockHeader};
-use lightning_block_sync::{BlockSourceErrorKind, SpvClient};
+use lightning_block_sync::{
+	AsyncBlockSourceResult, BlockData, BlockHeaderData, BlockSource, BlockSourceErrorKind,
+	SpvClient,
+};
 
 use crate::chain::adapters::bitcoind_raw::{BitcoindRpcSource, SourceReadiness};
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache, ChainListener};
@@ -56,12 +59,12 @@ use crate::chain::wire_convert::{
 	block_hash_from_wire, block_id_from_wire, block_id_to_wire, check_version, header_to_wire,
 	outpoint_from_wire, script_from_wire, tx_to_wire, txid_from_wire, txid_to_wire,
 };
-use crate::chain::{ChainLayer, WalletSyncStatus, CHAIN_POLLING_INTERVAL_SECS};
+use crate::chain::target::{SyncTarget, TargetId};
+use crate::chain::{ChainLayer, CHAIN_POLLING_INTERVAL_SECS};
 use crate::config::Config;
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::Error;
 
 use async_trait::async_trait;
 
@@ -69,15 +72,370 @@ pub(crate) struct BitcoindSyncEngine {
 	pub(crate) api_client: Arc<BitcoindClient>,
 	pub(crate) header_cache: tokio::sync::Mutex<BoundedHeaderCache>,
 	pub(crate) latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>,
-	pub(crate) onchain_wallet: Arc<Wallet>,
-	pub(crate) wallet_polling_status: Mutex<WalletSyncStatus>,
-	pub(crate) kv_store: Arc<DynStore>,
 	pub(crate) config: Arc<Config>,
 	pub(crate) logger: Arc<Logger>,
-	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
 	/// Answers Dependent nodes' syncs; `None` when its RPC client could not
 	/// be set up, and the serves then refuse.
 	pub(crate) scan_server: Option<Arc<DependentScanServer>>,
+	/// The targets the polling loop delivers blocks to: those synchronised up
+	/// to `latest_chain_tip`. A target registered after the initial
+	/// synchronisation is caught up to that tip — and only that tip — before
+	/// it joins, so the next poll hands it exactly the blocks it has not seen.
+	/// See [`PinnedTipSource`].
+	joined: Mutex<HashSet<TargetId>>,
+}
+
+impl BitcoindSyncEngine {
+	pub(crate) fn new(
+		api_client: Arc<BitcoindClient>,
+		latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>, config: Arc<Config>,
+		logger: Arc<Logger>, scan_server: Option<Arc<DependentScanServer>>,
+	) -> Self {
+		Self {
+			api_client,
+			header_cache: tokio::sync::Mutex::new(BoundedHeaderCache::new()),
+			latest_chain_tip,
+			config,
+			logger,
+			scan_server,
+			joined: Mutex::new(HashSet::new()),
+		}
+	}
+
+	/// This target's listeners with the block each last saw, in the shape
+	/// `synchronize_listeners` takes.
+	fn chain_listeners_of(target: &SyncTarget) -> Vec<(BlockHash, &(dyn Listen + Send + Sync))> {
+		let mut chain_listeners = vec![
+			(
+				target.onchain_wallet.current_best_block().block_hash,
+				&*target.onchain_wallet as &(dyn Listen + Send + Sync),
+			),
+			(
+				target.channel_manager.current_best_block().block_hash,
+				&*target.channel_manager as &(dyn Listen + Send + Sync),
+			),
+			(
+				target.output_sweeper.current_best_block().block_hash,
+				&*target.output_sweeper as &(dyn Listen + Send + Sync),
+			),
+		];
+
+		// TODO: Eventually we might want to see if we can synchronize `ChannelMonitor`s
+		// before giving them to `ChainMonitor` it the first place. However, this isn't
+		// trivial as we load them on initialization (in the `Builder`) and only gain
+		// network access during `start`. For now, we just make sure we get the worst known
+		// block hash and sychronize them via `ChainMonitor`.
+		if let Some(worst_channel_monitor_block_hash) = target
+			.chain_monitor
+			.list_monitors()
+			.iter()
+			.flat_map(|(txo, _)| target.chain_monitor.get_monitor(*txo))
+			.map(|m| m.current_best_block())
+			.min_by_key(|b| b.height)
+			.map(|b| b.block_hash)
+		{
+			chain_listeners.push((
+				worst_channel_monitor_block_hash,
+				&*target.chain_monitor as &(dyn Listen + Send + Sync),
+			));
+		}
+		chain_listeners
+	}
+
+	/// The ungated fan-out for one target; see [`ChainListener::new`].
+	fn listener_of(&self, layer: &ChainLayer, target: &SyncTarget) -> ChainListener {
+		ChainListener::new(
+			Arc::clone(&target.onchain_wallet),
+			Arc::clone(&target.channel_manager),
+			Arc::clone(&target.chain_monitor),
+			Arc::clone(&target.output_sweeper),
+			Arc::clone(layer.tx_broadcaster()),
+			Arc::clone(layer.fee_estimator()),
+			Arc::clone(&self.logger),
+		)
+	}
+
+	/// Stamp a completed pass into `targets`' metrics.
+	fn record_pass(&self, targets: &[Arc<SyncTarget>]) -> Result<(), Error> {
+		let unix_time_secs_opt =
+			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
+		for target in targets {
+			let mut locked_node_metrics =
+				target.node_metrics.write().unwrap_or_else(|e| e.into_inner());
+			locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
+			locked_node_metrics.latest_onchain_wallet_sync_timestamp = unix_time_secs_opt;
+			write_node_metrics(
+				&*locked_node_metrics,
+				Arc::clone(&target.kv_store),
+				Arc::clone(&self.logger),
+			)
+			.map_err(|e| {
+				log_error!(self.logger, "Failed to persist node metrics: {}", e);
+				Error::PersistenceFailed
+			})?;
+		}
+		Ok(())
+	}
+
+	/// One poll: catch up any target that joined since the last one, deliver
+	/// the new blocks to every joined target, then the mempool. The header
+	/// cache lock serialises passes, so two callers — the loop and a
+	/// foreground `sync_wallets` — never poll from the same cached tip twice.
+	async fn poll_pass(&self, layer: &ChainLayer) -> Result<(), Error> {
+		let Self { api_client, header_cache, latest_chain_tip, config, logger, .. } = self;
+
+		let mut locked_header_cache = header_cache.lock().await;
+
+		let latest_chain_tip_opt = *latest_chain_tip.read().unwrap_or_else(|e| e.into_inner());
+		let chain_tip = if let Some(tip) = latest_chain_tip_opt {
+			tip
+		} else {
+			match validate_best_block_header(api_client.as_ref()).await {
+				Ok(tip) => {
+					*latest_chain_tip.write().unwrap_or_else(|e| e.into_inner()) = Some(tip);
+					tip
+				},
+				Err(e) => {
+					log_error!(logger, "Failed to poll for chain data: {:?}", e);
+					return Err(Error::TxSyncFailed);
+				},
+			}
+		};
+
+		// A target registered after the loop started is brought up to the cached tip
+		// — not the source's — from wherever its own listeners stand, so the poll below
+		// hands it exactly the blocks past that tip, once, like everyone else.
+		let targets = layer.targets().snapshot();
+		let mut joined_targets = Vec::with_capacity(targets.len());
+		for target in &targets {
+			if self.joined.lock().unwrap_or_else(|e| e.into_inner()).contains(&target.id) {
+				joined_targets.push(Arc::clone(target));
+				continue;
+			}
+			let pinned = PinnedTipSource { inner: api_client.as_ref(), tip: chain_tip };
+			let now = SystemTime::now();
+			match synchronize_listeners(
+				&pinned,
+				config.network,
+				&mut *locked_header_cache,
+				Self::chain_listeners_of(target),
+			)
+			.await
+			{
+				Ok(_) => {
+					log_info!(
+						logger,
+						"Finished synchronizing listeners of {} to height {} in {}ms",
+						target.label,
+						chain_tip.height,
+						now.elapsed().unwrap_or_default().as_millis()
+					);
+					self.joined.lock().unwrap_or_else(|e| e.into_inner()).insert(target.id);
+					joined_targets.push(Arc::clone(target));
+				},
+				Err(e) => {
+					log_error!(
+						logger,
+						"Failed to synchronize chain listeners of {}: {:?}; retrying next poll",
+						target.label,
+						e
+					);
+				},
+			}
+		}
+
+		let listeners: Vec<ChainListener> =
+			joined_targets.iter().map(|t| self.listener_of(layer, t)).collect();
+		let fanout = FanoutListener { listeners: &listeners };
+		let chain_poller = ChainPoller::new(Arc::clone(api_client), config.network);
+		let mut spv_client =
+			SpvClient::new(chain_tip, chain_poller, &mut *locked_header_cache, &fanout);
+
+		let now = SystemTime::now();
+		match spv_client.poll_best_tip().await {
+			Ok((ChainTip::Better(tip), true)) => {
+				log_trace!(
+					logger,
+					"Finished polling best tip in {}ms",
+					now.elapsed().unwrap_or_default().as_millis()
+				);
+				*latest_chain_tip.write().unwrap_or_else(|e| e.into_inner()) = Some(tip);
+			},
+			Ok(_) => {},
+			Err(e) => {
+				log_error!(logger, "Failed to poll for chain data: {:?}", e);
+				return Err(Error::TxSyncFailed);
+			},
+		}
+
+		if joined_targets.is_empty() {
+			return Ok(());
+		}
+
+		// One mempool poll for every wallet: the adapter answers the whole mempool
+		// regardless, and each wallet keeps what is its own on apply. The evictions are
+		// the union's absences; each wallet is handed only those of its own unconfirmed
+		// transactions.
+		let cur_height = joined_targets
+			.iter()
+			.map(|t| t.channel_manager.current_best_block().height)
+			.min()
+			.unwrap_or(0);
+		let per_target_unconfirmed: Vec<Vec<Txid>> =
+			joined_targets.iter().map(|t| t.onchain_wallet.get_unconfirmed_txids()).collect();
+		let known_unconfirmed: Vec<Txid> = {
+			let mut all: Vec<Txid> = per_target_unconfirmed.iter().flatten().copied().collect();
+			all.sort_unstable();
+			all.dedup();
+			all
+		};
+
+		let now = SystemTime::now();
+		let query = MempoolQuery {
+			// A block-polling engine has no script list to send and needs
+			// none: its adapter answers the whole mempool and the wallet
+			// keeps what is its own on apply, as it always has.
+			scripts: Vec::new(),
+			known_unconfirmed,
+			scope: MempoolScope::Incremental { best_processed_height: cur_height },
+		};
+		match layer.mempool(&query).await {
+			Ok(answered) => {
+				let MempoolAnswer { unconfirmed: unconfirmed_txs, evicted: evicted_txids } =
+					answered.value.value;
+				log_trace!(
+					logger,
+					"Finished polling mempool of size {} and {} evicted transactions in {}ms",
+					unconfirmed_txs.len(),
+					evicted_txids.len(),
+					now.elapsed().unwrap_or_default().as_millis()
+				);
+				for (target, own_unconfirmed) in joined_targets.iter().zip(per_target_unconfirmed)
+				{
+					let own_evicted: Vec<(Txid, u64)> = evicted_txids
+						.iter()
+						.filter(|(txid, _)| own_unconfirmed.contains(txid))
+						.cloned()
+						.collect();
+					target
+						.onchain_wallet
+						.apply_mempool_txs(unconfirmed_txs.clone(), own_evicted)
+						.unwrap_or_else(|e| {
+							log_error!(logger, "Failed to apply mempool transactions: {:?}", e);
+						});
+				}
+			},
+			Err(e) => {
+				log_error!(logger, "Failed to poll for mempool transactions: {}", e);
+				return Err(Error::TxSyncFailed);
+			},
+		}
+
+		self.record_pass(&joined_targets)
+	}
+
+	/// A background tick: one poll, answered to every target whose latch is
+	/// free. A target whose latch a foreground pass holds gets its answer from
+	/// that pass; when every target is held, this tick waits for one of them
+	/// rather than polling behind it — the single-wallet "sync in progress"
+	/// behaviour.
+	async fn background_tick(&self, layer: &ChainLayer) -> Result<(), Error> {
+		let targets = layer.targets().snapshot();
+		let mut held = Vec::with_capacity(targets.len());
+		let mut busy = None;
+		for target in &targets {
+			let receiver_res = target
+				.onchain_wallet_sync_status
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.register_or_subscribe_pending_sync();
+			match receiver_res {
+				None => held.push(Arc::clone(target)),
+				Some(receiver) => busy = busy.or(Some(receiver)),
+			}
+		}
+		if held.is_empty() {
+			if let Some(mut sync_receiver) = busy {
+				log_info!(self.logger, "Sync in progress, skipping.");
+				return sync_receiver.recv().await.map_err(|e| {
+					debug_assert!(false, "Failed to receive wallet polling result: {:?}", e);
+					log_error!(self.logger, "Failed to receive wallet polling result: {:?}", e);
+					Error::WalletOperationFailed
+				})?;
+			}
+			// No targets at all: keep the cached tip moving so a node that
+			// registers later starts from a fresh one.
+			return self.poll_pass(layer).await;
+		}
+		let res = self.poll_pass(layer).await;
+		for target in &held {
+			target
+				.onchain_wallet_sync_status
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.propagate_result_to_subscribers(res);
+		}
+		res
+	}
+}
+
+/// `Listen` over every joined target at once, so one poll delivers each new
+/// block to all of them in registration order.
+struct FanoutListener<'a> {
+	listeners: &'a [ChainListener],
+}
+
+impl Listen for FanoutListener<'_> {
+	fn filtered_block_connected(
+		&self, header: &bitcoin::block::Header,
+		txdata: &lightning::chain::transaction::TransactionData, height: u32,
+	) {
+		for listener in self.listeners {
+			listener.filtered_block_connected(header, txdata, height);
+		}
+	}
+
+	fn block_connected(&self, block: &bitcoin::Block, height: u32) {
+		for listener in self.listeners {
+			listener.block_connected(block, height);
+		}
+	}
+
+	fn block_disconnected(&self, header: &bitcoin::block::Header, height: u32) {
+		for listener in self.listeners {
+			listener.block_disconnected(header, height);
+		}
+	}
+}
+
+/// The chain source with its best block pinned at `tip`.
+///
+/// `synchronize_listeners` syncs to whatever its source calls best. A target
+/// that joins a running loop must be synced to the loop's *cached* tip, not
+/// the source's: the next poll connects every block from the cached tip to
+/// the source's, and a target already past the cached tip would be handed
+/// blocks it has — which a `ChannelManager` refuses, loudly. Pinning the best
+/// block makes the catch-up stop exactly where the poll resumes.
+struct PinnedTipSource<'a> {
+	inner: &'a BitcoindClient,
+	tip: ValidatedBlockHeader,
+}
+
+impl BlockSource for PinnedTipSource<'_> {
+	fn get_header<'a>(
+		&'a self, header_hash: &'a BlockHash, height_hint: Option<u32>,
+	) -> AsyncBlockSourceResult<'a, BlockHeaderData> {
+		self.inner.get_header(header_hash, height_hint)
+	}
+
+	fn get_block<'a>(&'a self, header_hash: &'a BlockHash) -> AsyncBlockSourceResult<'a, BlockData> {
+		self.inner.get_block(header_hash)
+	}
+
+	fn get_best_block(&self) -> AsyncBlockSourceResult<'_, (BlockHash, Option<u32>)> {
+		let tip = self.tip;
+		Box::pin(async move { Ok((tip.header.block_hash(), Some(tip.height))) })
+	}
 }
 
 /// Served scans running at once; the rest wait their turn.
@@ -317,10 +675,6 @@ impl SyncEngine for BitcoindSyncEngine {
 		"bitcoind-block-poll"
 	}
 
-	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
-		Some(&self.onchain_wallet)
-	}
-
 	/// The MEMPOOL chain is this node's own bitcoind.
 	fn serves_mempool(&self) -> bool {
 		true
@@ -465,168 +819,43 @@ impl SyncEngine for BitcoindSyncEngine {
 	/// Poll the tip, then the mempool, then record the pass — in that order,
 	/// as pre-seam. The mempool comes through the layer's MEMPOOL chain now;
 	/// what it answers is applied exactly where, and how, the client's own
-	/// poll result was.
-	async fn sync_once(
-		&self, layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
-		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
-		let Self {
-			api_client,
-			header_cache,
-			latest_chain_tip,
-			onchain_wallet,
-			wallet_polling_status,
-			kv_store,
-			config,
-			logger,
-			node_metrics,
-			scan_server: _,
-		} = self;
+	/// poll result was. The poll is one for every joined target; `target` is
+	/// the one answered here, through its own latch.
+	async fn sync_once(&self, layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error> {
 		let receiver_res = {
-			let mut status_lock = wallet_polling_status.lock().unwrap();
+			let mut status_lock =
+				target.onchain_wallet_sync_status.lock().unwrap_or_else(|e| e.into_inner());
 			status_lock.register_or_subscribe_pending_sync()
 		};
 
 		if let Some(mut sync_receiver) = receiver_res {
-			log_info!(logger, "Sync in progress, skipping.");
+			log_info!(self.logger, "Sync in progress, skipping.");
 			return sync_receiver.recv().await.map_err(|e| {
 				debug_assert!(false, "Failed to receive wallet polling result: {:?}", e);
-				log_error!(logger, "Failed to receive wallet polling result: {:?}", e);
+				log_error!(self.logger, "Failed to receive wallet polling result: {:?}", e);
 				Error::WalletOperationFailed
 			})?;
 		}
 
-		let latest_chain_tip_opt = latest_chain_tip.read().unwrap().clone();
-		let chain_tip = if let Some(tip) = latest_chain_tip_opt {
-			tip
-		} else {
-			match validate_best_block_header(api_client.as_ref()).await {
-				Ok(tip) => {
-					*latest_chain_tip.write().unwrap() = Some(tip);
-					tip
-				},
-				Err(e) => {
-					log_error!(logger, "Failed to poll for chain data: {:?}", e);
-					let res = Err(Error::TxSyncFailed);
-					wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
-					return res;
-				},
-			}
-		};
-
-		let mut locked_header_cache = header_cache.lock().await;
-		let chain_poller = ChainPoller::new(Arc::clone(&api_client), config.network);
-		let chain_listener = ChainListener::new(
-			Arc::clone(&onchain_wallet),
-			Arc::clone(&channel_manager),
-			chain_monitor,
-			output_sweeper,
-			Arc::clone(layer.tx_broadcaster()),
-			Arc::clone(layer.fee_estimator()),
-			Arc::clone(&logger),
-		);
-		let mut spv_client =
-			SpvClient::new(chain_tip, chain_poller, &mut *locked_header_cache, &chain_listener);
-
-		let now = SystemTime::now();
-		match spv_client.poll_best_tip().await {
-			Ok((ChainTip::Better(tip), true)) => {
-				log_trace!(
-					logger,
-					"Finished polling best tip in {}ms",
-					now.elapsed().unwrap().as_millis()
-				);
-				*latest_chain_tip.write().unwrap() = Some(tip);
-			},
-			Ok(_) => {},
-			Err(e) => {
-				log_error!(logger, "Failed to poll for chain data: {:?}", e);
-				let res = Err(Error::TxSyncFailed);
-				wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
-				return res;
-			},
-		}
-
-		let cur_height = channel_manager.current_best_block().height;
-
-		let now = SystemTime::now();
-		let query = MempoolQuery {
-			// A block-polling engine has no script list to send and needs
-			// none: its adapter answers the whole mempool and the wallet
-			// keeps what is its own on apply, as it always has.
-			scripts: Vec::new(),
-			known_unconfirmed: onchain_wallet.get_unconfirmed_txids(),
-			scope: MempoolScope::Incremental { best_processed_height: cur_height },
-		};
-		match layer.mempool(&query).await {
-			Ok(answered) => {
-				let MempoolAnswer { unconfirmed: unconfirmed_txs, evicted: evicted_txids } =
-					answered.value.value;
-				log_trace!(
-					logger,
-					"Finished polling mempool of size {} and {} evicted transactions in {}ms",
-					unconfirmed_txs.len(),
-					evicted_txids.len(),
-					now.elapsed().unwrap().as_millis()
-				);
-				onchain_wallet.apply_mempool_txs(unconfirmed_txs, evicted_txids).unwrap_or_else(
-					|e| {
-						log_error!(logger, "Failed to apply mempool transactions: {:?}", e);
-					},
-				);
-			},
-			Err(e) => {
-				log_error!(logger, "Failed to poll for mempool transactions: {}", e);
-				let res = Err(Error::TxSyncFailed);
-				wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
-				return res;
-			},
-		}
-
-		let unix_time_secs_opt =
-			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-		let mut locked_node_metrics = node_metrics.write().unwrap();
-		locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
-		locked_node_metrics.latest_onchain_wallet_sync_timestamp = unix_time_secs_opt;
-
-		let write_res =
-			write_node_metrics(&*locked_node_metrics, Arc::clone(&kv_store), Arc::clone(&logger));
-		match write_res {
-			Ok(()) => (),
-			Err(e) => {
-				log_error!(logger, "Failed to persist node metrics: {}", e);
-				let res = Err(Error::PersistenceFailed);
-				wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
-				return res;
-			},
-		}
-
-		let res = Ok(());
-		wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(res);
+		let res = self.poll_pass(layer).await;
+		target
+			.onchain_wallet_sync_status
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.propagate_result_to_subscribers(res);
 		res
 	}
 
 	async fn run_background(
 		&self, layer: Arc<ChainLayer>, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
 	) {
-		let Self {
-			api_client,
-			header_cache,
-			latest_chain_tip,
-			onchain_wallet,
-			wallet_polling_status,
-			kv_store,
-			config,
-			logger,
-			node_metrics,
-			..
-		} = self;
+		let Self { api_client, header_cache, latest_chain_tip, config, logger, .. } = self;
 		// First register for the wallet polling status to make sure `Node::sync_wallets` calls
 		// wait on the result before proceeding.
-		{
-			let mut status_lock = wallet_polling_status.lock().unwrap();
+		let initial_targets = layer.targets().snapshot();
+		for target in &initial_targets {
+			let mut status_lock =
+				target.onchain_wallet_sync_status.lock().unwrap_or_else(|e| e.into_inner());
 			if status_lock.register_or_subscribe_pending_sync().is_some() {
 				debug_assert!(false, "Sync already in progress. This should never happen.");
 			}
@@ -641,34 +870,10 @@ impl SyncEngine for BitcoindSyncEngine {
 		const MAX_BACKOFF_SECS: u64 = 300;
 
 		loop {
-			let channel_manager_best_block_hash = channel_manager.current_best_block().block_hash;
-			let sweeper_best_block_hash = output_sweeper.current_best_block().block_hash;
-			let onchain_wallet_best_block_hash = onchain_wallet.current_best_block().block_hash;
-
-			let mut chain_listeners = vec![
-				(onchain_wallet_best_block_hash, &**onchain_wallet as &(dyn Listen + Send + Sync)),
-				(channel_manager_best_block_hash, &*channel_manager as &(dyn Listen + Send + Sync)),
-				(sweeper_best_block_hash, &*output_sweeper as &(dyn Listen + Send + Sync)),
-			];
-
-			// TODO: Eventually we might want to see if we can synchronize `ChannelMonitor`s
-			// before giving them to `ChainMonitor` it the first place. However, this isn't
-			// trivial as we load them on initialization (in the `Builder`) and only gain
-			// network access during `start`. For now, we just make sure we get the worst known
-			// block hash and sychronize them via `ChainMonitor`.
-			if let Some(worst_channel_monitor_block_hash) = chain_monitor
-				.list_monitors()
-				.iter()
-				.flat_map(|(txo, _)| chain_monitor.get_monitor(*txo))
-				.map(|m| m.current_best_block())
-				.min_by_key(|b| b.height)
-				.map(|b| b.block_hash)
-			{
-				chain_listeners.push((
-					worst_channel_monitor_block_hash,
-					&*chain_monitor as &(dyn Listen + Send + Sync),
-				));
-			}
+			// Every target's listeners in one call, each from the block it last saw:
+			// `synchronize_listeners` brings each to the same tip on its own.
+			let chain_listeners: Vec<(BlockHash, &(dyn Listen + Send + Sync))> =
+				initial_targets.iter().flat_map(|target| Self::chain_listeners_of(target)).collect();
 
 			let mut locked_header_cache = header_cache.lock().await;
 			let now = SystemTime::now();
@@ -676,7 +881,7 @@ impl SyncEngine for BitcoindSyncEngine {
 				api_client.as_ref(),
 				config.network,
 				&mut *locked_header_cache,
-				chain_listeners.clone(),
+				chain_listeners,
 			)
 			.await
 			{
@@ -685,24 +890,17 @@ impl SyncEngine for BitcoindSyncEngine {
 						log_info!(
 							logger,
 							"Finished synchronizing listeners in {}ms",
-							now.elapsed().unwrap().as_millis()
+							now.elapsed().unwrap_or_default().as_millis()
 						);
-						*latest_chain_tip.write().unwrap() = Some(chain_tip);
-						let unix_time_secs_opt =
-							SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-						let mut locked_node_metrics = node_metrics.write().unwrap();
-						locked_node_metrics.latest_lightning_wallet_sync_timestamp =
-							unix_time_secs_opt;
-						locked_node_metrics.latest_onchain_wallet_sync_timestamp =
-							unix_time_secs_opt;
-						write_node_metrics(
-							&*locked_node_metrics,
-							Arc::clone(&kv_store),
-							Arc::clone(&logger),
-						)
-						.unwrap_or_else(|e| {
+						*latest_chain_tip.write().unwrap_or_else(|e| e.into_inner()) =
+							Some(chain_tip);
+						{
+							let mut joined = self.joined.lock().unwrap_or_else(|e| e.into_inner());
+							joined.extend(initial_targets.iter().map(|t| t.id));
+						}
+						if let Err(e) = self.record_pass(&initial_targets) {
 							log_error!(logger, "Failed to persist node metrics: {}", e);
-						});
+						}
 					}
 					break;
 				},
@@ -732,7 +930,13 @@ impl SyncEngine for BitcoindSyncEngine {
 		}
 
 		// Now propagate the initial result to unblock waiting subscribers.
-		wallet_polling_status.lock().unwrap().propagate_result_to_subscribers(Ok(()));
+		for target in &initial_targets {
+			target
+				.onchain_wallet_sync_status
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.propagate_result_to_subscribers(Ok(()));
+		}
 
 		let mut chain_polling_interval =
 			tokio::time::interval(Duration::from_secs(CHAIN_POLLING_INTERVAL_SECS));
@@ -757,8 +961,8 @@ impl SyncEngine for BitcoindSyncEngine {
 					return;
 				}
 				_ = chain_polling_interval.tick() => {
-					if self.sync_once(&layer, Arc::clone(&channel_manager), Arc::clone(&chain_monitor), Arc::clone(&output_sweeper)).await.is_ok() {
-						layer.reap_dead_fundings(&channel_manager, &chain_monitor);
+					if self.background_tick(&layer).await.is_ok() {
+						layer.reap_dead_fundings();
 					}
 				}
 				_ = fee_rate_update_interval.tick() => {
@@ -766,5 +970,9 @@ impl SyncEngine for BitcoindSyncEngine {
 				}
 			}
 		}
+	}
+
+	fn target_unregistered(&self, id: TargetId) {
+		self.joined.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 	}
 }

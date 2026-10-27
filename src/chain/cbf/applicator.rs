@@ -15,7 +15,7 @@
 //! node may be called synced. Keeping the two apart is what lets the fetch run ahead of the
 //! (persisting, slower) application under a bounded queue.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bip157::IndexedBlock;
@@ -30,10 +30,10 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
 use crate::chain::bitcoind::ChainListener;
 use crate::chain::cbf::fee::{coinbase_fee_rate, record_block_fee, BlockFeeCache};
 use crate::chain::cbf::{mark_syncing, CbfSyncState, WatchLedger};
+use crate::chain::target::TargetRegistry;
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
-use crate::types::DynStore;
-use crate::{Error, NodeMetrics};
+use crate::Error;
 
 /// Bound on the queue between the kyoto event loop and [`BlockApplicator`].
 ///
@@ -93,6 +93,11 @@ pub(crate) enum ChainOp {
 	/// height is a true tip; the applicator judges stranded listeners against it and nothing
 	/// else.
 	Synced { tip_height: u32 },
+	/// A listener joined below the applied tip and the source is about to re-emit every
+	/// filter after `from_height`: expect the next block at `from_height + 1`. The listeners
+	/// already past it skip the replay block by block (the gated fan-out's
+	/// resume-from-minimum rule); the new one takes it.
+	Rescan { from_height: u32 },
 }
 
 /// Everything the applicator asks of the listeners, as one seam.
@@ -160,8 +165,8 @@ pub(crate) struct BlockApplicator<F: ChainFanout> {
 	/// estimator does not have to re-download it.
 	block_fee_cache: BlockFeeCache,
 	watch_ledger: Arc<WatchLedger>,
-	kv_store: Arc<DynStore>,
-	node_metrics: Arc<RwLock<NodeMetrics>>,
+	/// Whose metrics a synced tip is stamped into: every node the layer keeps in step.
+	targets: Arc<TargetRegistry>,
 	logger: Arc<Logger>,
 }
 
@@ -171,8 +176,7 @@ impl<F: ChainFanout> BlockApplicator<F> {
 	pub(crate) fn new(
 		fanout: Arc<F>, ops_rx: mpsc::Receiver<ChainOp>, next_height: u32,
 		sync_state_tx: watch::Sender<CbfSyncState>, block_fee_cache: BlockFeeCache,
-		watch_ledger: Arc<WatchLedger>, kv_store: Arc<DynStore>,
-		node_metrics: Arc<RwLock<NodeMetrics>>, logger: Arc<Logger>,
+		watch_ledger: Arc<WatchLedger>, targets: Arc<TargetRegistry>, logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			fanout,
@@ -182,8 +186,7 @@ impl<F: ChainFanout> BlockApplicator<F> {
 			sync_state_tx,
 			block_fee_cache,
 			watch_ledger,
-			kv_store,
-			node_metrics,
+			targets,
 			logger,
 		}
 	}
@@ -328,6 +331,30 @@ impl<F: ChainFanout> BlockApplicator<F> {
 						synced_to_tip: false,
 					});
 				},
+				ChainOp::Rescan { from_height } => {
+					if from_height + 1 >= self.next_height {
+						log_debug!(
+							self.logger,
+							"CBF rescan from height {} starts at or above the next height {}; nothing to rewind",
+							from_height,
+							self.next_height
+						);
+						continue;
+					}
+					log_info!(
+						self.logger,
+						"CBF rewinding the applicator from height {} to {} for a listener that joined late",
+						self.next_height,
+						from_height + 1
+					);
+					// Blocks applied so far are persisted before the replay starts over them.
+					self.flush_chain_state();
+					self.next_height = from_height + 1;
+					self.sync_state_tx.send_replace(CbfSyncState::Active {
+						applied_tip: Some(from_height),
+						synced_to_tip: false,
+					});
+				},
 				ChainOp::Synced { tip_height } => {
 					log_info!(self.logger, "CBF caught up to tip {}", tip_height);
 					if self.next_height > tip_height {
@@ -407,15 +434,18 @@ impl<F: ChainFanout> BlockApplicator<F> {
 		});
 		let unix_time_secs_opt =
 			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-		let mut locked_node_metrics = self.node_metrics.write().unwrap();
-		locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
-		locked_node_metrics.latest_onchain_wallet_sync_timestamp = unix_time_secs_opt;
-		if let Err(e) = write_node_metrics(
-			&*locked_node_metrics,
-			Arc::clone(&self.kv_store),
-			Arc::clone(&self.logger),
-		) {
-			log_error!(self.logger, "Failed to persist CBF sync metrics: {:?}", e);
+		for target in self.targets.snapshot() {
+			let mut locked_node_metrics =
+				target.node_metrics.write().unwrap_or_else(|e| e.into_inner());
+			locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
+			locked_node_metrics.latest_onchain_wallet_sync_timestamp = unix_time_secs_opt;
+			if let Err(e) = write_node_metrics(
+				&*locked_node_metrics,
+				Arc::clone(&target.kv_store),
+				Arc::clone(&self.logger),
+			) {
+				log_error!(self.logger, "Failed to persist CBF sync metrics: {:?}", e);
+			}
 		}
 	}
 }
@@ -438,7 +468,6 @@ mod tests {
 	use bitcoin::{BlockHash, Txid};
 	use lightning::chain::transaction::OutPoint;
 	use lightning::chain::BestBlock;
-	use lightning::util::test_utils::TestStore;
 
 	use crate::chain::bitcoind::{
 		disconnect_action, listener_action, DisconnectAction, ListenerAction, MonitorGate,
@@ -657,8 +686,7 @@ mod tests {
 			sync_state_tx.clone(),
 			new_block_fee_cache(),
 			Arc::clone(&ledger),
-			Arc::new(TestStore::new(false)),
-			Arc::new(RwLock::new(NodeMetrics::default())),
+			Arc::new(TargetRegistry::new()),
 			Arc::new(Logger::new_log_facade()),
 		);
 		let task = tokio::spawn(applicator.run());

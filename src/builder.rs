@@ -1611,13 +1611,10 @@ fn build_with_store_internal(
 			let layer = ChainLayer::new_esplora(
 				server_url.clone(),
 				sync_config,
-				Arc::clone(&wallet),
 				Arc::clone(&fee_estimator),
 				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
 				Arc::clone(&config),
 				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
 			);
 			(layer, chain_provider_fallback)
 		},
@@ -1626,13 +1623,10 @@ fn build_with_store_internal(
 			let layer = ChainLayer::new_electrum(
 				server_url.clone(),
 				sync_config,
-				Arc::clone(&wallet),
 				Arc::clone(&fee_estimator),
 				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
 				Arc::clone(&config),
 				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
 			);
 			(layer, chain_provider_fallback)
 		},
@@ -1649,27 +1643,21 @@ fn build_with_store_internal(
 					*rpc_port,
 					rpc_user.clone(),
 					rpc_password.clone(),
-					Arc::clone(&wallet),
 					Arc::clone(&fee_estimator),
 					Arc::clone(&tx_broadcaster),
-					Arc::clone(&kv_store),
 					Arc::clone(&config),
 					rest_client_config.clone(),
 					Arc::clone(&logger),
-					Arc::clone(&node_metrics),
 				),
 				None => ChainLayer::new_bitcoind_rpc(
 					rpc_host.clone(),
 					*rpc_port,
 					rpc_user.clone(),
 					rpc_password.clone(),
-					Arc::clone(&wallet),
 					Arc::clone(&fee_estimator),
 					Arc::clone(&tx_broadcaster),
-					Arc::clone(&kv_store),
 					Arc::clone(&config),
 					Arc::clone(&logger),
-					Arc::clone(&node_metrics),
 				),
 			};
 			(layer, chain_provider_fallback)
@@ -1680,12 +1668,9 @@ fn build_with_store_internal(
 			let layer = ChainLayer::new_dependent(
 				Arc::clone(provider),
 				sync_config,
-				Arc::clone(&wallet),
 				Arc::clone(&fee_estimator),
 				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
 				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
 			);
 			(layer, chain_provider_fallback)
 		},
@@ -1697,13 +1682,10 @@ fn build_with_store_internal(
 				cbf_config.clone(),
 				chain_provider_fallback,
 				cbf_filter_source,
-				Arc::clone(&wallet),
 				Arc::clone(&fee_estimator),
 				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
 				Arc::clone(&config),
 				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
 			)
 			.map_err(|e| {
 				log_error!(logger, "Failed to set up the CBF chain source: {}", e);
@@ -1719,13 +1701,10 @@ fn build_with_store_internal(
 			let layer = ChainLayer::new_esplora(
 				server_url.clone(),
 				sync_config,
-				Arc::clone(&wallet),
 				Arc::clone(&fee_estimator),
 				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
 				Arc::clone(&config),
 				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
 			);
 			(layer, chain_provider_fallback)
 		},
@@ -1843,7 +1822,10 @@ fn build_with_store_internal(
 	// of the `ChannelManager` and the `ChainMonitor`: a monitor cannot leave a running
 	// `ChainMonitor`, so this is where the rebroadcast loop over a dead funding ends. See
 	// `crate::dead_funding`.
-	let dead_fundings = Arc::clone(chain_source.dead_fundings());
+	let dead_fundings = Arc::new(dead_funding::DeadFundingStore::read_or_empty(
+		Arc::clone(&kv_store),
+		Arc::clone(&logger),
+	));
 	let archived_dead_monitors = if dead_fundings.is_empty() {
 		HashSet::new()
 	} else {
@@ -2307,6 +2289,11 @@ fn build_with_store_internal(
 		is_listening,
 		node_metrics,
 		dead_fundings,
+		chain_target: Mutex::new(None),
+		#[cfg(feature = "cbf")]
+		wallet_birthday_height: cbf_birthday.map(|b| b.height),
+		#[cfg(not(feature = "cbf"))]
+		wallet_birthday_height: None,
 		path_failures: Arc::new(crate::path_failure::PathFailureStore::new()),
 		#[cfg(feature = "swaps")]
 		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
