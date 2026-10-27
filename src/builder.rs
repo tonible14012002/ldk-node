@@ -2289,6 +2289,7 @@ fn build_with_store_internal(
 		#[cfg(not(feature = "cbf"))]
 		wallet_birthday_height: None,
 		path_failures: Arc::new(crate::path_failure::PathFailureStore::new()),
+		external_fundings: Arc::new(crate::funding::ExternalFundings::default()),
 		#[cfg(feature = "swaps")]
 		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
 	})

@@ -87,6 +87,7 @@ mod error;
 mod event;
 mod fee_estimator;
 mod ffi;
+mod funding;
 mod gossip;
 pub mod graph;
 mod hex_utils;
@@ -195,6 +196,7 @@ pub use builder::BuildError;
 pub use builder::NodeBuilder as Builder;
 
 pub use chain::host::{ChainHost, ChainHostBuilder, ChainHostStatus};
+pub use funding::{FundingRequest, FundingSource};
 pub use net::listener::InboundListener;
 pub use types::{Graph, Scorer};
 use chain::target::{SyncTargetSpec, TargetId};
@@ -297,6 +299,9 @@ pub struct Node {
 	/// Last `PaymentPathFailed` detail per payment (bounded, in-memory). Written by
 	/// the event handler, read via `Node::path_failure`.
 	path_failures: Arc<PathFailureStore>,
+	/// Opens funded by another wallet ([`Node::open_channel_with_funding`]), in memory: an
+	/// unfunded channel does not survive a restart either.
+	external_fundings: Arc<funding::ExternalFundings>,
 	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
 	#[cfg(feature = "swaps")]
 	swap_tx_watch: Arc<chain::SwapTxWatch>,
@@ -565,6 +570,7 @@ impl Node {
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.path_failures),
+			Arc::clone(&self.external_fundings),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
@@ -1497,6 +1503,7 @@ impl Node {
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
 		announce_for_forwarding: bool, counterparty_reserve_proportional_millionths: Option<u32>,
+		funding: Option<Arc<dyn FundingSource>>,
 	) -> Result<UserChannelId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -1515,8 +1522,12 @@ impl Node {
 		let spendable_amount_sats =
 			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
 
+		// Funded by another wallet, this node's own coins only need to cover the anchor
+		// reserve below: the channel value is the source's to find.
+		let channel_funds_sats = if funding.is_some() { 0 } else { channel_amount_sats };
+
 		// Fail early if we have less than the channel value available.
-		if spendable_amount_sats < channel_amount_sats {
+		if spendable_amount_sats < channel_funds_sats {
 			log_error!(self.logger,
 				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
 				spendable_amount_sats, channel_amount_sats
@@ -1538,7 +1549,7 @@ impl Node {
 			.peer_by_node_id(&node_id)
 			.ok_or(Error::ConnectionFailed)?
 			.init_features;
-		let required_funds_sats = channel_amount_sats
+		let required_funds_sats = channel_funds_sats
 			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 				if init_features.requires_anchors_zero_fee_htlc_tx()
 					&& !c.trusted_peers_no_reserve.contains(&node_id)
@@ -1576,6 +1587,12 @@ impl Node {
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = rand::thread_rng().gen::<u128>();
 
+		// Recorded before the channel exists, so `FundingGenerationReady` always finds it.
+		let externally_funded = funding.is_some();
+		if let Some(source) = funding {
+			self.external_fundings.insert(user_channel_id, source);
+		}
+
 		match self.channel_manager.create_channel(
 			peer_info.node_id,
 			channel_amount_sats,
@@ -1584,17 +1601,27 @@ impl Node {
 			None,
 			Some(user_config),
 		) {
-			Ok(_) => {
+			Ok(temporary_channel_id) => {
 				log_info!(
 					self.logger,
 					"Initiated channel creation with peer {}. ",
 					peer_info.node_id
 				);
+				if externally_funded {
+					self.external_fundings
+						.set_temporary_channel_id(user_channel_id, temporary_channel_id);
+				}
 				self.peer_store.add_peer(peer_info)?;
 				Ok(UserChannelId(user_channel_id))
 			},
 			Err(e) => {
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
+				if externally_funded {
+					self.external_fundings.release(
+						user_channel_id,
+						lightning::ln::types::ChannelId([0u8; 32]),
+					);
+				}
 				Err(Error::ChannelCreationFailed)
 			},
 		}
@@ -1629,6 +1656,7 @@ impl Node {
 			channel_config,
 			false,
 			None,
+			None,
 		)
 	}
 
@@ -1656,6 +1684,7 @@ impl Node {
 			channel_config,
 			false,
 			Some(counterparty_reserve_proportional_millionths),
+			None,
 		)
 	}
 
@@ -1698,7 +1727,61 @@ impl Node {
 			channel_config,
 			true,
 			None,
+			None,
 		)
+	}
+
+	/// Connect to a node and open a channel whose funding transaction `funding` builds,
+	/// instead of this node's on-chain wallet — typically another wallet in this process,
+	/// through its [`Node::funding_source`].
+	///
+	/// When the peer accepts, `funding` is asked for a transaction paying the channel's
+	/// funding output (`FundingSource::create_funding_transaction`); this node's channel
+	/// manager broadcasts it once the peer has signed. If the open fails or the channel
+	/// closes before that, `FundingSource::release` is called. Which source funds which open
+	/// is kept in memory only: an unfunded channel does not survive a restart either.
+	///
+	/// This node's own wallet still has to hold the anchor reserve for the new channel, if
+	/// anchors are negotiated (see [`AnchorChannelsConfig::per_channel_reserve_sats`]): it is
+	/// what bumps the channel's fees on a force-close. `announce` opens an announced
+	/// channel, with the same requirements as [`Node::open_announced_channel`].
+	///
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
+	pub fn open_channel_with_funding(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		announce: bool, funding: Arc<dyn FundingSource>,
+	) -> Result<UserChannelId, Error> {
+		if announce {
+			if let Err(err) = may_announce_channel(&self.config) {
+				log_error!(self.logger, "Failed to open announced channel as the node hasn't been sufficiently configured to act as a forwarding node: {}", err);
+				return Err(Error::ChannelCreationFailed);
+			}
+		}
+
+		self.open_channel_inner(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			announce,
+			None,
+			Some(funding),
+		)
+	}
+
+	/// A [`FundingSource`] over this node's on-chain wallet, for another node in the process
+	/// to fund its channels from ([`Node::open_channel_with_funding`]).
+	///
+	/// It builds and signs from this wallet and reserves the inputs exactly as this node does
+	/// for its own channels — its own coin selection skips them until the funding is
+	/// broadcast or released — and never broadcasts: the opening node does.
+	pub fn funding_source(&self) -> Arc<dyn FundingSource> {
+		Arc::new(funding::WalletFundingSource::new(
+			Arc::clone(&self.wallet),
+			Arc::clone(&self.logger),
+		))
 	}
 
 	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate
