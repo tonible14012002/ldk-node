@@ -471,7 +471,7 @@ impl Node {
 		let bcast_node_metrics = Arc::clone(&self.node_metrics);
 		let mut stop_bcast = self.stop_sender.subscribe();
 		let node_alias = self.config.node_alias.clone();
-		if may_announce_channel(&self.config).is_ok() {
+		if broadcasts_node_announcements(&self.config) {
 			runtime.spawn(async move {
 				// We check every 30 secs whether our last broadcast is NODE_ANN_BCAST_INTERVAL away.
 				#[cfg(not(test))]
@@ -1663,7 +1663,8 @@ impl Node {
 	///
 	/// This will return an error if the node has not been sufficiently configured to operate as a
 	/// forwarding node that can properly announce its existence to the publip network graph, i.e.,
-	/// [`Config::listening_addresses`] and [`Config::node_alias`] are unset.
+	/// [`Config::listening_addresses`] and [`Config::node_alias`] are unset, or if its
+	/// [`Config::announce_policy`] forbids announcing.
 	///
 	/// To open an unannounced channel, see [`Node::open_channel`].
 	///
@@ -2467,6 +2468,12 @@ impl_writeable_tlv_based!(NodeMetrics, {
 	(10, latest_channel_monitor_archival_height, option),
 });
 
+/// Whether a node runs the periodic node-announcement broadcast: only one that may announce,
+/// which includes its [`config::AnnouncePolicy`].
+pub(crate) fn broadcasts_node_announcements(config: &Config) -> bool {
+	may_announce_channel(config).is_ok()
+}
+
 pub(crate) fn total_anchor_channels_reserve_sats(
 	channel_manager: &ChannelManager, config: &Config,
 ) -> u64 {
@@ -2485,6 +2492,65 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 			.count() as u64;
 		anchor_channels_config.total_reserve_sats(count)
 	})
+}
+
+#[cfg(test)]
+mod announce_policy_tests {
+	use super::*;
+
+	use bitcoin::Network;
+	use lightning::util::test_utils::TestStore;
+
+	fn announcing_config(announce: bool) -> Config {
+		let mut config = Config::default();
+		config.network = Network::Regtest;
+		config.node_alias = Some(NodeAlias([7u8; 32]));
+		config.listening_addresses = Some(vec![SocketAddress::TcpIpV4 {
+			addr: [127, 0, 0, 1],
+			port: 19735,
+		}]);
+		config.announce_policy.announce = announce;
+		config
+	}
+
+	fn node(config: Config, seed: u8) -> Node {
+		let mut builder = Builder::from_config(config);
+		builder.set_log_facade_logger();
+		builder.set_entropy_seed_bytes([seed; 64]);
+		builder.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None);
+		builder.build_with_store(Arc::new(TestStore::new(false))).unwrap()
+	}
+
+	fn peer() -> PublicKey {
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let key = bitcoin::secp256k1::SecretKey::from_slice(&[3u8; 32]).unwrap();
+		PublicKey::from_secret_key(&secp, &key)
+	}
+
+	/// The announced open is refused up front for a node whose policy says no, although its
+	/// alias and addresses are complete; the same node announcing gets past the check (and
+	/// stops at "not running", the next one).
+	#[test]
+	fn an_unannounced_node_refuses_announced_opens() {
+		let address = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 9 };
+		let quiet = node(announcing_config(false), 61);
+		assert_eq!(
+			quiet.open_announced_channel(peer(), address.clone(), 100_000, None, None),
+			Err(Error::ChannelCreationFailed)
+		);
+		let public = node(announcing_config(true), 62);
+		assert_eq!(
+			public.open_announced_channel(peer(), address, 100_000, None, None),
+			Err(Error::NotRunning)
+		);
+	}
+
+	/// The node-announcement loop is not even started for such a node.
+	#[test]
+	fn an_unannounced_node_never_broadcasts_its_announcement() {
+		assert!(broadcasts_node_announcements(&announcing_config(true)));
+		assert!(!broadcasts_node_announcements(&announcing_config(false)));
+	}
 }
 
 #[cfg(test)]

@@ -13,6 +13,11 @@ dictionary Config {
 	u64 probing_liquidity_limit_multiplier;
 	AnchorChannelsConfig? anchor_channels_config;
 	SendingParameters? sending_parameters;
+	AnnouncePolicy announce_policy;
+};
+
+dictionary AnnouncePolicy {
+	boolean announce = true;
 };
 
 dictionary AnchorChannelsConfig {

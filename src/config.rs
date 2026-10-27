@@ -103,9 +103,10 @@ pub const WALLET_KEYS_SEED_LEN: usize = 64;
 /// | `log_level`                            | Debug              |
 /// | `anchor_channels_config`               | Some(..)           |
 /// | `sending_parameters`                   | None               |
+/// | `announce_policy`                      | announce: true     |
 ///
-/// See [`AnchorChannelsConfig`] and [`SendingParameters`] for more information regarding their
-/// respective default values.
+/// See [`AnchorChannelsConfig`], [`SendingParameters`] and [`AnnouncePolicy`] for more
+/// information regarding their respective default values.
 ///
 /// [`Node`]: crate::Node
 pub struct Config {
@@ -167,6 +168,30 @@ pub struct Config {
 	/// **Note:** If unset, default parameters will be used, and you will be able to override the
 	/// parameters on a per-payment basis in the corresponding method calls.
 	pub sending_parameters: Option<SendingParameters>,
+	/// Whether this node may make itself and its channels public at all; see
+	/// [`AnnouncePolicy`]. Defaults to announcing, i.e. today's behaviour.
+	pub announce_policy: AnnouncePolicy,
+}
+
+/// Whether a node takes part in the public graph.
+///
+/// A node configured to announce (alias and listening addresses set) does so by default. A
+/// wallet that should stay out of the graph — a secondary wallet in a multi-wallet process,
+/// dialing out only — sets `announce: false`: it then refuses to open or accept announced
+/// channels ([`Node::open_announced_channel`] errors) and never broadcasts a node
+/// announcement, whatever its alias and addresses say.
+///
+/// [`Node::open_announced_channel`]: crate::Node::open_announced_channel
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnouncePolicy {
+	/// Whether the node may announce itself and its channels. Default: `true`.
+	pub announce: bool,
+}
+
+impl Default for AnnouncePolicy {
+	fn default() -> Self {
+		Self { announce: true }
+	}
 }
 
 impl Default for Config {
@@ -181,6 +206,7 @@ impl Default for Config {
 			anchor_channels_config: Some(AnchorChannelsConfig::default()),
 			sending_parameters: None,
 			node_alias: None,
+			announce_policy: AnnouncePolicy::default(),
 		}
 	}
 }
@@ -450,6 +476,7 @@ pub(crate) enum AnnounceError {
 	MissingNodeAlias,
 	MissingListeningAddresses,
 	MissingAliasAndAddresses,
+	DisabledByPolicy,
 }
 
 impl fmt::Display for AnnounceError {
@@ -462,11 +489,26 @@ impl fmt::Display for AnnounceError {
 			AnnounceError::MissingAliasAndAddresses => {
 				write!(f, "Node alias and listening addresses are not configured")
 			},
+			AnnounceError::DisabledByPolicy => {
+				write!(f, "The node's announce policy forbids announcing")
+			},
 		}
 	}
 }
 
+/// Whether the node may announce itself and its channels: configured for it (alias and
+/// listening addresses) and allowed to by its [`AnnouncePolicy`].
 pub(crate) fn may_announce_channel(config: &Config) -> Result<(), AnnounceError> {
+	check_announce_configuration(config)?;
+	if !config.announce_policy.announce {
+		return Err(AnnounceError::DisabledByPolicy);
+	}
+	Ok(())
+}
+
+/// Whether the configuration has what announcing takes, regardless of the policy — what the
+/// builder checks an alias or announcement addresses against.
+pub(crate) fn check_announce_configuration(config: &Config) -> Result<(), AnnounceError> {
 	let has_listening_addresses =
 		config.listening_addresses.as_ref().map_or(false, |addrs| !addrs.is_empty());
 
@@ -825,5 +867,31 @@ mod tests {
 			addresses.push(socket_address);
 		}
 		assert!(may_announce_channel(&node_config).is_ok());
+
+		// A complete configuration with the policy off still may not announce.
+		node_config.announce_policy.announce = false;
+		assert_eq!(may_announce_channel(&node_config), Err(AnnounceError::DisabledByPolicy));
+		assert!(super::check_announce_configuration(&node_config).is_ok());
+	}
+
+	#[test]
+	fn announcing_is_the_default_policy() {
+		assert!(Config::default().announce_policy.announce);
+		assert_eq!(super::AnnouncePolicy::default(), super::AnnouncePolicy { announce: true });
+	}
+
+	#[test]
+	fn an_unannounced_node_neither_offers_nor_accepts_announced_channels() {
+		let mut node_config = Config::default();
+		node_config.node_alias = Some(NodeAlias([1u8; 32]));
+		node_config.listening_addresses =
+			Some(vec![SocketAddress::from_str("127.0.0.1:9735").unwrap()]);
+		let announcing = super::default_user_config(&node_config);
+		assert!(!announcing.channel_handshake_limits.force_announced_channel_preference);
+
+		node_config.announce_policy.announce = false;
+		let quiet = super::default_user_config(&node_config);
+		assert!(!quiet.channel_handshake_config.announce_for_forwarding);
+		assert!(quiet.channel_handshake_limits.force_announced_channel_preference);
 	}
 }

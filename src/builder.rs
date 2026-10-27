@@ -15,8 +15,8 @@ use crate::chain::provider::ChainDataProvider;
 #[cfg(feature = "cbf")]
 use crate::config::CbfConfig;
 use crate::config::{
-	default_user_config, may_announce_channel, AnnounceError, BitcoindRestClientConfig, Config,
-	ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
+	check_announce_configuration, default_user_config, AnnounceError,
+	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
 	WALLET_KEYS_SEED_LEN,
 };
 
@@ -1564,7 +1564,7 @@ fn build_with_store_internal(
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
-	if let Err(err) = may_announce_channel(&config) {
+	if let Err(err) = check_announce_configuration(&config) {
 		if config.announcement_addresses.is_some() {
 			log_error!(logger, "Announcement addresses were set but some required configuration options for node announcement are missing: {}", err);
 			let build_error = if matches!(err, AnnounceError::MissingNodeAlias) {
