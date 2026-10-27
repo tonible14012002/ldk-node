@@ -129,6 +129,10 @@ pub enum Error {
 	LiquiditySourceUnavailable,
 	/// The given operation failed due to the LSP's required opening fee being too high.
 	LiquidityFeeTooHigh,
+	/// Stopping the node's event handling failed: the background processor ended without
+	/// signalling, so the node may not have quiesced. Returned by [`crate::Node::stop`]
+	/// where it used to panic, so an application exporting the node's data can refuse to.
+	EventHandlingStopFailed,
 }
 
 impl fmt::Display for Error {
@@ -136,6 +140,9 @@ impl fmt::Display for Error {
 		match *self {
 			Self::AlreadyRunning => write!(f, "Node is already running."),
 			Self::NotRunning => write!(f, "Node is not running."),
+			Self::EventHandlingStopFailed => {
+				write!(f, "Stopping event handling failed; the node may not have quiesced.")
+			},
 			Self::OnchainTxCreationFailed => {
 				write!(f, "On-chain transaction could not be created.")
 			},

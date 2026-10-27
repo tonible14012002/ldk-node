@@ -274,6 +274,7 @@ enum NodeError {
 	"OnchainTxSigningFailed",
 	"TxSyncFailed",
 	"TxSyncTimeout",
+	"EventHandlingStopFailed",
 	"GossipUpdateFailed",
 	"GossipUpdateTimeout",
 	"LiquidityRequestFailed",

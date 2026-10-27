@@ -714,6 +714,11 @@ impl Node {
 	/// Disconnects all peers, stops all running background tasks, and shuts down [`Node`].
 	///
 	/// After this returns most API methods will return [`Error::NotRunning`].
+	///
+	/// Errors with [`Error::EventHandlingStopFailed`] — the node is stopped all the same —
+	/// when the background processor ended without saying so, which upstream treats as a
+	/// panic. An application about to export the node's data wants the answer, not the
+	/// abort: see [`Node::stop_and_quiesce`].
 	pub fn stop(&self) -> Result<(), Error> {
 		let runtime = self.runtime.write().unwrap().take().ok_or(Error::NotRunning)?;
 		#[cfg(tokio_unstable)]
@@ -759,8 +764,9 @@ impl Node {
 			})
 		});
 
+		let mut stop_res = Ok(());
 		match timeout_res {
-			Ok(stop_res) => match stop_res {
+			Ok(changed) => match changed {
 				Ok(()) => {},
 				Err(e) => {
 					log_error!(
@@ -768,7 +774,8 @@ impl Node {
 						"Stopping event handling failed. This should never happen: {}",
 						e
 					);
-					panic!("Stopping event handling failed. This should never happen.");
+					debug_assert!(false, "Stopping event handling failed. This should never happen.");
+					stop_res = Err(Error::EventHandlingStopFailed);
 				},
 			},
 			Err(e) => {
@@ -790,7 +797,54 @@ impl Node {
 		}
 
 		log_info!(self.logger, "Shutdown complete.");
-		Ok(())
+		stop_res
+	}
+
+	/// [`Node::stop`], then make the node's data safe to copy: the SQLite store, if the node
+	/// has one at the default path, has its write-ahead log folded into the database file
+	/// (`PRAGMA wal_checkpoint(TRUNCATE)`), so a copy of `ldk_node_data.sqlite` alone is the
+	/// whole store.
+	///
+	/// Returns what an export should know: the block the Lightning wallet is synced to and
+	/// how many events still wait to be handled. Errors with [`Error::NotRunning`] if the
+	/// node was not running, with [`Error::EventHandlingStopFailed`] as [`Node::stop`] does,
+	/// and with [`Error::PersistenceFailed`] when the checkpoint could not be run — the node
+	/// is stopped in every case.
+	pub fn stop_and_quiesce(&self) -> Result<QuiesceReport, Error> {
+		self.stop()?;
+
+		let db_path = std::path::PathBuf::from(&self.config.storage_dir_path)
+			.join(io::sqlite_store::SQLITE_DB_FILE_NAME);
+		if db_path.exists() {
+			let checkpoint = rusqlite::Connection::open(&db_path).and_then(|connection| {
+				// Returns (busy, log frames, checkpointed frames); busy means a reader held
+				// the WAL open and the checkpoint stopped short.
+				connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+					row.get::<_, i64>(0)
+				})
+			});
+			match checkpoint {
+				Ok(0) => {
+					log_debug!(self.logger, "Checkpointed the SQLite store for export.");
+				},
+				Ok(_busy) => {
+					log_error!(
+						self.logger,
+						"The SQLite store's write-ahead log could not be fully checkpointed: another connection holds it open."
+					);
+					return Err(Error::PersistenceFailed);
+				},
+				Err(e) => {
+					log_error!(self.logger, "Failed to checkpoint the SQLite store: {}", e);
+					return Err(Error::PersistenceFailed);
+				},
+			}
+		}
+
+		Ok(QuiesceReport {
+			last_block_height: self.channel_manager.current_best_block().height,
+			pending_events: self.event_queue.len(),
+		})
 	}
 
 	/// Returns the status of the [`Node`].
@@ -2260,6 +2314,15 @@ impl Drop for Node {
 	}
 }
 
+/// What [`Node::stop_and_quiesce`] found once the node had stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuiesceReport {
+	/// The height the Lightning wallet is synced to.
+	pub last_block_height: u32,
+	/// How many events wait in the persisted queue for the application to handle.
+	pub pending_events: usize,
+}
+
 /// Represents the status of the [`Node`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -2439,4 +2502,70 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 			.count() as u64;
 		anchor_channels_config.total_reserve_sats(count)
 	})
+}
+
+#[cfg(test)]
+mod quiesce_tests {
+	use super::*;
+
+	use std::sync::Arc;
+
+	use bitcoin::Network;
+	use lightning::util::test_utils::TestStore;
+
+	fn builder(seed: u8) -> Builder {
+		let mut builder = Builder::new();
+		builder.set_network(Network::Regtest);
+		builder.set_log_facade_logger();
+		builder.set_entropy_seed_bytes([seed; 64]);
+		builder.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None);
+		builder
+	}
+
+	/// Start, stop, and a quiesce on a node that is not running: the first stop is clean,
+	/// the quiesce says so.
+	#[test]
+	fn stop_then_quiesce_on_an_in_memory_node() {
+		let node = builder(11).build_with_store(Arc::new(TestStore::new(false))).unwrap();
+		node.start().unwrap();
+		assert!(node.status().is_running);
+		node.stop().unwrap();
+		assert!(!node.status().is_running);
+		assert_eq!(node.stop_and_quiesce(), Err(Error::NotRunning));
+
+		node.start().unwrap();
+		let report = node.stop_and_quiesce().unwrap();
+		assert_eq!(report, QuiesceReport { last_block_height: 0, pending_events: 0 });
+		assert!(!node.status().is_running);
+	}
+
+	/// With a SQLite store at the default path the quiesce checkpoints it, and the file
+	/// is there to copy afterwards.
+	#[test]
+	fn quiesce_checkpoints_the_sqlite_store() {
+		let dir = std::env::temp_dir().join(format!(
+			"ldk-node-quiesce-{}-{:?}",
+			std::process::id(),
+			std::time::Instant::now()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		let mut builder = builder(12);
+		builder.set_storage_dir_path(dir.to_string_lossy().into_owned());
+		let node = builder.build().unwrap();
+		node.start().unwrap();
+
+		let report = node.stop_and_quiesce().unwrap();
+		assert_eq!(report.last_block_height, 0);
+		assert_eq!(report.pending_events, 0);
+
+		let db_path = dir.join(io::sqlite_store::SQLITE_DB_FILE_NAME);
+		assert!(db_path.exists(), "the store is where an export copies it from");
+		let wal = db_path.with_extension("sqlite-wal");
+		assert!(
+			!wal.exists() || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) == 0,
+			"the write-ahead log is folded into the database"
+		);
+		drop(node);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
 }

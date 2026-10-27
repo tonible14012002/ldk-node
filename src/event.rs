@@ -326,6 +326,11 @@ where
 		locked_queue.front().cloned()
 	}
 
+	/// How many events wait to be handled — the persisted queue's length.
+	pub(crate) fn len(&self) -> usize {
+		self.queue.lock().unwrap_or_else(|e| e.into_inner()).len()
+	}
+
 	pub(crate) async fn next_event_async(&self) -> Event {
 		EventFuture { event_queue: Arc::clone(&self.queue), waker: Arc::clone(&self.waker) }.await
 	}
