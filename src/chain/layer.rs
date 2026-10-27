@@ -374,6 +374,49 @@ impl ChainLayer {
 		Ok(target)
 	}
 
+	/// When the shared fee cache was last refreshed through this layer, in seconds since
+	/// the UNIX epoch; `None` until the first successful refresh of this process.
+	pub(crate) fn fee_cache_updated_at(&self) -> Option<u64> {
+		*self.fee_cache_updated_at.read().unwrap_or_else(|e| e.into_inner())
+	}
+
+	/// A layer with empty slots over `engine`, for a test of what sits above the layer.
+	#[cfg(test)]
+	pub(crate) fn with_engine_for_test(engine: Arc<dyn SyncEngine>, logger: Arc<Logger>) -> Self {
+		let slots = ChainSlots {
+			fee: ActionChain::new("fee", FEE_BUDGET, Vec::new(), Arc::clone(&logger)),
+			#[cfg(feature = "swaps")]
+			tx_status: ActionChain::new(
+				"tx_status",
+				TX_STATUS_BUDGET,
+				Vec::new(),
+				Arc::clone(&logger),
+			),
+			broadcast: ActionChain::new(
+				"broadcast",
+				BROADCAST_BUDGET,
+				Vec::new(),
+				Arc::clone(&logger),
+			),
+			mempool: ActionChain::new("mempool", MEMPOOL_BUDGET, Vec::new(), Arc::clone(&logger)),
+			script_history: ActionChain::new(
+				"script_history",
+				SCRIPT_HISTORY_BUDGET,
+				Vec::new(),
+				Arc::clone(&logger),
+			),
+			utxo: None,
+		};
+		Self::new(
+			slots,
+			engine,
+			Arc::new(OnchainFeeEstimator::new()),
+			Arc::new(crate::tx_broadcaster::TransactionBroadcaster::new(Arc::clone(&logger))),
+			logger,
+			Arc::new(TargetRegistry::new()),
+		)
+	}
+
 	/// Remove a node from what this layer keeps in step. A pass already running on a
 	/// snapshot finishes with it.
 	pub(crate) fn unregister_target(&self, id: TargetId) {

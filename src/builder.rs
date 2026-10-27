@@ -9,8 +9,8 @@
 use crate::chain::cbf::birthday::birthday_checkpoint;
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::source::FilterSource;
+use crate::chain::host::{ChainHost, ChainHostBuilder};
 use crate::chain::provider::ChainDataProvider;
-use crate::chain::{ChainLayer, DEFAULT_ESPLORA_SERVER_URL};
 #[cfg(feature = "cbf")]
 use crate::config::CbfConfig;
 use crate::config::{
@@ -23,7 +23,6 @@ use crate::connection::ConnectionManager;
 use crate::custom_gossip::CustomGossipMessageHandler;
 use crate::dead_funding;
 use crate::event::EventQueue;
-use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{read_node_metrics, write_node_metrics};
@@ -34,10 +33,9 @@ use crate::io::{
 use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
 };
-use crate::logger::{log_error, log_info, log_warn, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::peer_store::PeerStore;
-use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeysManager, MessageRouter,
 	OnionMessenger, PaymentStore, PeerManager,
@@ -94,7 +92,7 @@ const VSS_LNURL_AUTH_HARDENED_CHILD_INDEX: u32 = 138;
 const LSPS_HARDENED_CHILD_INDEX: u32 = 577;
 
 #[derive(Clone)]
-enum ChainDataSourceConfig {
+pub(crate) enum ChainDataSourceConfig {
 	Esplora {
 		server_url: String,
 		sync_config: Option<EsploraSyncConfig>,
@@ -133,13 +131,13 @@ enum ChainDataSourceConfig {
 /// Where this node reads the raw BIP157/158 data it serves to other nodes;
 /// see [`NodeBuilder::set_raw_chain_source_bitcoind_rpc`].
 #[derive(Clone)]
-struct RawChainSourceConfig {
-	url: String,
-	user: String,
-	password: String,
-	cert_sha256: Option<String>,
+pub(crate) struct RawChainSourceConfig {
+	pub(crate) url: String,
+	pub(crate) user: String,
+	pub(crate) password: String,
+	pub(crate) cert_sha256: Option<String>,
 	/// See [`NodeBuilder::set_raw_chain_source_allow_insecure_http`].
-	allow_insecure_http: bool,
+	pub(crate) allow_insecure_http: bool,
 }
 
 // Hand-written so the credentials never reach a log.
@@ -305,6 +303,10 @@ pub enum BuildError {
 	/// does not parse, or an external fee server whose client could not be
 	/// built. The log says which.
 	ChainSourceSetupFailed,
+	/// A [`ChainHost`] was given ([`NodeBuilder::set_chain_host`]) beside a
+	/// chain source of the node's own; the two would disagree on where the
+	/// chain comes from, so neither is picked.
+	ChainHostConflict,
 }
 
 impl fmt::Display for BuildError {
@@ -333,6 +335,9 @@ impl fmt::Display for BuildError {
 				write!(f, "Given network does not match the node's previously configured network.")
 			},
 			Self::ChainSourceSetupFailed => write!(f, "Failed to set up the chain source."),
+			Self::ChainHostConflict => {
+				write!(f, "A chain host and a chain source were both configured.")
+			},
 		}
 	}
 }
@@ -357,6 +362,7 @@ pub struct NodeBuilder {
 	cbf_filter_source: Option<CbfFilterSource>,
 	raw_chain_source_config: Option<RawChainSourceConfig>,
 	raw_chain_source_allow_insecure_http: bool,
+	chain_host: Option<Arc<ChainHost>>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -388,11 +394,54 @@ impl NodeBuilder {
 			cbf_filter_source: None,
 			raw_chain_source_config: None,
 			raw_chain_source_allow_insecure_http: false,
+			chain_host: None,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
 			custom_gossip_enabled,
 		}
+	}
+
+	/// Attaches the [`Node`] to a [`ChainHost`] shared with other nodes in this process,
+	/// instead of giving it a chain source of its own.
+	///
+	/// The node then takes the host's chain source, sync engine, fee estimator and
+	/// broadcaster; its wallet and channels are one target of the host's sync, started with
+	/// the node and stopped with it. The chain source setters on this builder must not be
+	/// used beside this one: the build fails with [`BuildError::ChainHostConflict`].
+	pub fn set_chain_host(&mut self, host: Arc<ChainHost>) -> &mut Self {
+		self.chain_host = Some(host);
+		self
+	}
+
+	/// Where this node's chain comes from: the host it was given, or a private host built
+	/// from the chain setters on this builder — the one path every node takes.
+	fn chain_selection(&self, logger: &Arc<Logger>) -> Result<ChainSelection, BuildError> {
+		if let Some(host) = &self.chain_host {
+			let own_chain_source = self.chain_data_source_config.is_some()
+				|| self.raw_chain_source_config.is_some()
+				|| self.chain_provider_fallback().is_some();
+			#[cfg(feature = "cbf")]
+			let own_chain_source = own_chain_source || self.cbf_filter_source().is_some();
+			if own_chain_source {
+				log_error!(
+					logger,
+					"A chain host and a chain source of the node's own were both configured; pick one."
+				);
+				return Err(BuildError::ChainHostConflict);
+			}
+			return Ok(ChainSelection::Shared(Arc::clone(host)));
+		}
+		Ok(ChainSelection::Own(Box::new(ChainHostBuilder::from_node_config(
+			self.config.clone(),
+			self.chain_data_source_config.clone(),
+			#[cfg(feature = "cbf")]
+			self.chain_provider_fallback(),
+			#[cfg(feature = "cbf")]
+			self.cbf_filter_source(),
+			self.raw_chain_source_config_for_build(),
+			Arc::clone(logger),
+		))))
 	}
 
 	/// Configures the [`Node`] instance to source its wallet entropy from a seed file on disk.
@@ -990,11 +1039,7 @@ impl NodeBuilder {
 			})?;
 		build_with_store_internal(
 			config,
-			self.chain_data_source_config.as_ref(),
-			self.chain_provider_fallback(),
-			#[cfg(feature = "cbf")]
-			self.cbf_filter_source(),
-			self.raw_chain_source_config_for_build().as_ref(),
+			self.chain_selection(&logger)?,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1017,11 +1062,7 @@ impl NodeBuilder {
 
 		build_with_store_internal(
 			config,
-			self.chain_data_source_config.as_ref(),
-			self.chain_provider_fallback(),
-			#[cfg(feature = "cbf")]
-			self.cbf_filter_source(),
-			self.raw_chain_source_config_for_build().as_ref(),
+			self.chain_selection(&logger)?,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1450,16 +1491,18 @@ fn seed_wallet_at_birthday(
 	Ok(())
 }
 
+/// Where a node's chain comes from; see [`NodeBuilder::chain_selection`].
+enum ChainSelection {
+	/// A host shared with other nodes.
+	Shared(Arc<ChainHost>),
+	/// A host of this node's own, built from its chain setters. Boxed: the builder
+	/// carries every chain setting and dwarfs the other variant.
+	Own(Box<ChainHostBuilder>),
+}
+
 /// Builds a [`Node`] instance according to the options previously configured.
-///
-/// `chain_provider_fallback` is consulted by the CBF preset alone; see
-/// [`NodeBuilder::set_chain_provider_fallback`].
 fn build_with_store_internal(
-	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
-	chain_provider_fallback: Option<Arc<dyn ChainDataProvider>>,
-	#[cfg(feature = "cbf")] cbf_filter_source: Option<Arc<dyn FilterSource>>,
-	raw_chain_source_config: Option<&RawChainSourceConfig>,
-	gossip_source_config: Option<&GossipSourceConfig>,
+	config: Arc<Config>, chain: ChainSelection, gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
@@ -1492,6 +1535,15 @@ fn build_with_store_internal(
 			}
 		},
 	};
+
+	// The chain layer: the host's, which every node attached to it shares. Built before
+	// the wallet, which takes the host's broadcaster and fee estimator.
+	let chain_host = match chain {
+		ChainSelection::Shared(host) => host,
+		ChainSelection::Own(host_builder) => host_builder.build()?,
+	};
+	let tx_broadcaster = Arc::clone(chain_host.tx_broadcaster());
+	let fee_estimator = Arc::clone(chain_host.fee_estimator());
 
 	// Initialize the on-chain wallet and chain access
 	let xprv = bitcoin::bip32::Xpriv::new_master(config.network, &seed_bytes).map_err(|e| {
@@ -1545,13 +1597,10 @@ fn build_with_store_internal(
 	// engine resolves — and logs — the same anchor as its resume floor; this
 	// one seeds what the engine cannot reach from the outside.
 	#[cfg(feature = "cbf")]
-	let cbf_birthday: Option<BestBlock> = match chain_data_source_config {
-		Some(ChainDataSourceConfig::Cbf { config: cbf_config, .. }) => cbf_config
-			.wallet_birthday_height
-			.and_then(|height| birthday_checkpoint(config.network, height))
-			.map(|checkpoint| BestBlock::new(checkpoint.hash, checkpoint.height)),
-		_ => None,
-	};
+	let cbf_birthday: Option<BestBlock> = chain_host
+		.wallet_birthday_height()
+		.and_then(|height| birthday_checkpoint(config.network, height))
+		.map(|checkpoint| BestBlock::new(checkpoint.hash, checkpoint.height));
 
 	// A wallet whose persisted chain is still rooted at genesis has never been
 	// scanned — created just now, or created earlier and never synced — and is
@@ -1573,9 +1622,6 @@ fn build_with_store_internal(
 		}
 		wallet
 	};
-
-	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
-	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 
 	let payment_store = match io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)) {
 		Ok(payments) => Arc::new(PaymentStore::new(
@@ -1600,137 +1646,7 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 	));
 
-	// The chain ability seam. Every consumer below talks to `ChainLayer`; none
-	// of them knows which backend fills its slots.
-	//
-	// The fallback provider goes to the one preset that consults it; every
-	// other arm hands it back untouched, to be announced as ignored below.
-	let (chain_source, unconsulted_fallback) = match chain_data_source_config {
-		Some(ChainDataSourceConfig::Esplora { server_url, sync_config }) => {
-			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
-			let layer = ChainLayer::new_esplora(
-				server_url.clone(),
-				sync_config,
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-			);
-			(layer, chain_provider_fallback)
-		},
-		Some(ChainDataSourceConfig::Electrum { server_url, sync_config }) => {
-			let sync_config = sync_config.unwrap_or(ElectrumSyncConfig::default());
-			let layer = ChainLayer::new_electrum(
-				server_url.clone(),
-				sync_config,
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-			);
-			(layer, chain_provider_fallback)
-		},
-		Some(ChainDataSourceConfig::Bitcoind {
-			rpc_host,
-			rpc_port,
-			rpc_user,
-			rpc_password,
-			rest_client_config,
-		}) => {
-			let layer = match rest_client_config {
-				Some(rest_client_config) => ChainLayer::new_bitcoind_rest(
-					rpc_host.clone(),
-					*rpc_port,
-					rpc_user.clone(),
-					rpc_password.clone(),
-					Arc::clone(&fee_estimator),
-					Arc::clone(&tx_broadcaster),
-					Arc::clone(&config),
-					rest_client_config.clone(),
-					Arc::clone(&logger),
-				),
-				None => ChainLayer::new_bitcoind_rpc(
-					rpc_host.clone(),
-					*rpc_port,
-					rpc_user.clone(),
-					rpc_password.clone(),
-					Arc::clone(&fee_estimator),
-					Arc::clone(&tx_broadcaster),
-					Arc::clone(&config),
-					Arc::clone(&logger),
-				),
-			};
-			(layer, chain_provider_fallback)
-		},
-
-		Some(ChainDataSourceConfig::Dependent { provider, sync_config }) => {
-			let sync_config = sync_config.clone().unwrap_or(EsploraSyncConfig::default());
-			let layer = ChainLayer::new_dependent(
-				Arc::clone(provider),
-				sync_config,
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&logger),
-			);
-			(layer, chain_provider_fallback)
-		},
-
-		#[cfg(feature = "cbf")]
-		Some(ChainDataSourceConfig::Cbf { peers, config: cbf_config }) => {
-			let layer = ChainLayer::new_cbf(
-				peers.clone(),
-				cbf_config.clone(),
-				chain_provider_fallback,
-				cbf_filter_source,
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-			)
-			.map_err(|e| {
-				log_error!(logger, "Failed to set up the CBF chain source: {}", e);
-				BuildError::ChainSourceSetupFailed
-			})?;
-			(layer, None)
-		},
-
-		None => {
-			// Default to Esplora client.
-			let server_url = DEFAULT_ESPLORA_SERVER_URL.to_string();
-			let sync_config = EsploraSyncConfig::default();
-			let layer = ChainLayer::new_esplora(
-				server_url.clone(),
-				sync_config,
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-			);
-			(layer, chain_provider_fallback)
-		},
-	};
-
-	if let Some(provider) = unconsulted_fallback {
-		log_warn!(
-			logger,
-			"A chain provider fallback ({}) is set, but the configured chain source scans its own backend and never consults one; ignoring it.",
-			provider.name()
-		);
-	}
-
-	let mut chain_source = chain_source;
-	if let Some(raw) = raw_chain_source_config {
-		// A refused configuration turns raw serving off and is logged; the node still builds.
-		chain_source.set_raw_source_bitcoind_rpc(
-			&raw.url,
-			Some(raw.user.clone()),
-			Some(raw.password.clone()),
-			raw.cert_sha256.as_deref(),
-			raw.allow_insecure_http,
-		);
-	}
-
-	let chain_source = Arc::new(chain_source);
+	let chain_source = Arc::clone(chain_host.layer());
 
 	let runtime = Arc::new(RwLock::new(None));
 
@@ -2289,6 +2205,7 @@ fn build_with_store_internal(
 		is_listening,
 		node_metrics,
 		dead_fundings,
+		chain_host,
 		chain_target: Mutex::new(None),
 		#[cfg(feature = "cbf")]
 		wallet_birthday_height: cbf_birthday.map(|b| b.height),

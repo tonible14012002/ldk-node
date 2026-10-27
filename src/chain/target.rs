@@ -183,7 +183,7 @@ pub(crate) mod test_support {
 			Arc::clone(&wallet),
 			Arc::clone(&logger),
 		));
-		let network_graph = Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)));
+		let network_graph = Arc::new(Graph::new(config.network, Arc::clone(&logger)));
 		let scorer = Arc::new(Mutex::new(ProbabilisticScorer::new(
 			ProbabilisticScoringDecayParameters::default(),
 			Arc::clone(&network_graph),
@@ -211,7 +211,7 @@ pub(crate) mod test_support {
 			Arc::clone(&keys_manager),
 			Arc::clone(&keys_manager),
 			default_user_config(&config),
-			ChainParameters { network: config.network.into(), best_block },
+			ChainParameters { network: config.network, best_block },
 			now.as_secs() as u32,
 		));
 		let output_sweeper = Arc::new(OutputSweeper::new(

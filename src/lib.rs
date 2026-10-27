@@ -193,6 +193,7 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 
+pub use chain::host::{ChainHost, ChainHostBuilder, ChainHostStatus};
 use chain::target::{SyncTargetSpec, TargetId};
 use chain::ChainLayer;
 use config::{
@@ -253,6 +254,8 @@ pub struct Node {
 	event_handling_stopped_sender: tokio::sync::watch::Sender<()>,
 	config: Arc<Config>,
 	wallet: Arc<Wallet>,
+	/// The host this node's chain comes from; `chain_source` is its layer.
+	chain_host: Arc<ChainHost>,
 	chain_source: Arc<ChainLayer>,
 	tx_broadcaster: Arc<Broadcaster>,
 	event_queue: Arc<EventQueue<Arc<Logger>>>,
@@ -277,7 +280,7 @@ pub struct Node {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	/// Fundings proven dead by the chain; see [`dead_funding`].
 	dead_fundings: Arc<dead_funding::DeadFundingStore>,
-	/// This node's handle in the chain layer's target registry, from `start` to `stop`.
+	/// This node's handle in the chain host's target registry, from `start` to `stop`.
 	chain_target: Mutex<Option<TargetId>>,
 	/// Where a filter scan for this node's wallet may start; see
 	/// [`chain::target::SyncTargetSpec::birthday_height`].
@@ -325,89 +328,15 @@ impl Node {
 			self.config.network
 		);
 
-		// Start up any runtime-dependant chain sources (e.g. Electrum)
-		self.chain_source.start(Arc::clone(&runtime)).map_err(|e| {
-			log_error!(self.logger, "Failed to start chain syncing: {}", e);
-			e
-		})?;
-
-		// Join the chain layer's targets before anything syncs, so the first pass and the
-		// fee stamp below cover this node.
-		let target = self.chain_source.register_target(self.sync_target_spec()).map_err(|e| {
-			log_error!(self.logger, "Failed to join the chain sync: {}", e);
-			e
-		})?;
-		*self.chain_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(target.id);
-
-		// Record which adapters occupy each chain ability slot, in chain order,
-		// so a support question about a fee or broadcast answer can be traced
-		// to the thing that produced it without guessing from config.
-		let slots = self.chain_source.slot_adapters();
-		log_info!(self.logger, "Chain ability slots: {}", slots);
-		if slots.utxo.is_none() {
-			// Say this out loud. Without a UTXO source the routing graph accepts
-			// every peer's channel_announcement without checking that the funding
-			// output exists, and nothing else reports it.
-			log_info!(
-				self.logger,
-				"No chain adapter can verify BOLT-7 channel announcements; the routing graph will carry unverified channel capacities."
-			);
-		}
-
-		// Refresh the fee rate cache once on startup — but do NOT let a failure
-		// stop the node coming up.
-		//
-		// DEVIATION from upstream ldk-node, which propagates this error with
-		// `?` and refuses to start. Upstream's rule is a reachability probe on
-		// the chain source, using the cheapest call available: fail fast rather
-		// than come up blind. That is sound for a node whose chain source is an
-		// external server it can retry until the network appears.
-		//
-		// It is wrong for a node whose chain source is reached through this
-		// node's own transport. There the probe is gated on the node it is
-		// gating — identity and message signing are served by the application
-		// wrapping this crate, and that application cannot answer until start()
-		// returns. The node then retries forever against a dependency that can
-		// never be satisfied.
-		//
-		// Two facts make continuing safe rather than reckless:
-		//
-		//   * `FeeEstimator::estimate_fee_rate` cannot fail. Every target has a
-		//     hardcoded fallback, so an empty cache yields constants, not an
-		//     error. A node with no estimates runs.
-		//   * this crate ALREADY tolerates indefinite fee failures — the
-		//     background loop discards them (`let _ = …update_fee_rate_estimates`).
-		//     A node whose provider dies after startup keeps running on a stale
-		//     cache. Only the very first fetch was fatal, which is an asymmetry
-		//     rather than a safety property.
-		//
-		// What replaces the guarantee: the failure is recorded rather than
-		// swallowed. `latest_fee_rate_cache_update_timestamp` stays `None`,
-		// which [`Node::chain_freshness`] reports so the embedding application
-		// can refuse the operations where a wrong fee rate costs money —
-		// building or broadcasting a transaction — while still serving reads.
-		// Degraded and honest beats absent.
-		let chain_source = Arc::clone(&self.chain_source);
-		let runtime_ref = &runtime;
-		let fee_update = tokio::task::block_in_place(move || {
-			runtime_ref.block_on(async move { chain_source.update_fee_rate_estimates().await })
-		});
-		if let Err(e) = fee_update {
-			log_error!(
-				self.logger,
-				"Initial fee rate cache update failed: {}. Continuing startup with fallback fee \
-				 estimates; transaction-building operations should be refused until a refresh \
-				 succeeds (see Node::chain_freshness).",
+		// Join the chain host: the first node to attach starts the chain source, refreshes
+		// the fee cache once and spawns the sync loop and the broadcast drain on `runtime`;
+		// a later one is simply one more target of the running sync.
+		let target_id =
+			self.chain_host.attach(self.sync_target_spec(), Arc::clone(&runtime)).map_err(|e| {
+				log_error!(self.logger, "Failed to join the chain host: {}", e);
 				e
-			);
-		}
-
-		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
-		let stop_sync_receiver = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		runtime.spawn(async move {
-			chain_source.continuously_sync_wallets(stop_sync_receiver).await;
-		});
+			})?;
+		*self.chain_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(target_id);
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
@@ -643,29 +572,6 @@ impl Node {
 			});
 		}
 
-		let mut stop_tx_bcast = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		let tx_bcast_logger = Arc::clone(&self.logger);
-		runtime.spawn(async move {
-			// Every second we try to clear our broadcasting queue.
-			let mut interval = tokio::time::interval(Duration::from_secs(1));
-			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-			loop {
-				tokio::select! {
-						_ = stop_tx_bcast.changed() => {
-							log_debug!(
-								tx_bcast_logger,
-								"Stopping broadcasting transactions.",
-							);
-							return;
-						}
-						_ = interval.tick() => {
-							chain_source.process_broadcast_queue().await;
-						}
-				}
-			}
-		});
-
 		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
 			Arc::clone(&self.tx_broadcaster),
 			Arc::new(LdkWallet::new(Arc::clone(&self.wallet), Arc::clone(&self.logger))),
@@ -795,10 +701,9 @@ impl Node {
 
 		log_info!(self.logger, "Shutting down LDK Node with node ID {}...", self.node_id());
 
-		// Stop any runtime-dependant chain sources.
-		self.chain_source.stop();
+		// Leave the chain host; the last node out stops the chain source and its tasks.
 		if let Some(id) = self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).take() {
-			self.chain_source.unregister_target(id);
+			self.chain_host.detach(id);
 		}
 
 		// Stop the runtime.
