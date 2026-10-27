@@ -10,6 +10,7 @@ use crate::chain::cbf::birthday::birthday_checkpoint;
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::source::FilterSource;
 use crate::chain::host::{ChainHost, ChainHostBuilder};
+use crate::net::listener::InboundListener;
 use crate::chain::provider::ChainDataProvider;
 #[cfg(feature = "cbf")]
 use crate::config::CbfConfig;
@@ -82,7 +83,6 @@ use std::default::Default;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
@@ -372,6 +372,7 @@ pub struct NodeBuilder {
 	raw_chain_source_allow_insecure_http: bool,
 	chain_host: Option<Arc<ChainHost>>,
 	shared_graph: Option<SharedGraph>,
+	inbound_listener: Option<Arc<InboundListener>>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -405,6 +406,7 @@ impl NodeBuilder {
 			raw_chain_source_allow_insecure_http: false,
 			chain_host: None,
 			shared_graph: None,
+			inbound_listener: None,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
@@ -435,6 +437,20 @@ impl NodeBuilder {
 	/// [`BuildError::SharedGraphWithRgs`]: only the owner syncs RGS.
 	pub fn set_shared_graph(&mut self, graph: Arc<Graph>, scorer: Arc<Mutex<Scorer>>) -> &mut Self {
 		self.shared_graph = Some(SharedGraph { graph, scorer });
+		self
+	}
+
+	/// Takes inbound connections through an [`InboundListener`] shared with other nodes in
+	/// this process, instead of binding a listener of the node's own.
+	///
+	/// On start, a node with [`Config::listening_addresses`] registers with the listener —
+	/// connections dialed for its node id are routed to it — and on stop it unregisters;
+	/// [`NodeStatus::is_listening`] reflects the registration. The addresses still say what
+	/// the node announces; the listener is bound wherever the application bound it.
+	///
+	/// [`NodeStatus::is_listening`]: crate::NodeStatus::is_listening
+	pub fn set_inbound_listener(&mut self, listener: Arc<InboundListener>) -> &mut Self {
+		self.inbound_listener = Some(listener);
 		self
 	}
 
@@ -1065,6 +1081,7 @@ impl NodeBuilder {
 			config,
 			self.chain_selection(&logger)?,
 			self.shared_graph.clone(),
+			self.inbound_listener.clone(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1089,6 +1106,7 @@ impl NodeBuilder {
 			config,
 			self.chain_selection(&logger)?,
 			self.shared_graph.clone(),
+			self.inbound_listener.clone(),
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1542,7 +1560,7 @@ impl std::fmt::Debug for SharedGraph {
 /// Builds a [`Node`] instance according to the options previously configured.
 fn build_with_store_internal(
 	config: Arc<Config>, chain: ChainSelection, shared_graph: Option<SharedGraph>,
-	gossip_source_config: Option<&GossipSourceConfig>,
+	inbound_listener: Option<Arc<InboundListener>>, gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
@@ -1564,7 +1582,6 @@ fn build_with_store_internal(
 	}
 
 	// Initialize the status fields.
-	let is_listening = Arc::new(AtomicBool::new(false));
 	let node_metrics = match read_node_metrics(Arc::clone(&kv_store), Arc::clone(&logger)) {
 		Ok(metrics) => Arc::new(RwLock::new(metrics)),
 		Err(e) => {
@@ -2261,7 +2278,8 @@ fn build_with_store_internal(
 		scorer,
 		peer_store,
 		payment_store,
-		is_listening,
+		shared_inbound_listener: inbound_listener,
+		inbound_listener: Mutex::new(None),
 		node_metrics,
 		dead_fundings,
 		chain_host,

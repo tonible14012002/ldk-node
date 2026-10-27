@@ -133,6 +133,8 @@ pub enum Error {
 	/// signalling, so the node may not have quiesced. Returned by [`crate::Node::stop`]
 	/// where it used to panic, so an application exporting the node's data can refuse to.
 	EventHandlingStopFailed,
+	/// None of the listening addresses could be bound — something else listens there.
+	ListenFailed,
 }
 
 impl fmt::Display for Error {
@@ -142,6 +144,9 @@ impl fmt::Display for Error {
 			Self::NotRunning => write!(f, "Node is not running."),
 			Self::EventHandlingStopFailed => {
 				write!(f, "Stopping event handling failed; the node may not have quiesced.")
+			},
+			Self::ListenFailed => {
+				write!(f, "Failed to bind to the listening addresses.")
 			},
 			Self::OnchainTxCreationFailed => {
 				write!(f, "On-chain transaction could not be created.")

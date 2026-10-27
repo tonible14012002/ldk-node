@@ -94,6 +94,9 @@ bip21 = { version = "0.5", features = ["std"], default-features = false }
 
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 rand = "0.8.5"
+# ChaCha20-Poly1305 for matching a BOLT 8 act one to a local node key (`net::act_one`):
+# rust-lightning keeps its own implementation crate-private. rust-bitcoin's crate, no deps.
+chacha20-poly1305 = "0.1.2"
 # Needed for object-safe async methods on the chain ability adapters
 # (`Arc<dyn FeeAdapter>` and friends in `chain::seam`).
 async-trait = "0.1"

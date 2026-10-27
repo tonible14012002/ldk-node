@@ -94,6 +94,7 @@ pub mod io;
 pub mod liquidity;
 pub mod logger;
 mod message_handler;
+mod net;
 mod path_failure;
 pub mod payment;
 mod peer_store;
@@ -194,6 +195,7 @@ pub use builder::BuildError;
 pub use builder::NodeBuilder as Builder;
 
 pub use chain::host::{ChainHost, ChainHostBuilder, ChainHostStatus};
+pub use net::listener::InboundListener;
 pub use types::{Graph, Scorer};
 use chain::target::{SyncTargetSpec, TargetId};
 use chain::ChainLayer;
@@ -239,8 +241,6 @@ use bitcoin::secp256k1::PublicKey;
 use rand::Rng;
 
 use std::default::Default;
-use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -281,7 +281,11 @@ pub struct Node {
 	scorer: Arc<Mutex<Scorer>>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
-	is_listening: Arc<AtomicBool>,
+	/// The listener the application shares between its nodes
+	/// ([`Builder::set_inbound_listener`]); `None` means this node binds its own on start.
+	shared_inbound_listener: Option<Arc<InboundListener>>,
+	/// The listener this node is registered with, from `start` to `stop`.
+	inbound_listener: Mutex<Option<Arc<InboundListener>>>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	/// Fundings proven dead by the chain; see [`dead_funding`].
 	dead_fundings: Arc<dead_funding::DeadFundingStore>,
@@ -393,68 +397,33 @@ impl Node {
 			});
 		}
 
+		// Take inbound connections: through the listener the application shares between its
+		// nodes, or through one bound here for this node alone — the same path either way.
 		if let Some(listening_addresses) = &self.config.listening_addresses {
-			// Setup networking
-			let peer_manager_connection_handler = Arc::clone(&self.peer_manager);
-			let mut stop_listen = self.stop_sender.subscribe();
-			let listening_logger = Arc::clone(&self.logger);
-			let listening_indicator = Arc::clone(&self.is_listening);
-
-			let mut bind_addrs = Vec::with_capacity(listening_addresses.len());
-
-			for listening_addr in listening_addresses {
-				let resolved_address = listening_addr.to_socket_addrs().map_err(|e| {
-					log_error!(
-						self.logger,
-						"Unable to resolve listening address: {:?}. Error details: {}",
-						listening_addr,
-						e,
-					);
-					Error::InvalidSocketAddress
-				})?;
-
-				bind_addrs.extend(resolved_address);
-			}
-
-			runtime.spawn(async move {
-				{
-				let listener =
-					tokio::net::TcpListener::bind(&*bind_addrs).await
-										.unwrap_or_else(|e| {
-											log_error!(listening_logger, "Failed to bind to listen addresses/ports - is something else already listening on it?: {}", e);
-											panic!(
-												"Failed to bind to listen address/port - is something else already listening on it?",
-												);
-										});
-
-				listening_indicator.store(true, Ordering::Release);
-
-				loop {
-					let peer_mgr = Arc::clone(&peer_manager_connection_handler);
-					tokio::select! {
-						_ = stop_listen.changed() => {
-							log_debug!(
-								listening_logger,
-								"Stopping listening to inbound connections.",
-							);
-							break;
+			let listener = match &self.shared_inbound_listener {
+				Some(shared) => Arc::clone(shared),
+				None => match InboundListener::bind(
+					listening_addresses.clone(),
+					Arc::clone(&runtime),
+					Arc::clone(&self.logger),
+				) {
+					Ok(own) => own,
+					Err(e) => {
+						if let Some(id) =
+							self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).take()
+						{
+							self.chain_host.detach(id);
 						}
-						res = listener.accept() => {
-							let tcp_stream = res.unwrap().0;
-							tokio::spawn(async move {
-								lightning_net_tokio::setup_inbound(
-									Arc::clone(&peer_mgr),
-									tcp_stream.into_std().unwrap(),
-									)
-									.await;
-							});
-						}
-					}
-				}
-				}
-
-				listening_indicator.store(false, Ordering::Release);
-			});
+						return Err(e);
+					},
+				},
+			};
+			listener.register(
+				self.node_id(),
+				Arc::clone(&self.keys_manager),
+				Arc::clone(&self.peer_manager),
+			);
+			*self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(listener);
 		}
 
 		// Regularly reconnect to persisted peers.
@@ -744,6 +713,15 @@ impl Node {
 			},
 		}
 
+		// Stop taking inbound connections: leave a shared listener, stop a private one.
+		if let Some(listener) = self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()).take()
+		{
+			listener.unregister(&self.node_id());
+			if self.shared_inbound_listener.is_none() {
+				listener.stop();
+			}
+		}
+
 		// Disconnect all peers.
 		self.peer_manager.disconnect_all_peers();
 
@@ -905,7 +883,12 @@ impl Node {
 	/// Returns the status of the [`Node`].
 	pub fn status(&self) -> NodeStatus {
 		let is_running = self.runtime.read().unwrap().is_some();
-		let is_listening = self.is_listening.load(Ordering::Acquire);
+		let is_listening = self
+			.inbound_listener
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+			.map_or(false, |l| l.is_listening() && l.is_registered(&self.node_id()));
 		let current_best_block = self.channel_manager.current_best_block().into();
 		let locked_node_metrics = self.node_metrics.read().unwrap();
 		let latest_lightning_wallet_sync_timestamp =
