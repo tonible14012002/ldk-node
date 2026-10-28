@@ -735,7 +735,7 @@ impl ScriptTxLookup {
 		let (tip, _) = source.scan_tip().await.map_err(|e| e.to_string())?;
 		let remembered = self.memory.lock().unwrap_or_else(|e| e.into_inner()).get(&txid).copied();
 
-		let (mut from, mut pruned) = match remembered {
+		let (from, mut pruned) = match remembered {
 			Some(Lookup::Found(block)) => {
 				match source.header_state(&block.hash).await.map_err(|e| e.to_string())? {
 					Some(state) if state.in_best_chain => {
@@ -755,45 +755,76 @@ impl ScriptTxLookup {
 			},
 		};
 
-		let watched = vec![WatchedTxScan { txid, known: None, script: Some(script.clone()) }];
-		loop {
-			let scan =
-				LightningScan { txs: watched.clone(), outputs: Vec::new(), scan_from: Some(from) };
-			match scan_lightning(source, scan, &self.limits).await {
-				Ok(scanned) => {
-					if let Some(found) =
-						scanned.confirmed.iter().find(|f| f.tx.compute_txid() == txid)
-					{
-						self.remember(txid, Lookup::Found(found.block));
-						return Ok(TxLocation::Confirmed {
-							block: found.block,
-							tip: scanned.source_tip,
-						});
+		// One pass from just above `from` — or above its fork point, when a
+		// reorg took it off the best chain — under one budget for the filter
+		// reads and the matching blocks together. A matching block this node
+		// has pruned is stepped over, not a reason to start again: a script
+		// paid in many old blocks would otherwise restart the scan once per
+		// block.
+		let began = Instant::now();
+		let start = match resume_height(source, &from.hash, self.limits.max_blocks)
+			.await
+			.map_err(|e| e.to_string())?
+		{
+			Some(height) => height,
+			None => tip.height.saturating_sub(self.limits.max_blocks) + 1,
+		};
+		let span = if start > tip.height { 0 } else { tip.height - start + 1 };
+		let count = span.min(self.limits.max_blocks);
+		let hashes = if count == 0 {
+			Vec::new()
+		} else {
+			source.best_hashes(start, count).await.map_err(|e| e.to_string())?
+		};
+		let queries = [script.to_bytes()];
+		let (scanned, matched) = if hashes.is_empty() {
+			(0, Vec::new())
+		} else {
+			scan_filters(source, &hashes, &queries, &self.limits, began)
+				.await
+				.map_err(|e| e.to_string())?
+		};
+
+		// How many of `hashes`, in order, have been looked at in full.
+		let mut done = scanned;
+		for index in matched {
+			if began.elapsed() >= self.limits.filter_budget {
+				done = index;
+				break;
+			}
+			let height = start + index as u32;
+			match checked_block(source, height, &hashes[index]).await {
+				Ok(block) => {
+					if block.txdata.iter().any(|tx| tx.compute_txid() == txid) {
+						let found = BlockId { height, hash: hashes[index] };
+						self.remember(txid, Lookup::Found(found));
+						return Ok(TxLocation::Confirmed { block: found, tip });
 					}
-					self.remember(txid, Lookup::ScannedTo { block: scanned.tip, pruned });
-					if scanned.tip != scanned.source_tip {
-						return Err(format!(
-							"scan for {} reached height {} of {} within its budget",
-							txid, scanned.tip.height, scanned.source_tip.height
-						));
-					}
-					if pruned {
-						return Err(format!(
-							"a pruned block matches the script of {}; it may be confirmed there",
-							txid
-						));
-					}
-					return Ok(TxLocation::NotFound);
 				},
-				// A block below the node's prune height matches: step past it,
-				// and remember that "not found" can no longer be said.
-				Err(ScanError::Pruned { height, hash, .. }) if height > from.height => {
-					pruned = true;
-					from = BlockId { height, hash };
-				},
+				Err(ScanError::Pruned { .. }) => pruned = true,
 				Err(e) => return Err(e.to_string()),
 			}
 		}
+
+		let reached = if done > 0 {
+			BlockId { height: start + done as u32 - 1, hash: hashes[done - 1] }
+		} else {
+			from
+		};
+		self.remember(txid, Lookup::ScannedTo { block: reached, pruned });
+		if (done as u32) < span {
+			return Err(format!(
+				"scan for {} reached height {} of {} within its budget",
+				txid, reached.height, tip.height
+			));
+		}
+		if pruned {
+			return Err(format!(
+				"a pruned block matches the script of {}; it may be confirmed there",
+				txid
+			));
+		}
+		Ok(TxLocation::NotFound)
 	}
 }
 
@@ -1498,5 +1529,27 @@ pub(crate) mod tests {
 			}
 		}
 		assert!(answered);
+	}
+
+	#[cfg(feature = "swaps")]
+	#[tokio::test]
+	async fn a_tx_lookup_steps_over_many_pruned_matches_in_one_pass() {
+		// A script paid in every one of 30 old blocks, all pruned.
+		let mut chain = MemChain::new(5);
+		let spk = script(10);
+		for i in 0..30u32 {
+			let pay = spend(&[OutPoint { txid: Txid::all_zeros(), vout: 100 + i }], &[(&spk, 1)]);
+			chain.mine(vec![pay]); // 5..34
+		}
+		for _ in 0..5 {
+			chain.mine(Vec::new()); // 35..39
+		}
+		chain.pruned_below = 35;
+		let lookup = ScriptTxLookup::with_limits(lookup_limits(100));
+		let missing = Txid::from_byte_array([4; 32]);
+		assert!(lookup.locate(&chain, missing, &spk).await.is_err());
+		// One pass: every filter read once, every matching block tried once.
+		assert_eq!(*chain.filter_reads.lock().unwrap(), 39);
+		assert_eq!(chain.block_reads.lock().unwrap().len(), 30);
 	}
 }
