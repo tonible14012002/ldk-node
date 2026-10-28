@@ -330,6 +330,30 @@ impl Node {
 	/// After this returns, the [`Node`] instance can be controlled via the provided API methods in
 	/// a thread-safe manner.
 	pub fn start_with_runtime(&self, runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
+		self.start_inner(runtime, true)
+	}
+
+	/// Starts like [`Node::start_with_runtime`], but takes no inbound connections: the node
+	/// binds no listener and registers with none, so it only dials out. Its channels, its
+	/// payments and the peers it reconnects to work as usual; no peer can dial it.
+	///
+	/// For a node whose [`Config::listening_addresses`] cannot be bound now — another process
+	/// holds the port, so [`Node::start_with_runtime`] fails with [`Error::ListenFailed`] — and
+	/// that must run anyway. Its configuration is unchanged: [`Node::listening_addresses`]
+	/// still names the addresses, the node may still announce them and open announced
+	/// channels, and its next start listens on them again. [`NodeStatus::is_listening`] stays
+	/// false while it runs this way.
+	///
+	/// [`Config::listening_addresses`]: crate::config::Config::listening_addresses
+	pub fn start_outbound_only_with_runtime(
+		&self, runtime: Arc<tokio::runtime::Runtime>,
+	) -> Result<(), Error> {
+		self.start_inner(runtime, false)
+	}
+
+	fn start_inner(
+		&self, runtime: Arc<tokio::runtime::Runtime>, take_inbound: bool,
+	) -> Result<(), Error> {
 		// Acquire a run lock and hold it until we're setup.
 		let mut runtime_lock = self.runtime.write().unwrap();
 		if runtime_lock.is_some() {
@@ -353,6 +377,46 @@ impl Node {
 				e
 			})?;
 		*self.chain_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(target_id);
+
+		// Take inbound connections: through the listener the application shares between its
+		// nodes, or through one bound here for this node alone — the same path either way.
+		// Before any task is spawned, so a start that cannot bind leaves nothing running.
+		match &self.config.listening_addresses {
+			Some(listening_addresses) if take_inbound => {
+				let listener = match &self.shared_inbound_listener {
+					Some(shared) => Arc::clone(shared),
+					None => match InboundListener::bind(
+						listening_addresses.clone(),
+						Arc::clone(&runtime),
+						Arc::clone(&self.logger),
+					) {
+						Ok(own) => own,
+						Err(e) => {
+							if let Some(id) =
+								self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).take()
+							{
+								self.chain_host.detach(id);
+							}
+							return Err(e);
+						},
+					},
+				};
+				listener.register(
+					self.node_id(),
+					Arc::clone(&self.keys_manager),
+					Arc::clone(&self.peer_manager),
+				);
+				*self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(listener);
+			},
+			Some(listening_addresses) => {
+				log_info!(
+					self.logger,
+					"Taking no inbound connections this run: not listening on {:?}.",
+					listening_addresses
+				);
+			},
+			None => {},
+		}
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
@@ -402,35 +466,6 @@ impl Node {
 					}
 				}
 			});
-		}
-
-		// Take inbound connections: through the listener the application shares between its
-		// nodes, or through one bound here for this node alone — the same path either way.
-		if let Some(listening_addresses) = &self.config.listening_addresses {
-			let listener = match &self.shared_inbound_listener {
-				Some(shared) => Arc::clone(shared),
-				None => match InboundListener::bind(
-					listening_addresses.clone(),
-					Arc::clone(&runtime),
-					Arc::clone(&self.logger),
-				) {
-					Ok(own) => own,
-					Err(e) => {
-						if let Some(id) =
-							self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).take()
-						{
-							self.chain_host.detach(id);
-						}
-						return Err(e);
-					},
-				},
-			};
-			listener.register(
-				self.node_id(),
-				Arc::clone(&self.keys_manager),
-				Arc::clone(&self.peer_manager),
-			);
-			*self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(listener);
 		}
 
 		// Regularly reconnect to persisted peers.

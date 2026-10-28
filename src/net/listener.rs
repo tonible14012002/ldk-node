@@ -449,4 +449,61 @@ mod tests {
 		node.start().unwrap();
 		node.stop().unwrap();
 	}
+
+	/// A port something else holds need not keep the node down: started outbound-only it
+	/// runs without a listener and dials out, its listening addresses unchanged, and its next
+	/// start listens on them again.
+	#[test]
+	fn an_outbound_only_start_runs_while_the_port_is_taken() {
+		let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = loopback(squatter.local_addr().unwrap().port());
+		let mut own = builder(54);
+		own.set_listening_addresses(vec![address.clone()]).unwrap();
+		let node = build(&own);
+		assert_eq!(node.start(), Err(Error::ListenFailed));
+
+		node.start_outbound_only_with_runtime(runtime()).unwrap();
+		assert!(node.status().is_running);
+		assert!(!node.status().is_listening);
+		assert_eq!(node.listening_addresses(), Some(vec![address.clone()]));
+
+		let peer_address = loopback(free_port());
+		let mut listening = builder(55);
+		listening.set_listening_addresses(vec![peer_address.clone()]).unwrap();
+		let peer = build(&listening);
+		peer.start().unwrap();
+		node.connect(peer.node_id(), peer_address, false).unwrap();
+		wait_for_peer(&peer, node.node_id());
+		peer.stop().unwrap();
+		node.stop().unwrap();
+
+		drop(squatter);
+		node.start().unwrap();
+		assert!(node.status().is_listening, "the next start listens again");
+		node.stop().unwrap();
+	}
+
+	/// A start that cannot bind leaves nothing running on the runtime it was given: the bind
+	/// comes before any task is spawned. An RGS node used to keep the gossip sync task of
+	/// every failed start until it stopped.
+	#[test]
+	fn a_start_that_cannot_bind_leaves_no_task_behind() {
+		let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let mut own = builder(56);
+		own.set_listening_addresses(vec![loopback(squatter.local_addr().unwrap().port())]).unwrap();
+		own.set_gossip_source_rgs("http://127.0.0.1:1".to_string());
+		let node = build(&own);
+		let runtime = runtime();
+		assert_eq!(node.start_with_runtime(Arc::clone(&runtime)), Err(Error::ListenFailed));
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while runtime.metrics().num_alive_tasks() > 0 {
+			assert!(
+				Instant::now() < deadline,
+				"a failed start left {} task(s) running",
+				runtime.metrics().num_alive_tasks()
+			);
+			std::thread::sleep(Duration::from_millis(20));
+		}
+	}
 }
