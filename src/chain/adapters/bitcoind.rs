@@ -39,6 +39,8 @@ use crate::logger::{log_bytes, log_error, log_trace, LdkLogger, Logger};
 use crate::Error;
 
 #[cfg(feature = "swaps")]
+use crate::chain::filter_scan::{ScanSource, ScriptTxLookup, TxLocation};
+#[cfg(feature = "swaps")]
 use crate::chain::seam::TxStatusAction;
 #[cfg(feature = "swaps")]
 use crate::chain::RawTxObservation;
@@ -147,6 +149,11 @@ pub(crate) struct BitcoindChainAdapter {
 	latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>,
 	config: Arc<Config>,
 	logger: Arc<Logger>,
+	/// Finds a confirmed transaction `getrawtransaction` cannot — one that
+	/// has left the mempool, on a bitcoind without `-txindex` — by its output
+	/// script over the block filter index. `None` without a source to scan.
+	#[cfg(feature = "swaps")]
+	by_script: Option<(Box<dyn ScanSource>, ScriptTxLookup)>,
 }
 
 impl BitcoindChainAdapter {
@@ -155,7 +162,55 @@ impl BitcoindChainAdapter {
 		latest_chain_tip: Arc<RwLock<Option<ValidatedBlockHeader>>>, config: Arc<Config>,
 		logger: Arc<Logger>,
 	) -> Self {
-		Self { api_client, latest_chain_tip, config, logger }
+		Self {
+			api_client,
+			latest_chain_tip,
+			config,
+			logger,
+			#[cfg(feature = "swaps")]
+			by_script: None,
+		}
+	}
+
+	/// Let TX_STATUS find confirmed transactions by script through `source`'s
+	/// block filters when bitcoind cannot find them by txid.
+	#[cfg(feature = "swaps")]
+	pub(crate) fn with_script_lookup(mut self, source: Box<dyn ScanSource>) -> Self {
+		self.by_script = Some((source, ScriptTxLookup::new()));
+		self
+	}
+
+	/// A transaction bitcoind does not know by txid, looked up by `script`.
+	/// Without a source to scan, "not found" as before; a lookup that cannot
+	/// rule the transaction out fails, never answers "not found".
+	#[cfg(feature = "swaps")]
+	async fn tx_status_by_script(
+		&self, txid: Txid, script: Option<&ScriptBuf>,
+	) -> ActionResult<Anchored<RawTxObservation>> {
+		let (Some(script), Some((source, lookup))) = (script, &self.by_script) else {
+			return Ok(Anchored { value: RawTxObservation::NotFound, tip: None });
+		};
+		match lookup.locate(&**source, txid, script).await {
+			Ok(TxLocation::Confirmed { block, tip }) => Ok(Anchored {
+				value: RawTxObservation::Confirmed {
+					height: Some(block.height),
+					confirmations: tip.height.saturating_sub(block.height) + 1,
+				},
+				tip: Some(tip),
+			}),
+			Ok(TxLocation::NotFound) => {
+				Ok(Anchored { value: RawTxObservation::NotFound, tip: None })
+			},
+			Err(reason) => {
+				log_error!(
+					self.logger,
+					"swap_query_tx: Bitcoind lookup by script failed for {}: {}",
+					txid,
+					reason
+				);
+				Err(ChainActionError::unavailable(format!("lookup by script failed: {}", reason)))
+			},
+		}
 	}
 
 	/// The tip the block-polling engine has synced the listeners to, if it
@@ -318,7 +373,7 @@ impl TxStatusAction for BitcoindChainAdapter {
 	/// height/hash pair. Mempool and not-found answers consult no tip and
 	/// carry none.
 	async fn tx_status(
-		&self, txid: Txid, _script_pubkey: Option<&ScriptBuf>,
+		&self, txid: Txid, script_pubkey: Option<&ScriptBuf>,
 	) -> ActionResult<Anchored<RawTxObservation>> {
 		match self.api_client.swap_tx_confirmations(&txid).await {
 			Ok(Some(0)) => Ok(Anchored { value: RawTxObservation::InMempool, tip: None }),
@@ -348,7 +403,7 @@ impl TxStatusAction for BitcoindChainAdapter {
 				let height = tip.map(|t| t.height.saturating_sub(confirmations.saturating_sub(1)));
 				Ok(Anchored { value: RawTxObservation::Confirmed { height, confirmations }, tip })
 			},
-			Ok(None) => Ok(Anchored { value: RawTxObservation::NotFound, tip: None }),
+			Ok(None) => self.tx_status_by_script(txid, script_pubkey).await,
 			Err(e) => {
 				log_error!(self.logger, "swap_query_tx: Bitcoind query failed for {}: {}", txid, e);
 				let reason = format!("query failed: {}", e);

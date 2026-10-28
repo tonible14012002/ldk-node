@@ -53,6 +53,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+#[cfg(feature = "swaps")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -644,6 +646,165 @@ pub(crate) async fn scan_lightning(
 	})
 }
 
+// ── one transaction, by script ────────────────────────────────────────────
+
+/// How far below the tip [`ScriptTxLookup`] looks for a transaction it has
+/// never seen: one week of mainnet blocks. Deeper than any pruned node keeps
+/// blocks for at the sizes we run, so a match below the window shows as
+/// pruned rather than being missed.
+#[cfg(feature = "swaps")]
+pub(crate) const TX_LOOKUP_LOOKBACK: u32 = 1008;
+
+/// Time one lookup spends reading filters at most. A local bitcoind reads a
+/// week of filters in about three seconds on a small VM; the Dependent
+/// route's 10 s host deadline is the outer bound.
+#[cfg(feature = "swaps")]
+pub(crate) const TX_LOOKUP_FILTER_BUDGET: Duration = Duration::from_secs(6);
+
+/// Transactions remembered at most; the memory is cleared when it fills.
+#[cfg(feature = "swaps")]
+const TX_LOOKUP_MEMORY: usize = 4096;
+
+/// What [`ScriptTxLookup`] remembers about one transaction.
+#[cfg(feature = "swaps")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+	/// Found confirmed in this block.
+	Found(BlockId),
+	/// Scanned up to this block and not found. `pruned` when a block below
+	/// it matched the script and could not be read: the transaction may be
+	/// in it, so "not found" cannot be said.
+	ScannedTo { block: BlockId, pruned: bool },
+}
+
+/// Where a looked-up transaction is.
+#[cfg(feature = "swaps")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxLocation {
+	/// Confirmed in `block`, as seen at `tip`.
+	Confirmed { block: BlockId, tip: BlockId },
+	/// In none of the blocks looked at, which reach the tip.
+	NotFound,
+}
+
+/// Finds a confirmed transaction by one of its output scripts, over the
+/// block filter index — the lookup a bitcoind without `-txindex` cannot do by
+/// txid alone once the transaction has left its mempool.
+///
+/// The first lookup of a transaction scans the last [`TX_LOOKUP_LOOKBACK`]
+/// blocks; later ones only the blocks since (or, over a reorg, since the
+/// fork point), and a transaction once found is re-checked by its block
+/// alone. Never answers "not found" for a scan that was cut short or that
+/// skipped a pruned block matching the script: those are errors, so a caller
+/// arming deadlines fails closed.
+#[cfg(feature = "swaps")]
+pub(crate) struct ScriptTxLookup {
+	memory: Mutex<HashMap<Txid, Lookup>>,
+	limits: ScanLimits,
+}
+
+#[cfg(feature = "swaps")]
+impl ScriptTxLookup {
+	pub(crate) fn new() -> Self {
+		Self::with_limits(ScanLimits {
+			max_blocks: TX_LOOKUP_LOOKBACK,
+			filter_budget: TX_LOOKUP_FILTER_BUDGET,
+		})
+	}
+
+	fn with_limits(limits: ScanLimits) -> Self {
+		Self { memory: Mutex::new(HashMap::new()), limits }
+	}
+
+	fn remember(&self, txid: Txid, lookup: Lookup) {
+		let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+		if memory.len() >= TX_LOOKUP_MEMORY && !memory.contains_key(&txid) {
+			memory.clear();
+		}
+		memory.insert(txid, lookup);
+	}
+
+	fn forget(&self, txid: &Txid) {
+		self.memory.lock().unwrap_or_else(|e| e.into_inner()).remove(txid);
+	}
+
+	/// Where `txid`, which pays `script`, is on `source`'s best chain.
+	pub(crate) async fn locate(
+		&self, source: &dyn ScanSource, txid: Txid, script: &ScriptBuf,
+	) -> Result<TxLocation, String> {
+		let (tip, _) = source.scan_tip().await.map_err(|e| e.to_string())?;
+		let remembered = self.memory.lock().unwrap_or_else(|e| e.into_inner()).get(&txid).copied();
+
+		let (mut from, mut pruned) = match remembered {
+			Some(Lookup::Found(block)) => {
+				match source.header_state(&block.hash).await.map_err(|e| e.to_string())? {
+					Some(state) if state.in_best_chain => {
+						return Ok(TxLocation::Confirmed { block, tip });
+					},
+					// Reorged out: look again from just below its old block.
+					_ => {
+						self.forget(&txid);
+						(block_at(source, block.height.saturating_sub(1)).await?, false)
+					},
+				}
+			},
+			Some(Lookup::ScannedTo { block, pruned }) => (block, pruned),
+			None => {
+				let below = tip.height.saturating_sub(self.limits.max_blocks);
+				(block_at(source, below).await?, false)
+			},
+		};
+
+		let watched = vec![WatchedTxScan { txid, known: None, script: Some(script.clone()) }];
+		loop {
+			let scan =
+				LightningScan { txs: watched.clone(), outputs: Vec::new(), scan_from: Some(from) };
+			match scan_lightning(source, scan, &self.limits).await {
+				Ok(scanned) => {
+					if let Some(found) =
+						scanned.confirmed.iter().find(|f| f.tx.compute_txid() == txid)
+					{
+						self.remember(txid, Lookup::Found(found.block));
+						return Ok(TxLocation::Confirmed {
+							block: found.block,
+							tip: scanned.source_tip,
+						});
+					}
+					self.remember(txid, Lookup::ScannedTo { block: scanned.tip, pruned });
+					if scanned.tip != scanned.source_tip {
+						return Err(format!(
+							"scan for {} reached height {} of {} within its budget",
+							txid, scanned.tip.height, scanned.source_tip.height
+						));
+					}
+					if pruned {
+						return Err(format!(
+							"a pruned block matches the script of {}; it may be confirmed there",
+							txid
+						));
+					}
+					return Ok(TxLocation::NotFound);
+				},
+				// A block below the node's prune height matches: step past it,
+				// and remember that "not found" can no longer be said.
+				Err(ScanError::Pruned { height, hash, .. }) if height > from.height => {
+					pruned = true;
+					from = BlockId { height, hash };
+				},
+				Err(e) => return Err(e.to_string()),
+			}
+		}
+	}
+}
+
+#[cfg(feature = "swaps")]
+async fn block_at(source: &dyn ScanSource, height: u32) -> Result<BlockId, String> {
+	match source.hash_at(height).await.map_err(|e| e.to_string())? {
+		Some(hash) => Ok(BlockId { height, hash }),
+		None => Err(format!("no best-chain block at height {}", height)),
+	}
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
 	use super::*;
@@ -1233,5 +1394,109 @@ pub(crate) mod tests {
 		let got = scan_lightning(&chain, req, &limits()).await.unwrap();
 		assert_eq!(got.blocks_scanned, LIGHTNING_FALLBACK_LOOKBACK);
 		assert_eq!(got.confirmed.len(), 1);
+	}
+
+	#[cfg(feature = "swaps")]
+	fn lookup_limits(max_blocks: u32) -> ScanLimits {
+		ScanLimits { max_blocks, filter_budget: Duration::from_secs(60) }
+	}
+
+	#[cfg(feature = "swaps")]
+	#[tokio::test]
+	async fn a_tx_lookup_finds_a_confirmed_tx_by_script_and_follows_reorgs() {
+		let mut chain = MemChain::new(30);
+		let spk = script(7);
+		let tx = spend(&[OutPoint { txid: Txid::all_zeros(), vout: 3 }], &[(&spk, 5_000)]);
+		let txid = tx.compute_txid();
+		let lookup = ScriptTxLookup::with_limits(lookup_limits(20));
+
+		// Not anywhere yet.
+		assert_eq!(lookup.locate(&chain, txid, &spk).await, Ok(TxLocation::NotFound));
+
+		// Mined at 30, then buried: found, then re-checked by its block alone.
+		chain.mine(vec![tx.clone()]); // 30
+		chain.mine(Vec::new()); // 31
+		let tip = chain.tip();
+		assert_eq!(
+			lookup.locate(&chain, txid, &spk).await,
+			Ok(TxLocation::Confirmed { block: chain.id(30), tip })
+		);
+		chain.block_reads.lock().unwrap().clear();
+		let before = *chain.filter_reads.lock().unwrap();
+		chain.mine(Vec::new()); // 32
+		assert_eq!(
+			lookup.locate(&chain, txid, &spk).await,
+			Ok(TxLocation::Confirmed { block: chain.id(30), tip: chain.tip() })
+		);
+		assert_eq!(*chain.filter_reads.lock().unwrap(), before);
+		assert!(chain.block_reads.lock().unwrap().is_empty());
+
+		// Reorged out from 30: not found; re-mined on the new branch: found there.
+		chain.reorg(30, 4, Vec::new()); // 30..33
+		assert_eq!(lookup.locate(&chain, txid, &spk).await, Ok(TxLocation::NotFound));
+		chain.mine(vec![tx]); // 34
+		assert_eq!(
+			lookup.locate(&chain, txid, &spk).await,
+			Ok(TxLocation::Confirmed { block: chain.id(34), tip: chain.tip() })
+		);
+	}
+
+	#[cfg(feature = "swaps")]
+	#[tokio::test]
+	async fn a_tx_lookup_only_scans_new_blocks_after_a_miss() {
+		let mut chain = MemChain::new(30);
+		let spk = script(8);
+		let tx = spend(&[OutPoint { txid: Txid::all_zeros(), vout: 4 }], &[(&spk, 5_000)]);
+		let lookup = ScriptTxLookup::with_limits(lookup_limits(20));
+		assert_eq!(lookup.locate(&chain, tx.compute_txid(), &spk).await, Ok(TxLocation::NotFound));
+		let first = *chain.filter_reads.lock().unwrap();
+		chain.mine(vec![tx.clone()]);
+		assert!(matches!(
+			lookup.locate(&chain, tx.compute_txid(), &spk).await,
+			Ok(TxLocation::Confirmed { .. })
+		));
+		// One batch for the one new block, not the whole lookback again.
+		assert_eq!(*chain.filter_reads.lock().unwrap(), first + 1);
+	}
+
+	#[cfg(feature = "swaps")]
+	#[tokio::test]
+	async fn a_tx_lookup_never_says_not_found_past_a_pruned_match_or_a_cut_scan() {
+		let mut chain = MemChain::new(10);
+		let spk = script(9);
+		// An older payment to the same script, in a block that gets pruned.
+		let old = spend(&[OutPoint { txid: Txid::all_zeros(), vout: 5 }], &[(&spk, 1_000)]);
+		chain.mine(vec![old]); // 10
+		for _ in 0..5 {
+			chain.mine(Vec::new()); // 11..15
+		}
+		chain.pruned_below = 12;
+		let wanted = spend(&[OutPoint { txid: Txid::all_zeros(), vout: 6 }], &[(&spk, 2_000)]);
+		let lookup = ScriptTxLookup::with_limits(lookup_limits(20));
+		assert!(lookup.locate(&chain, wanted.compute_txid(), &spk).await.is_err());
+		// Found above the pruned match: that is an answer.
+		chain.mine(vec![wanted.clone()]); // 16
+		assert_eq!(
+			lookup.locate(&chain, wanted.compute_txid(), &spk).await,
+			Ok(TxLocation::Confirmed { block: chain.id(16), tip: chain.tip() })
+		);
+
+		// A scan cut short by its budget is an error, and the next one resumes.
+		let mut chain = MemChain::new(200);
+		chain.filter_delay = Duration::from_millis(50);
+		let lookup = ScriptTxLookup::with_limits(ScanLimits {
+			max_blocks: 150,
+			filter_budget: Duration::from_millis(10),
+		});
+		let missing = Txid::from_byte_array([3; 32]);
+		assert!(lookup.locate(&chain, missing, &spk).await.is_err());
+		let mut answered = false;
+		for _ in 0..10 {
+			if lookup.locate(&chain, missing, &spk).await == Ok(TxLocation::NotFound) {
+				answered = true;
+				break;
+			}
+		}
+		assert!(answered);
 	}
 }

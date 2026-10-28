@@ -554,11 +554,14 @@ impl ChainLayer {
 	) -> Self {
 		let scan_server =
 			Self::dependent_scan_server(&rpc_host, rpc_port, &rpc_user, &rpc_password, &logger);
+		let lookup_source =
+			Self::rpc_scan_source(&rpc_host, rpc_port, &rpc_user, &rpc_password).ok();
 		let api_client =
 			Arc::new(BitcoindClient::new_rpc(rpc_host, rpc_port, rpc_user, rpc_password));
 		Self::from_bitcoind_client(
 			api_client,
 			scan_server,
+			lookup_source,
 			onchain_wallet,
 			fee_estimator,
 			tx_broadcaster,
@@ -578,6 +581,8 @@ impl ChainLayer {
 	) -> Self {
 		let scan_server =
 			Self::dependent_scan_server(&rpc_host, rpc_port, &rpc_user, &rpc_password, &logger);
+		let lookup_source =
+			Self::rpc_scan_source(&rpc_host, rpc_port, &rpc_user, &rpc_password).ok();
 		let api_client = Arc::new(BitcoindClient::new_rest(
 			rest_client_config.rest_host,
 			rest_client_config.rest_port,
@@ -589,6 +594,7 @@ impl ChainLayer {
 		Self::from_bitcoind_client(
 			api_client,
 			scan_server,
+			lookup_source,
 			onchain_wallet,
 			fee_estimator,
 			tx_broadcaster,
@@ -607,19 +613,7 @@ impl ChainLayer {
 	fn dependent_scan_server(
 		rpc_host: &str, rpc_port: u16, rpc_user: &str, rpc_password: &str, logger: &Arc<Logger>,
 	) -> Option<Arc<DependentScanServer>> {
-		let host = if rpc_host.contains(':') && !rpc_host.starts_with('[') {
-			format!("[{}]", rpc_host)
-		} else {
-			rpc_host.to_string()
-		};
-		let url = format!("http://{}:{}", host, rpc_port);
-		match BitcoindRpcSource::with_options(
-			&url,
-			Some(rpc_user.to_string()),
-			Some(rpc_password.to_string()),
-			None,
-			true,
-		) {
+		match Self::rpc_scan_source(rpc_host, rpc_port, rpc_user, rpc_password) {
 			Ok(source) => Some(Arc::new(DependentScanServer::new(source, Arc::clone(logger)))),
 			Err(reason) => {
 				log_error!(
@@ -634,21 +628,50 @@ impl ChainLayer {
 		}
 	}
 
+	/// A filter-scan client for the chain source's own RPC endpoint; see
+	/// [`Self::dependent_scan_server`].
+	fn rpc_scan_source(
+		rpc_host: &str, rpc_port: u16, rpc_user: &str, rpc_password: &str,
+	) -> Result<BitcoindRpcSource, String> {
+		let host = if rpc_host.contains(':') && !rpc_host.starts_with('[') {
+			format!("[{}]", rpc_host)
+		} else {
+			rpc_host.to_string()
+		};
+		let url = format!("http://{}:{}", host, rpc_port);
+		BitcoindRpcSource::with_options(
+			&url,
+			Some(rpc_user.to_string()),
+			Some(rpc_password.to_string()),
+			None,
+			true,
+		)
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	fn from_bitcoind_client(
 		api_client: Arc<BitcoindClient>, scan_server: Option<Arc<DependentScanServer>>,
-		onchain_wallet: Arc<Wallet>, fee_estimator: Arc<OnchainFeeEstimator>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>,
-		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
+		lookup_source: Option<BitcoindRpcSource>, onchain_wallet: Arc<Wallet>,
+		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
 	) -> Self {
 		let latest_chain_tip = Arc::new(RwLock::new(None));
 
-		let adapter = Arc::new(BitcoindChainAdapter::new(
+		let adapter = BitcoindChainAdapter::new(
 			Arc::clone(&api_client),
 			Arc::clone(&latest_chain_tip),
 			Arc::clone(&config),
 			Arc::clone(&logger),
-		));
+		);
+		#[cfg(feature = "swaps")]
+		let adapter = match lookup_source {
+			Some(source) => adapter.with_script_lookup(Box::new(source)),
+			None => adapter,
+		};
+		#[cfg(not(feature = "swaps"))]
+		let _ = lookup_source;
+		let adapter = Arc::new(adapter);
 
 		let engine = Arc::new(BitcoindSyncEngine {
 			api_client,
