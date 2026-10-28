@@ -27,7 +27,7 @@ use lightning_block_sync::{
 use serde::Serialize;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub enum BitcoindClient {
@@ -36,6 +36,7 @@ pub enum BitcoindClient {
 		latest_mempool_timestamp: AtomicU64,
 		mempool_entries_cache: tokio::sync::Mutex<HashMap<Txid, MempoolEntry>>,
 		mempool_txs_cache: tokio::sync::Mutex<HashMap<Txid, (Transaction, u64)>>,
+		mempool_loaded: AtomicBool,
 	},
 	Rest {
 		rest_client: Arc<RestClient>,
@@ -43,6 +44,9 @@ pub enum BitcoindClient {
 		latest_mempool_timestamp: AtomicU64,
 		mempool_entries_cache: tokio::sync::Mutex<HashMap<Txid, MempoolEntry>>,
 		mempool_txs_cache: tokio::sync::Mutex<HashMap<Txid, (Transaction, u64)>>,
+		/// Set once this node's own mempool poll has loaded the whole mempool
+		/// into the two caches; see [`Self::get_mempool_snapshot`].
+		mempool_loaded: AtomicBool,
 	},
 }
 
@@ -58,7 +62,13 @@ impl BitcoindClient {
 
 		let mempool_entries_cache = tokio::sync::Mutex::new(HashMap::new());
 		let mempool_txs_cache = tokio::sync::Mutex::new(HashMap::new());
-		Self::Rpc { rpc_client, latest_mempool_timestamp, mempool_entries_cache, mempool_txs_cache }
+		Self::Rpc {
+			rpc_client,
+			latest_mempool_timestamp,
+			mempool_entries_cache,
+			mempool_txs_cache,
+			mempool_loaded: AtomicBool::new(false),
+		}
 	}
 
 	/// Creates a new, primarily REST API client for the chain interactions
@@ -88,6 +98,7 @@ impl BitcoindClient {
 			latest_mempool_timestamp,
 			mempool_entries_cache,
 			mempool_txs_cache,
+			mempool_loaded: AtomicBool::new(false),
 		}
 	}
 
@@ -507,9 +518,21 @@ impl BitcoindClient {
 	/// walk of the entries cache and the clone of the accepted transactions.
 	/// `relevant` runs before the clone, because on mainnet the whole mempool
 	/// is far too large to hand out.
+	///
+	/// Refused until this node's own poll has loaded the mempool once. On
+	/// mainnet that first load is tens of thousands of RPCs; a snapshot asked
+	/// for before it would start the same load a second time, under the same
+	/// cache locks, and on a small machine the two together held this node's
+	/// chain polling — blocks included — back for minutes after a restart.
 	pub(crate) async fn get_mempool_snapshot(
 		&self, relevant: impl Fn(&Transaction) -> bool + Send,
 	) -> std::io::Result<Vec<(Transaction, u64)>> {
+		if !self.mempool_loaded().load(Ordering::Acquire) {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::Other,
+				"mempool not loaded yet: this node's first mempool poll has not finished",
+			));
+		}
 		let (mempool_entries_cache, mempool_txs_cache) = match self {
 			BitcoindClient::Rpc { mempool_entries_cache, mempool_txs_cache, .. }
 			| BitcoindClient::Rest { mempool_entries_cache, mempool_txs_cache, .. } => {
@@ -658,7 +681,15 @@ impl BitcoindClient {
 		if !txs_to_emit.is_empty() {
 			latest_mempool_timestamp.store(latest_time, Ordering::Release);
 		}
+		self.mempool_loaded().store(true, Ordering::Release);
 		Ok(txs_to_emit)
+	}
+
+	fn mempool_loaded(&self) -> &AtomicBool {
+		match self {
+			BitcoindClient::Rpc { mempool_loaded, .. }
+			| BitcoindClient::Rest { mempool_loaded, .. } => mempool_loaded,
+		}
 	}
 
 	// Retrieve a list of Txids that have been evicted from the mempool.
