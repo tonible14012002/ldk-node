@@ -822,6 +822,7 @@ pub(crate) fn synthetic_block(payload: usize, nonce: u32) -> Block {
 #[cfg(test)]
 mod raw_tests {
 	use super::*;
+	use crate::chain::provider::MAX_PEER_REPLY_BYTES;
 	use bitcoin::hashes::Hash;
 
 	fn chained_headers(n: u32) -> Vec<Header> {
@@ -905,18 +906,18 @@ mod raw_tests {
 		assert_eq!(block_chunk_count(BLOCK_CHUNK_BYTES), 1);
 		assert_eq!(block_chunk_count(BLOCK_CHUNK_BYTES + 1), 2);
 		assert_eq!(block_chunk_count(4_000_000), MAX_BLOCK_CHUNKS);
-		// A full chunk, hex, with its JSON envelope, stays well under the
-		// 2 MiB a relayed message may carry.
+		// A full chunk, hex, with its JSON envelope, stays under the cap the
+		// asking node's host puts on one peer reply.
 		let hash = BlockHash::all_zeros();
 		let chunk = block_chunk_to_wire(&hash, &vec![0u8; BLOCK_CHUNK_BYTES], 0).unwrap();
-		assert!(serde_json::to_vec(&chunk).unwrap().len() < 1_700_000);
+		assert!(serde_json::to_vec(&chunk).unwrap().len() < MAX_PEER_REPLY_BYTES);
 	}
 
-	/// A block over 1 MiB is served in more than one chunk and reassembles to
+	/// A block over one chunk is served in more than one and reassembles to
 	/// exactly the original bytes.
 	#[test]
 	fn a_large_block_reassembles_from_its_chunks() {
-		let block = synthetic_block(1_300_000, 7);
+		let block = synthetic_block(600_000, 7);
 		let bytes = serialize(&block);
 		let hash = block.block_hash();
 		let total = block_chunk_count(bytes.len());
@@ -937,7 +938,7 @@ mod raw_tests {
 
 	#[test]
 	fn the_assembler_refuses_what_does_not_add_up() {
-		let block = synthetic_block(1_300_000, 7);
+		let block = synthetic_block(600_000, 7);
 		let bytes = serialize(&block);
 		let hash = block.block_hash();
 		let first = block_chunk_to_wire(&hash, &bytes, 0).unwrap();
@@ -959,7 +960,7 @@ mod raw_tests {
 		let short = WireBlockChunk { bytes_hex: "00".into(), ..first.clone() };
 		assert!(BlockChunkAssembler::new(hash).push(&short).is_err());
 		// Tampered bytes: the block no longer hashes to what was asked.
-		let tampered = synthetic_block(1_300_000, 9);
+		let tampered = synthetic_block(600_000, 9);
 		let tampered_bytes = serialize(&tampered);
 		let mut assembler = BlockChunkAssembler::new(hash);
 		assembler.push(&block_chunk_to_wire(&hash, &tampered_bytes, 0).unwrap()).unwrap();
