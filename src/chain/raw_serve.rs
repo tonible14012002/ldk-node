@@ -32,9 +32,10 @@
 //! RPC work, so each is bounded four ways:
 //!
 //! * **Reply size.** A filters reply carries at most
-//!   [`FILTER_BYTES_PER_REPLY`] of raw filter bytes (hex doubles it, well
-//!   under the ~2 MiB a relayed message may carry), a filter-headers reply at
-//!   most [`FILTER_HEADERS_PER_REPLY`] headers, a headers reply at most
+//!   [`FILTER_BYTES_PER_REPLY`] of raw filter bytes (hex doubles it, under
+//!   the [`MAX_PEER_REPLY_BYTES`](crate::chain::provider::MAX_PEER_REPLY_BYTES)
+//!   a peer reply may carry), a filter-headers reply at most
+//!   [`FILTER_HEADERS_PER_REPLY`] headers, a headers reply at most
 //!   [`HEADER_BYTES_PER_REPLY`]. A reply cut short is a *prefix* of the span
 //!   asked — never empty — and the asking node continues from where it ended.
 //! * **Concurrency.** At most [`RAW_SERVE_CONCURRENCY`] serves ask the source
@@ -87,10 +88,13 @@ pub(crate) const FILTER_CACHE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const FILTER_HEADER_CACHE_BYTES: usize = 1024 * 1024;
 
 /// Raw filter bytes one filters reply carries at most. Hex doubles them and the
-/// JSON around them is small, so a reply stays under ~1.4 MiB — inside the
-/// ~2 MiB a relayed message may carry even when a mainnet span of
-/// [`MAX_FILTERS_PER_REQUEST`] filters runs to several MiB.
-pub(crate) const FILTER_BYTES_PER_REPLY: usize = 700 * 1024;
+/// JSON around them is small (~100 bytes a filter), so a reply stays near
+/// 800 KiB — under the
+/// [`MAX_PEER_REPLY_BYTES`](crate::chain::provider::MAX_PEER_REPLY_BYTES) a
+/// peer reply may carry even when a mainnet span of
+/// [`MAX_FILTERS_PER_REQUEST`] filters runs to several MiB (a mainnet filter
+/// is ~25 KB).
+pub(crate) const FILTER_BYTES_PER_REPLY: usize = 384 * 1024;
 
 /// Filter headers one reply carries at most. Answering a span costs one
 /// `getblockfilter` read per block, whole filter included, so the span
@@ -818,7 +822,7 @@ mod tests {
 	use bitcoin::bip158::FilterHeader;
 	use bitcoin::hashes::Hash;
 
-	use crate::chain::provider::CHAIN_WIRE_VERSION;
+	use crate::chain::provider::{CHAIN_WIRE_VERSION, MAX_PEER_REPLY_BYTES};
 	use crate::chain::wire_convert::{
 		filter_headers_from_wire, filters_from_wire, headers_from_wire, BlockChunkAssembler,
 	};
@@ -935,7 +939,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_block_is_fetched_once_for_all_its_chunks() {
-		let (server, source) = server(MockFilterSource::new(3, 1_300_000));
+		let (server, source) = server(MockFilterSource::new(3, 600_000));
 		let block = source.blocks[2].clone();
 		let hash = block.block_hash();
 
@@ -994,7 +998,7 @@ mod tests {
 			assert_eq!(filter.height, i as u32, "a prefix of the span, from its start");
 		}
 		let encoded = serde_json::to_vec(&wire).unwrap();
-		assert!(encoded.len() < 3 * 1024 * 1024 / 2, "{} bytes on the wire", encoded.len());
+		assert!(encoded.len() < MAX_PEER_REPLY_BYTES, "{} bytes on the wire", encoded.len());
 
 		// One filter larger than the whole budget still goes: a reply always makes progress.
 		let mut huge = MockFilterSource::new(3, 10);
@@ -1052,7 +1056,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn concurrent_chunk_requests_for_one_block_share_one_fetch() {
-		let mut source = MockFilterSource::new(3, 1_300_000);
+		let mut source = MockFilterSource::new(3, 600_000);
 		source.delay = Some(Duration::from_millis(100));
 		let hash = source.blocks[2].block_hash();
 		let (server, source) = fast_server(source);
