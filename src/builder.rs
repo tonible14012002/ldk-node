@@ -373,6 +373,7 @@ pub struct NodeBuilder {
 	chain_host: Option<Arc<ChainHost>>,
 	shared_graph: Option<SharedGraph>,
 	inbound_listener: Option<Arc<InboundListener>>,
+	wallet_birthday: Option<BestBlock>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -407,6 +408,7 @@ impl NodeBuilder {
 			chain_host: None,
 			shared_graph: None,
 			inbound_listener: None,
+			wallet_birthday: None,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
@@ -437,6 +439,16 @@ impl NodeBuilder {
 	/// [`BuildError::SharedGraphWithRgs`]: only the owner syncs RGS.
 	pub fn set_shared_graph(&mut self, graph: Arc<Graph>, scorer: Arc<Mutex<Scorer>>) -> &mut Self {
 		self.shared_graph = Some(SharedGraph { graph, scorer });
+		self
+	}
+
+	/// Seeds a wallet that has never been scanned at `best_block` instead of genesis: a
+	/// wallet created beside a running node (a secondary) cannot hold anything older than
+	/// its creation, and a fresh wallet rooted at genesis asks a pruned or block-polling
+	/// chain source for history it does not have. Ignored once the wallet has persisted a
+	/// block of its own; a filter-following host's compiled birthday wins over it.
+	pub fn set_wallet_birthday(&mut self, best_block: BestBlock) -> &mut Self {
+		self.wallet_birthday = Some(best_block);
 		self
 	}
 
@@ -1082,6 +1094,7 @@ impl NodeBuilder {
 			self.chain_selection(&logger)?,
 			self.shared_graph.clone(),
 			self.inbound_listener.clone(),
+			self.wallet_birthday,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1107,6 +1120,7 @@ impl NodeBuilder {
 			self.chain_selection(&logger)?,
 			self.shared_graph.clone(),
 			self.inbound_listener.clone(),
+			self.wallet_birthday,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1509,7 +1523,6 @@ impl ArcedNodeBuilder {
 /// crash window between wallet creation and the first persisted block, which
 /// would otherwise resurrect a genesis-rooted wallet next to a
 /// `ChannelManager` already initialised at the anchor.
-#[cfg(feature = "cbf")]
 fn seed_wallet_at_birthday(
 	wallet: &mut bdk_wallet::PersistedWallet<KVStoreWalletPersister>,
 	persister: &mut KVStoreWalletPersister, anchor: BestBlock, logger: &Logger,
@@ -1560,7 +1573,8 @@ impl std::fmt::Debug for SharedGraph {
 /// Builds a [`Node`] instance according to the options previously configured.
 fn build_with_store_internal(
 	config: Arc<Config>, chain: ChainSelection, shared_graph: Option<SharedGraph>,
-	inbound_listener: Option<Arc<InboundListener>>, gossip_source_config: Option<&GossipSourceConfig>,
+	inbound_listener: Option<Arc<InboundListener>>, wallet_birthday: Option<BestBlock>,
+	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
@@ -1659,6 +1673,14 @@ fn build_with_store_internal(
 		.and_then(|height| birthday_checkpoint(config.network, height))
 		.map(|checkpoint| BestBlock::new(checkpoint.hash, checkpoint.height));
 
+	// The block a fresh wallet's components start at: a filter-following host's compiled
+	// birthday checkpoint, else the birthday the caller set (a secondary created beside a
+	// running node), else genesis.
+	#[cfg(feature = "cbf")]
+	let fresh_birthday: Option<BestBlock> = cbf_birthday.or(wallet_birthday);
+	#[cfg(not(feature = "cbf"))]
+	let fresh_birthday: Option<BestBlock> = wallet_birthday;
+
 	// A wallet whose persisted chain is still rooted at genesis has never been
 	// scanned — created just now, or created earlier and never synced — and is
 	// seeded at the birthday so its first filter scan starts there, not at
@@ -1669,10 +1691,9 @@ fn build_with_store_internal(
 	// between wallet creation and the first persisted block: a genesis-rooted
 	// wallet next to a `ChannelManager` initialised at the anchor is a resume
 	// the filter engine refuses.
-	#[cfg(feature = "cbf")]
 	let bdk_wallet = {
 		let mut wallet = bdk_wallet;
-		if let Some(anchor) = cbf_birthday {
+		if let Some(anchor) = fresh_birthday {
 			if wallet.latest_checkpoint().height() == 0 {
 				seed_wallet_at_birthday(&mut wallet, &mut wallet_persister, anchor, &logger)?;
 			}
@@ -1928,8 +1949,7 @@ fn build_with_store_internal(
 			// birthday, where a fresh wallet was seeded above: nothing of this
 			// node's can be older, and a listener at genesis would be a resume
 			// the filter engine refuses.
-			#[cfg(feature = "cbf")]
-			let best_block = cbf_birthday.unwrap_or(best_block);
+			let best_block = fresh_birthday.unwrap_or(best_block);
 
 			let chain_params = ChainParameters { network: config.network.into(), best_block };
 			channelmanager::ChannelManager::new(
@@ -2284,10 +2304,7 @@ fn build_with_store_internal(
 		dead_fundings,
 		chain_host,
 		chain_target: Mutex::new(None),
-		#[cfg(feature = "cbf")]
-		wallet_birthday_height: cbf_birthday.map(|b| b.height),
-		#[cfg(not(feature = "cbf"))]
-		wallet_birthday_height: None,
+		wallet_birthday_height: fresh_birthday.map(|b| b.height),
 		path_failures: Arc::new(crate::path_failure::PathFailureStore::new()),
 		external_fundings: Arc::new(crate::funding::ExternalFundings::default()),
 		#[cfg(feature = "swaps")]
