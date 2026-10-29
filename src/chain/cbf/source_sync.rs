@@ -1081,6 +1081,11 @@ impl SourceSync {
 			);
 			self.send(ChainOp::Synced { tip_height: ours.height }).await?;
 			self.synced_at = Some(ours.hash);
+		} else {
+			// The tip was just asked for and nothing is new: that is a fresh proof the node is
+			// caught up, and the wallet sync timestamps must say so between blocks too. A failed
+			// tip check never gets here, so an outage still shows as stalled.
+			self.send(ChainOp::TipConfirmed { tip_height: ours.height }).await?;
 		}
 		Ok(Progress::Idle)
 	}
@@ -1804,9 +1809,12 @@ mod tests {
 	use super::test_support::*;
 	use super::*;
 
+	use std::sync::RwLock;
+
 	use bitcoin::CompactTarget;
 
 	use crate::chain::cbf::applicator::CBF_FULL_BLOCK_PERMITS;
+	use crate::NodeMetrics;
 
 	/// Any single wait in these tests; a test that would otherwise hang fails instead.
 	const WAIT: Duration = Duration::from_secs(20);
@@ -1818,6 +1826,7 @@ mod tests {
 		Filtered(u32),
 		Disconnect(Vec<u32>),
 		Synced(u32),
+		TipConfirmed(u32),
 	}
 
 	struct Harness {
@@ -1871,7 +1880,18 @@ mod tests {
 	}
 
 	impl Harness {
+		/// The next op that moves the chain or ends a catch-up. A `TipConfirmed` moves nothing
+		/// and comes on every idle poll, so it is skipped here; [`Self::next_any_op`] sees it.
 		async fn next_op(&mut self) -> Op {
+			loop {
+				let op = self.next_any_op().await;
+				if !matches!(op, Op::TipConfirmed(_)) {
+					return op;
+				}
+			}
+		}
+
+		async fn next_any_op(&mut self) -> Op {
 			let op = tokio::time::timeout(WAIT, self.ops_rx.recv())
 				.await
 				.expect("an op in time")
@@ -1897,6 +1917,7 @@ mod tests {
 					Op::Disconnect(heights)
 				},
 				ChainOp::Synced { tip_height } => Op::Synced(tip_height),
+				ChainOp::TipConfirmed { tip_height } => Op::TipConfirmed(tip_height),
 			}
 		}
 
@@ -1923,10 +1944,31 @@ mod tests {
 			self.end().await
 		}
 
-		/// No op arrives for a while.
+		/// No op that moves the chain arrives for a while; `TipConfirmed`s may.
 		async fn assert_quiet(&mut self) {
-			let op = tokio::time::timeout(Duration::from_millis(150), self.ops_rx.recv()).await;
-			assert!(op.is_err(), "no op expected, got one");
+			let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+			while let Ok(op) = tokio::time::timeout_at(deadline, self.ops_rx.recv()).await {
+				assert!(
+					matches!(op, Some(ChainOp::TipConfirmed { .. })),
+					"no op expected, got {:?}",
+					op
+				);
+			}
+		}
+
+		/// Makes every source call fail from now on, and returns once a tip check has failed:
+		/// every op from a step that began before is queued by then, and is drained here.
+		async fn take_the_source_down(&mut self) {
+			let tips = self.source.calls("tip");
+			self.source.fail_next(u32::MAX);
+			tokio::time::timeout(WAIT, async {
+				while self.source.calls("tip") <= tips {
+					tokio::time::sleep(Duration::from_millis(1)).await;
+				}
+			})
+			.await
+			.expect("a tip check in time");
+			while self.ops_rx.try_recv().is_ok() {}
 		}
 	}
 
@@ -2165,6 +2207,172 @@ mod tests {
 		h.source.mine(1, &[], 0);
 		assert_eq!(h.ops_until_synced().await, vec![Op::Filtered(30), Op::Synced(30)]);
 		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	#[tokio::test]
+	async fn an_unchanged_tip_is_confirmed_on_every_poll_and_a_failed_tip_check_confirms_nothing() {
+		let mut h = start(FakeSource::new(30, &[]), 10, fast_tuning());
+		h.ops_until_synced().await;
+
+		// Nothing new on the source: each poll proves the node caught up again.
+		assert_eq!(h.next_any_op().await, Op::TipConfirmed(29));
+		assert_eq!(h.next_any_op().await, Op::TipConfirmed(29));
+
+		// The source goes down: the tip checks fail, and none of them vouches for the node.
+		h.take_the_source_down().await;
+		let op = tokio::time::timeout(Duration::from_millis(150), h.ops_rx.recv()).await;
+		assert!(op.is_err(), "a failed tip check sends nothing, got {:?}", op);
+
+		// Back: the tip is no longer known to be ours, so it is `Synced` again before it is
+		// confirmed again.
+		h.source.fail_next(0);
+		assert_eq!(h.next_any_op().await, Op::Synced(29));
+		assert_eq!(h.next_any_op().await, Op::TipConfirmed(29));
+		assert_eq!(h.stop().await, SourceSyncEnd::Stopped);
+	}
+
+	/// A fan-out with nothing behind it: the source loop and the real applicator, end to end,
+	/// down to the node metrics.
+	struct NoListeners;
+
+	impl crate::chain::cbf::applicator::ChainFanout for NoListeners {
+		fn connect_block(&self, _block: &Block, _height: u32) {}
+		fn connect_filtered(&self, _header: &Header, _height: u32) {}
+		fn disconnect(&self, _header: &Header, _height: u32) {}
+		fn take_divergence(&self) -> Option<String> {
+			None
+		}
+		fn record_stranded_listeners(&self, _tip_height: u32) -> bool {
+			false
+		}
+		fn set_bulk_chain_persistence(&self, _enabled: bool) {}
+		fn flush_chain_persistence(&self) -> Result<(), Error> {
+			Ok(())
+		}
+	}
+
+	/// A timestamp no real sync writes, to tell a refresh from a stale value.
+	const OLD_STAMP: Option<u64> = Some(1);
+
+	fn stamps(metrics: &RwLock<NodeMetrics>) -> (Option<u64>, Option<u64>) {
+		let m = metrics.read().unwrap();
+		(m.latest_onchain_wallet_sync_timestamp, m.latest_lightning_wallet_sync_timestamp)
+	}
+
+	fn age_stamps(metrics: &RwLock<NodeMetrics>) {
+		let mut m = metrics.write().unwrap();
+		m.latest_onchain_wallet_sync_timestamp = OLD_STAMP;
+		m.latest_lightning_wallet_sync_timestamp = OLD_STAMP;
+	}
+
+	async fn wait_for_fresh_stamps(metrics: &RwLock<NodeMetrics>) {
+		tokio::time::timeout(WAIT, async {
+			loop {
+				let (onchain, lightning) = stamps(metrics);
+				if onchain > OLD_STAMP && lightning > OLD_STAMP {
+					return;
+				}
+				tokio::time::sleep(Duration::from_millis(2)).await;
+			}
+		})
+		.await
+		.expect("both sync timestamps refreshed in time");
+	}
+
+	/// The source loop at 10 on a 30-block chain, feeding the real applicator; returns once
+	/// it has caught up to 29.
+	async fn start_applying(
+		source: FakeSource,
+	) -> (Arc<FakeSource>, Arc<RwLock<NodeMetrics>>, watch::Sender<bool>) {
+		use crate::chain::cbf::applicator::{BlockApplicator, CBF_CHAIN_OP_QUEUE_DEPTH};
+		use crate::chain::cbf::fee::new_block_fee_cache;
+		use crate::chain::cbf::WatchLedger;
+		use lightning::util::test_utils::TestStore;
+
+		let source = Arc::new(source);
+		let anchor = BlockId { height: 10, hash: source.block_at(10).block_hash() };
+		let (ops_tx, ops_rx) = mpsc::channel(CBF_CHAIN_OP_QUEUE_DEPTH);
+		let (sync_state_tx, _) =
+			watch::channel(CbfSyncState::Active { applied_tip: Some(10), synced_to_tip: false });
+		let (stop_tx, stop_rx) = watch::channel(false);
+		let metrics = Arc::new(RwLock::new(NodeMetrics::default()));
+		let logger = Arc::new(Logger::new_log_facade());
+		let applicator = BlockApplicator::new(
+			Arc::new(NoListeners),
+			ops_rx,
+			11,
+			sync_state_tx.clone(),
+			new_block_fee_cache(),
+			Arc::new(WatchLedger::new()),
+			Arc::new(TestStore::new(false)),
+			Arc::clone(&metrics),
+			Arc::clone(&logger),
+		);
+		tokio::spawn(applicator.run());
+		let sync = SourceSync::new(
+			Arc::clone(&source) as Arc<dyn FilterSource>,
+			Network::Regtest,
+			anchor,
+			new_shared_header_chain(),
+			Arc::new(FixedScripts(vec![watched_script()])),
+			ops_tx,
+			sync_state_tx.clone(),
+			Arc::new(Semaphore::new(CBF_FULL_BLOCK_PERMITS)),
+			stop_rx,
+			fast_tuning(),
+			logger,
+		);
+		tokio::spawn(sync.run());
+		let mut rx = sync_state_tx.subscribe();
+		tokio::time::timeout(
+			WAIT,
+			rx.wait_for(|s| {
+				matches!(s, CbfSyncState::Active { applied_tip: Some(29), synced_to_tip: true })
+			}),
+		)
+		.await
+		.expect("synced in time")
+		.expect("the sync state channel is open");
+		(source, metrics, stop_tx)
+	}
+
+	#[tokio::test]
+	async fn a_tip_check_that_finds_nothing_new_refreshes_the_sync_timestamps() {
+		let (_source, metrics, stop_tx) = start_applying(FakeSource::new(30, &[])).await;
+		assert!(stamps(&metrics).0.is_some(), "catching up to the tip stamps them");
+
+		// No block arrives; the next tip poll alone must refresh both.
+		age_stamps(&metrics);
+		wait_for_fresh_stamps(&metrics).await;
+		stop_tx.send_replace(true);
+	}
+
+	#[tokio::test]
+	async fn a_failed_tip_check_leaves_the_sync_timestamps_to_age() {
+		let (source, metrics, stop_tx) = start_applying(FakeSource::new(30, &[])).await;
+
+		// The source goes down; let a confirmation already queued land before aging the stamps.
+		let tips = source.calls("tip");
+		source.fail_next(u32::MAX);
+		tokio::time::timeout(WAIT, async {
+			while source.calls("tip") < tips + 2 {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
+		})
+		.await
+		.expect("failed tip checks in time");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		age_stamps(&metrics);
+
+		// Many failed polls later, nothing has vouched for the node: an outage reads as stalled.
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		assert!(source.calls("tip") > tips + 4, "the source kept being asked");
+		assert_eq!(stamps(&metrics), (OLD_STAMP, OLD_STAMP));
+
+		// Back up: the next good tip check refreshes them again.
+		source.fail_next(0);
+		wait_for_fresh_stamps(&metrics).await;
+		stop_tx.send_replace(true);
 	}
 
 	#[tokio::test]
