@@ -93,6 +93,15 @@ pub(crate) enum ChainOp {
 	/// height is a true tip; the applicator judges stranded listeners against it and nothing
 	/// else.
 	Synced { tip_height: u32 },
+	/// The filter source was asked for its tip again and it is still the one last [`Synced`] to:
+	/// nothing new, the node is caught up. Moves nothing; it only refreshes the wallet sync
+	/// timestamps, so a synced node between two blocks does not read as stalled.
+	///
+	/// Kyoto has no such signal: it only reports `FiltersSynced` when a new block takes it
+	/// back to the tip, so only the filter-source loop sends this.
+	///
+	/// [`Synced`]: ChainOp::Synced
+	TipConfirmed { tip_height: u32 },
 }
 
 /// Everything the applicator asks of the listeners, as one seam.
@@ -328,6 +337,7 @@ impl<F: ChainFanout> BlockApplicator<F> {
 						synced_to_tip: false,
 					});
 				},
+				ChainOp::TipConfirmed { tip_height } => self.confirm_tip(tip_height),
 				ChainOp::Synced { tip_height } => {
 					log_info!(self.logger, "CBF caught up to tip {}", tip_height);
 					if self.next_height > tip_height {
@@ -399,12 +409,48 @@ impl<F: ChainFanout> BlockApplicator<F> {
 				applied_tip: already_published,
 				synced_to_tip: true,
 			});
+			self.record_sync_timestamps();
 			return;
 		}
 		self.sync_state_tx.send_replace(CbfSyncState::Active {
 			applied_tip: Some(tip_height),
 			synced_to_tip: true,
 		});
+		self.record_sync_timestamps();
+	}
+
+	/// A tip check found nothing new. Refreshes the sync timestamps only if every block through
+	/// that tip is applied and published as synced: a confirmation that overtook a block still
+	/// in the queue, or one raced by a reorg or a failure, must not vouch for a node that is
+	/// behind.
+	fn confirm_tip(&self, tip_height: u32) {
+		let caught_up = match *self.sync_state_tx.borrow() {
+			CbfSyncState::Active { applied_tip: Some(applied), synced_to_tip: true } => {
+				applied >= tip_height
+			},
+			_ => false,
+		};
+		if caught_up && self.next_height > tip_height {
+			self.record_sync_timestamps();
+		} else {
+			log_debug!(
+				self.logger,
+				"CBF tip {} confirmed while not synced to it (next height {}); sync timestamps \
+				 left as they are",
+				tip_height,
+				self.next_height
+			);
+		}
+	}
+
+	/// Stamps both wallet sync timestamps with now and persists the node metrics.
+	///
+	/// The timestamps mean "last verified caught up", as the Electrum and bitcoind engines
+	/// write them on every poll: `get_sync_status` reports stalled once they are 300 s old, and
+	/// blocks come every ~10 min, so stamping only when a block is applied would show a synced
+	/// CBF node as stalled between blocks. Only a successful tip check reaches here, so an
+	/// outage still ages them out.
+	fn record_sync_timestamps(&self) {
 		let unix_time_secs_opt =
 			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
 		let mut locked_node_metrics = self.node_metrics.write().unwrap();
@@ -639,6 +685,7 @@ mod tests {
 		ops_tx: mpsc::Sender<ChainOp>,
 		sync_state_tx: watch::Sender<CbfSyncState>,
 		ledger: Arc<WatchLedger>,
+		node_metrics: Arc<RwLock<NodeMetrics>>,
 		task: tokio::task::JoinHandle<()>,
 	}
 
@@ -650,6 +697,7 @@ mod tests {
 			synced_to_tip: false,
 		});
 		let ledger = Arc::new(WatchLedger::new());
+		let node_metrics = Arc::new(RwLock::new(NodeMetrics::default()));
 		let applicator = BlockApplicator::new(
 			Arc::clone(&fanout),
 			ops_rx,
@@ -658,11 +706,11 @@ mod tests {
 			new_block_fee_cache(),
 			Arc::clone(&ledger),
 			Arc::new(TestStore::new(false)),
-			Arc::new(RwLock::new(NodeMetrics::default())),
+			Arc::clone(&node_metrics),
 			Arc::new(Logger::new_log_facade()),
 		);
 		let task = tokio::spawn(applicator.run());
-		Harness { fanout, ops_tx, sync_state_tx, ledger, task }
+		Harness { fanout, ops_tx, sync_state_tx, ledger, node_metrics, task }
 	}
 
 	/// How long any single wait on the applicator may take before the test fails.
@@ -732,6 +780,54 @@ mod tests {
 		})
 		.await;
 		matches!(state, CbfSyncState::Active { .. })
+	}
+
+	/// Both wallet sync timestamps, on-chain first.
+	fn stamps(h: &Harness) -> (Option<u64>, Option<u64>) {
+		let m = h.node_metrics.read().unwrap();
+		(m.latest_onchain_wallet_sync_timestamp, m.latest_lightning_wallet_sync_timestamp)
+	}
+
+	fn set_stamps(h: &Harness, stamp: Option<u64>) {
+		let mut m = h.node_metrics.write().unwrap();
+		m.latest_onchain_wallet_sync_timestamp = stamp;
+		m.latest_lightning_wallet_sync_timestamp = stamp;
+	}
+
+	#[tokio::test]
+	async fn a_tip_confirmation_refreshes_the_sync_timestamps_only_once_that_tip_is_applied() {
+		let h = spawn(FakeFanout::at(BestBlock::new(hash(100), 100)));
+		let headers = connect_101_to_103(&h).await;
+		assert!(stamps(&h).0.is_some(), "reaching the tip stamps them");
+		let old = Some(1);
+
+		// A confirmation of a tip above the one applied vouches for nothing. The block after
+		// it is the barrier: once it is applied, the confirmation before it was handled.
+		set_stamps(&h, old);
+		h.ops_tx.send(ChainOp::TipConfirmed { tip_height: 104 }).await.unwrap();
+		let next = header_with(headers[2].block_hash(), 104);
+		h.ops_tx.send(ChainOp::ConnectFiltered { header: next, height: 104 }).await.unwrap();
+		wait_for_state(&h, |s| matches!(s, CbfSyncState::Active { synced_to_tip: false, .. }))
+			.await;
+		assert_eq!(stamps(&h), (old, old));
+
+		h.ops_tx.send(ChainOp::Synced { tip_height: 104 }).await.unwrap();
+		wait_for_state(&h, |s| {
+			matches!(s, CbfSyncState::Active { applied_tip: Some(104), synced_to_tip: true })
+		})
+		.await;
+		assert!(stamps(&h).0 > old, "the Synced at 104 stamps them");
+
+		// At the tip, a confirmation refreshes both.
+		set_stamps(&h, old);
+		h.ops_tx.send(ChainOp::TipConfirmed { tip_height: 104 }).await.unwrap();
+		tokio::time::timeout(WAIT, async {
+			while !(stamps(&h).0 > old && stamps(&h).1 > old) {
+				tokio::time::sleep(Duration::from_millis(2)).await;
+			}
+		})
+		.await
+		.expect("both sync timestamps refreshed in time");
 	}
 
 	#[tokio::test]
