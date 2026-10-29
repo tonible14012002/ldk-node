@@ -29,11 +29,13 @@ use bitcoin::{Script, Transaction, Txid};
 use lightning_block_sync::gossip::UtxoSource;
 use lightning_transaction_sync::EsploraSyncClient;
 
+use crate::broadcast_queue::{parents_first, BroadcastPolicy, Hold};
 use crate::chain::adapters::bitcoind::BitcoindChainAdapter;
 use crate::chain::adapters::bitcoind_raw::{BitcoindRpcSource, RawSourceHealth, RawSourceStatus};
 use crate::chain::adapters::dependent::DependentChainAdapter;
 use crate::chain::adapters::electrum::ElectrumChainAdapter;
 use crate::chain::adapters::esplora::EsploraChainAdapter;
+use crate::chain::adapters::is_missing_inputs_rejection;
 use crate::chain::bitcoind::{BitcoindClient, BoundedHeaderCache};
 use crate::chain::cbf::source::FilterSource;
 use crate::chain::engine::bitcoind::{BitcoindSyncEngine, DependentScanServer};
@@ -194,6 +196,10 @@ pub(crate) fn stamp_locally(answer: MempoolAnswer, now: u64) -> (Unconfirmed, Ev
 	)
 }
 
+fn unix_now_secs() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 /// One package's run through the BROADCAST chain: the chain's verdict, and
 /// every transaction some adapter reported as on the network along the way.
 struct BroadcastRun {
@@ -224,6 +230,11 @@ pub(crate) struct SharedChainCtx {
 /// filters show makes the eviction moot. After it, an absence is a real
 /// signal — dropped, or replaced — and the inputs should be released.
 pub(crate) const OWN_BROADCAST_EVICTION_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// How often the drain looks for held transactions due for a rebroadcast. The look is in
+/// memory and costs nothing when the queue holds nothing; a child is sent within this long of
+/// its parent.
+const BROADCAST_RETRY_TICK: Duration = Duration::from_secs(1);
 
 /// Bound on the transactions [`RecentOwnBroadcasts`] remembers. Own broadcasts
 /// are rare — a channel open, a sweep, a payment — so the bound is never
@@ -1002,18 +1013,60 @@ impl ChainLayer {
 	/// wait for the next tick rather than being lost to a chain that could
 	/// not have answered — the pre-seam Electrum skip-and-retry, now for every
 	/// backend. Otherwise each package runs the chain and then the shared
-	/// tail ([`ChainLayer::broadcast_package`]). Nothing here propagates: the
-	/// queue carries no retry semantics, so a package the chain cannot place
-	/// is logged and dropped, exactly as lossy as pre-seam.
+	/// tail ([`ChainLayer::broadcast_package`]). Nothing here propagates.
+	///
+	/// The packages channel carries no retry semantics; the broadcast queue
+	/// does ([`crate::broadcast_queue`]). Between packages, every
+	/// [`BROADCAST_RETRY_TICK`] the held transactions that are due are sent
+	/// again ([`ChainLayer::retry_held_broadcasts`]). A transaction with no
+	/// queued policy that the chain cannot place is logged and dropped,
+	/// exactly as lossy as pre-seam.
 	pub(crate) async fn process_broadcast_queue(&self) {
 		if !self.any_broadcast_adapter_ready().await {
 			return;
 		}
 
 		let mut receiver = self.shared.tx_broadcaster.get_broadcast_queue().await;
-		while let Some(next_package) = receiver.recv().await {
-			self.broadcast_package(next_package).await;
+		let mut retry = tokio::time::interval(BROADCAST_RETRY_TICK);
+		retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+		loop {
+			tokio::select! {
+				next_package = receiver.recv() => match next_package {
+					Some(package) => self.broadcast_package(package).await,
+					None => return,
+				},
+				_ = retry.tick() => self.retry_held_broadcasts().await,
+			}
 		}
+	}
+
+	/// One pass over the broadcast queue ([`crate::broadcast_queue`]): give up what is past its
+	/// `max_age`, releasing the inputs, then send what is due — the held transactions whose
+	/// backoff ran out, or with a parent newly on the network — through the BROADCAST chain and
+	/// its tail, which holds them again if they are refused again.
+	///
+	/// Nothing is sent while no adapter is ready, so a backend that is down does not use up the
+	/// held transactions' attempts.
+	pub(crate) async fn retry_held_broadcasts(&self) {
+		let Some(wallet) = self.engine.onchain_wallet().cloned() else {
+			return;
+		};
+		let queue = Arc::clone(wallet.broadcast_queue());
+		let now = unix_now_secs();
+
+		for (txid, reason, definitive) in queue.expire(now) {
+			self.give_up(&wallet, txid, reason, definitive);
+		}
+
+		if !queue.has_held() || !self.any_broadcast_adapter_ready().await {
+			return;
+		}
+		let due = queue.due(now, |txid| wallet.is_tx_confirmed(txid));
+		if due.is_empty() {
+			return;
+		}
+		log_debug!(self.shared.logger, "Rebroadcasting {} held transaction(s)", due.len());
+		self.broadcast_package(due).await;
 	}
 
 	async fn any_broadcast_adapter_ready(&self) -> bool {
@@ -1057,27 +1110,68 @@ impl ChainLayer {
 
 	/// One package through the BROADCAST chain, then the shared tail.
 	///
-	/// The tail is what every backend used to lack: it tells the on-chain
-	/// wallet what the chain's answer means for the node's own coins.
+	/// The package goes out parents first ([`parents_first`]): a backend sends
+	/// it one transaction at a time, and a child sent before its parent is
+	/// refused for a missing input. A transaction whose queued policy names
+	/// dependencies not yet on the network is held unsent until they are.
 	///
-	/// * `Rejected` — each refused transaction is logged with its reason and
-	///   evicted from the wallet, so the inputs it tried to spend are offered
-	///   again. Relaying it elsewhere would only buy the same verdict.
-	///   Transactions of the package that were not listed were accepted.
-	/// * `Ok` — the package is on the network. If the engine
-	///   [`SyncEngine::tracks_own_broadcasts`], the wallet is told the
-	///   package is unconfirmed now, because nothing else ever will; an
-	///   engine with a mempool view sees its own transactions come back and
-	///   is left alone.
-	/// * exhausted — logged at error and dropped, as lossy as pre-seam. But a
+	/// The tail is what every backend used to lack: it tells the on-chain
+	/// wallet what the chain's answer means for the node's own coins, and the
+	/// broadcast queue ([`crate::broadcast_queue`]) what it means for the
+	/// transactions it holds. A transaction is *queued* when the policy
+	/// registered for it is [`BroadcastPolicy::QueueUntilParents`] — every
+	/// transaction the on-chain wallet builds, unless its caller chose
+	/// otherwise.
+	///
+	/// * `Rejected` — a queued transaction refused because an input is
+	///   missing is held: its inputs stay reserved and it is sent again once
+	///   a parent is out. Every other refused transaction is logged with its
+	///   reason and evicted from the wallet, so the inputs it tried to spend
+	///   are offered again; a queued one is recorded as given up, with every
+	///   queued transaction depending on it. Relaying it elsewhere would only
+	///   buy the same verdict. Transactions of the package that were not
+	///   listed were accepted.
+	/// * `Ok` — the package is on the network, and any held child of it is
+	///   due at once. If the engine [`SyncEngine::tracks_own_broadcasts`], the
+	///   wallet is told the package is unconfirmed now, because nothing else
+	///   ever will; an engine with a mempool view sees its own transactions
+	///   come back and is left alone.
+	/// * exhausted — a queued transaction no adapter took is held, as above.
+	///   Any other is logged at error and dropped, as lossy as pre-seam. But a
 	///   transaction some adapter did hand to the network before the chain
 	///   ran out is not dropped: an engine that tracks its own broadcasts is
 	///   told it is unconfirmed, exactly as it would have been had the whole
 	///   package gone, so the coins it spent stop being offered again.
 	async fn broadcast_package(&self, package: Vec<Transaction>) {
+		let now = unix_now_secs();
+		let wallet = self.engine.onchain_wallet().cloned();
+		let queued = |txid: &Txid| match &wallet {
+			Some(wallet) => matches!(
+				wallet.broadcast_queue().policy(txid),
+				BroadcastPolicy::QueueUntilParents { .. }
+			),
+			None => false,
+		};
+
+		let mut package = parents_first(package);
+		if let Some(wallet) = &wallet {
+			let queue = wallet.broadcast_queue();
+			let (waiting, ready): (Vec<Transaction>, Vec<Transaction>) = package
+				.into_iter()
+				.partition(|tx| queue.awaits_dependencies(tx, |t| wallet.is_tx_confirmed(t)));
+			for tx in &waiting {
+				let reason = "waiting for the transactions its policy depends on".to_string();
+				let released = self.hold_queued(wallet, tx, reason, false, now);
+				self.release_inputs(wallet, released, now);
+			}
+			package = ready;
+		}
+		if package.is_empty() {
+			return;
+		}
+
 		let BroadcastRun { outcome, accepted } = self.run_broadcast(&package).await;
 
-		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
 		let echo_own = self.engine.tracks_own_broadcasts();
 
 		let (unconfirmed, evicted): (Unconfirmed, Evicted) = match outcome {
@@ -1088,25 +1182,49 @@ impl ChainLayer {
 					package.len(),
 					answered.by
 				);
+				if let Some(wallet) = &wallet {
+					let sent: Vec<Txid> = package.iter().map(|tx| tx.compute_txid()).collect();
+					wallet.broadcast_queue().mark_sent(&sent, now);
+				}
 				if !echo_own {
 					return;
 				}
 				(package.into_iter().map(|tx| (tx, now)).collect(), Vec::new())
 			},
 			Err(ChainActionError::Unavailable { reason, .. }) => {
-				log_error!(
-					self.shared.logger,
-					"Failed to broadcast a package of {} transaction(s); dropping it: {}",
-					package.len(),
-					reason
-				);
-				for tx in &package {
-					if !accepted.contains(&tx.compute_txid()) {
+				if let Some(wallet) = &wallet {
+					let sent: Vec<Txid> = accepted.iter().copied().collect();
+					wallet.broadcast_queue().mark_sent(&sent, now);
+				}
+				let (unsent_queued, dropped): (Vec<&Transaction>, Vec<&Transaction>) = package
+					.iter()
+					.filter(|tx| !accepted.contains(&tx.compute_txid()))
+					.partition(|tx| queued(&tx.compute_txid()));
+				if !dropped.is_empty() {
+					log_error!(
+						self.shared.logger,
+						"Failed to broadcast a package of {} transaction(s); dropping it: {}",
+						package.len(),
+						reason
+					);
+					for tx in &dropped {
 						log_trace!(
 							self.shared.logger,
 							"Dropped broadcast transaction {}",
 							tx.compute_txid()
 						);
+					}
+				}
+				if let Some(wallet) = &wallet {
+					for tx in unsent_queued {
+						let released = self.hold_queued(
+							wallet,
+							tx,
+							format!("no chain backend took it: {}", reason),
+							false,
+							now,
+						);
+						self.release_inputs(wallet, released, now);
 					}
 				}
 				if !echo_own || accepted.is_empty() {
@@ -1126,16 +1244,46 @@ impl ChainLayer {
 				(sent, Vec::new())
 			},
 			Err(ChainActionError::Rejected(rejected)) => {
-				for (txid, reason) in &rejected {
-					log_warn!(
-						self.shared.logger,
-						"The network rejected transaction {}; giving it up and releasing its inputs in the on-chain wallet: {}",
-						txid,
-						reason
-					);
-				}
 				let rejected_txids: HashSet<Txid> =
 					rejected.iter().map(|(txid, _)| *txid).collect();
+				if let Some(wallet) = &wallet {
+					let sent: Vec<Txid> = package
+						.iter()
+						.map(|tx| tx.compute_txid())
+						.filter(|txid| !rejected_txids.contains(txid))
+						.collect();
+					wallet.broadcast_queue().mark_sent(&sent, now);
+				}
+
+				let mut evicted: Evicted = Vec::new();
+				for (txid, reason) in rejected {
+					let tx = package.iter().find(|tx| tx.compute_txid() == txid);
+					match (&wallet, tx) {
+						(Some(wallet), Some(tx))
+							if queued(&txid) && is_missing_inputs_rejection(&reason) =>
+						{
+							let released = self.hold_queued(wallet, tx, reason, true, now);
+							evicted.extend(released.into_iter().map(|t| (t, now)));
+						},
+						(Some(wallet), _) if queued(&txid) => {
+							self.give_up(
+								wallet,
+								txid,
+								format!("the network rejected it: {}", reason),
+								true,
+							);
+						},
+						_ => {
+							log_warn!(
+								self.shared.logger,
+								"The network rejected transaction {}; giving it up and releasing its inputs in the on-chain wallet: {}",
+								txid,
+								reason
+							);
+							evicted.push((txid, now));
+						},
+					}
+				}
 				let accepted = if echo_own {
 					package
 						.into_iter()
@@ -1145,7 +1293,7 @@ impl ChainLayer {
 				} else {
 					Vec::new()
 				};
-				(accepted, rejected.into_iter().map(|(txid, _)| (txid, now)).collect())
+				(accepted, evicted)
 			},
 		};
 
@@ -1161,7 +1309,7 @@ impl ChainLayer {
 			}
 		}
 
-		let Some(wallet) = self.engine.onchain_wallet() else {
+		let Some(wallet) = wallet else {
 			log_debug!(
 				self.shared.logger,
 				"No on-chain wallet to record a broadcast package in ({} unconfirmed, {} evicted)",
@@ -1170,10 +1318,131 @@ impl ChainLayer {
 			);
 			return;
 		};
+		if unconfirmed.is_empty() && evicted.is_empty() {
+			return;
+		}
 		if let Err(e) = wallet.apply_mempool_txs(unconfirmed, evicted) {
 			log_error!(
 				self.shared.logger,
 				"Failed to record a broadcast package in the on-chain wallet: {}",
+				e
+			);
+		}
+	}
+
+	/// Holds the queued `tx` after a refusal (`verdict`) or a broadcast nobody
+	/// answered, keeping its inputs reserved in the wallet — unless the chain
+	/// already gave the definitive answer, in which case it is given up
+	/// ([`ChainLayer::give_up`]).
+	///
+	/// Definitive: an input spent by a different transaction confirmed on the
+	/// wallet's chain, a parent this node gave up on, or its policy's
+	/// `max_age` passed. Returns the transactions to evict the way an
+	/// unqueued refusal always was: `tx`, should its policy have been
+	/// dropped meanwhile; otherwise nothing.
+	fn hold_queued(
+		&self, wallet: &Arc<Wallet>, tx: &Transaction, reason: String, verdict: bool, now: u64,
+	) -> Vec<Txid> {
+		let txid = tx.compute_txid();
+		let queue = wallet.broadcast_queue();
+
+		let definitive = if let Some((input, by)) = wallet.confirmed_conflict(tx) {
+			Some(format!("input {} is spent by confirmed transaction {}", input, by))
+		} else {
+			queue
+				.abandoned_parent(tx)
+				.map(|parent| format!("it depends on {}, which was given up", parent))
+		};
+		if let Some(definitive) = definitive {
+			self.give_up(wallet, txid, definitive, true);
+			return Vec::new();
+		}
+
+		match queue.hold(tx, reason.clone(), verdict, now) {
+			Hold::Held { attempts, next_attempt_at } => {
+				log_info!(
+					self.shared.logger,
+					"Holding transaction {} for a rebroadcast (attempt {}, next within {}s): {}",
+					txid,
+					attempts,
+					next_attempt_at.saturating_sub(now),
+					reason
+				);
+				// Reserve the inputs: a wallet that never saw the transaction — an
+				// on-chain send, on an engine with a mempool view — would offer them
+				// to the next spend.
+				if let Err(e) = wallet.apply_mempool_txs(vec![(tx.clone(), now)], Vec::new()) {
+					log_error!(
+						self.shared.logger,
+						"Failed to reserve the inputs of held transaction {}: {}",
+						txid,
+						e
+					);
+				}
+				Vec::new()
+			},
+			Hold::Expired => {
+				self.give_up(
+					wallet,
+					txid,
+					format!("past its maximum age; last: {}", reason),
+					verdict,
+				);
+				Vec::new()
+			},
+			Hold::NotQueued => {
+				log_warn!(
+					self.shared.logger,
+					"The network rejected transaction {}; giving it up and releasing its inputs in the on-chain wallet: {}",
+					txid,
+					reason
+				);
+				vec![txid]
+			},
+		}
+	}
+
+	/// Gives the queued `txid` up for good, with every transaction depending
+	/// on it, and releases their inputs ([`Wallet::give_up_transaction`]).
+	fn give_up(&self, wallet: &Wallet, txid: Txid, reason: String, definitive: bool) {
+		log_warn!(
+			self.shared.logger,
+			"Giving up queued transaction {} and releasing its inputs in the on-chain wallet: {}",
+			txid,
+			reason
+		);
+		match wallet.give_up_transaction(txid, reason, definitive) {
+			Ok(given_up) => {
+				for child in given_up.iter().filter(|t| **t != txid) {
+					log_warn!(
+						self.shared.logger,
+						"Giving up transaction {} too: it depends on {}",
+						child,
+						txid
+					);
+				}
+			},
+			Err(e) => {
+				log_error!(
+					self.shared.logger,
+					"Failed to release the inputs of given-up transaction {}: {}",
+					txid,
+					e
+				);
+			},
+		}
+	}
+
+	/// Hands the inputs of the given-up `txids` back to coin selection.
+	fn release_inputs(&self, wallet: &Wallet, txids: Vec<Txid>, now: u64) {
+		if txids.is_empty() {
+			return;
+		}
+		let evicted = txids.into_iter().map(|txid| (txid, now)).collect();
+		if let Err(e) = wallet.apply_mempool_txs(Vec::new(), evicted) {
+			log_error!(
+				self.shared.logger,
+				"Failed to release the inputs of given-up transactions: {}",
 				e
 			);
 		}
@@ -1805,6 +2074,7 @@ mod tests {
 	use lightning::chain::chaininterface::BroadcasterInterface;
 	use lightning::util::test_utils::TestStore;
 
+	use crate::broadcast_queue::{BroadcastPolicy, BroadcastQueueState};
 	use crate::chain::seam::{ActionResult, MempoolScope, PackageOutcomes, TxBroadcastOutcome};
 	use crate::chain::test_wallet::fresh_regtest_wallet;
 	use crate::chain::wire_convert::{script_to_wire, tx_to_wire, txid_to_wire};
@@ -2427,6 +2697,335 @@ mod tests {
 
 		assert_eq!(unconfirmed_txids(&h.wallet), vec![deposit_tx.compute_txid()]);
 		assert_eq!(total_sats(&h.wallet), FUNDING_SATS, "the wallet was not told about the spend");
+	}
+
+	/// A network that knows which transactions are out: a transaction spending an output of one
+	/// of `unpublished` before that one was sent is refused for a missing input, exactly as
+	/// bitcoind (directly, or relayed by electrs) refuses it; everything else is accepted.
+	struct FakeNetwork {
+		unpublished: HashSet<Txid>,
+		/// Refused for this reason whenever sent, whatever its inputs.
+		refuse: HashMap<Txid, String>,
+		sent: Mutex<Vec<Txid>>,
+	}
+
+	impl FakeNetwork {
+		fn new(unpublished: &[&Transaction]) -> Arc<Self> {
+			Arc::new(Self {
+				unpublished: unpublished.iter().map(|tx| tx.compute_txid()).collect(),
+				refuse: HashMap::new(),
+				sent: Mutex::new(Vec::new()),
+			})
+		}
+
+		fn refusing(txid: Txid, reason: &str) -> Arc<Self> {
+			Arc::new(Self {
+				unpublished: HashSet::new(),
+				refuse: [(txid, reason.to_string())].into_iter().collect(),
+				sent: Mutex::new(Vec::new()),
+			})
+		}
+
+		fn sent(&self) -> Vec<Txid> {
+			self.sent.lock().unwrap().clone()
+		}
+	}
+
+	#[async_trait]
+	impl BroadcastAction for FakeNetwork {
+		fn name(&self) -> &'static str {
+			"network"
+		}
+
+		async fn ready(&self) -> bool {
+			true
+		}
+
+		async fn broadcast_package(
+			&self, txs: &[Transaction],
+		) -> ActionResult<PackageOutcomes, BroadcastRejection> {
+			let mut sent = self.sent.lock().unwrap();
+			Ok(txs
+				.iter()
+				.map(|tx| {
+					let txid = tx.compute_txid();
+					if let Some(reason) = self.refuse.get(&txid) {
+						return (txid, TxBroadcastOutcome::Rejected(reason.clone()));
+					}
+					let missing = tx.input.iter().any(|input| {
+						let parent = input.previous_output.txid;
+						self.unpublished.contains(&parent) && !sent.contains(&parent)
+					});
+					if missing {
+						let reason = "bad-txns-inputs-missingorspent (-25)".to_string();
+						return (txid, TxBroadcastOutcome::Rejected(reason));
+					}
+					sent.push(txid);
+					(txid, TxBroadcastOutcome::Accepted)
+				})
+				.collect())
+		}
+	}
+
+	fn network_harness(network: &Arc<FakeNetwork>, wallet: Option<Arc<Wallet>>) -> Harness {
+		build(HarnessSpec {
+			broadcast: vec![Arc::clone(network) as Arc<dyn BroadcastAction>],
+			wallet,
+			..HarnessSpec::default()
+		})
+	}
+
+	fn header_on(prev_blockhash: BlockHash, nonce: u32) -> bitcoin::block::Header {
+		bitcoin::block::Header {
+			version: bitcoin::block::Version::TWO,
+			prev_blockhash,
+			merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+			time: 1_700_000_000,
+			bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+			nonce,
+		}
+	}
+
+	/// Mines `txs` into the next block on the wallet's chain.
+	fn mine(wallet: &Wallet, txs: &[&Transaction], nonce: u32) {
+		use lightning::chain::Listen;
+		let best = wallet.current_best_block();
+		let header = header_on(best.block_hash, nonce);
+		let txdata: Vec<(usize, &Transaction)> = txs.iter().copied().enumerate().collect();
+		wallet.filtered_block_connected(&header, &txdata, best.height + 1);
+	}
+
+	/// A fresh wallet holding one confirmed coin of [`FUNDING_SATS`] — the incident's node.
+	fn wallet_with_one_confirmed_coin() -> (Arc<Wallet>, Transaction) {
+		let h = harness(&[], false);
+		let coin = deposit(&h.wallet, 7);
+		mine(&h.wallet, &[&coin], 1);
+		(h.wallet, coin)
+	}
+
+	fn channel_output(seed: u8) -> ScriptBuf {
+		ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::hash(&[seed]))
+	}
+
+	/// A channel funding the way the event handler builds one: by the wallet, with the
+	/// broadcast policy the open asked for registered under its txid.
+	fn funding(wallet: &Wallet, seed: u8, sats: u64, policy: BroadcastPolicy) -> Transaction {
+		let tx = wallet
+			.create_funding_transaction(
+				channel_output(seed),
+				Amount::from_sat(sats),
+				crate::fee_estimator::ConfirmationTarget::ChannelFunding,
+				absolute::LockTime::ZERO,
+			)
+			.expect("the wallet funds the channel");
+		wallet.broadcast_queue().register(tx.compute_txid(), policy, unix_now());
+		tx
+	}
+
+	fn unix_now() -> u64 {
+		SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+	}
+
+	fn spends_output_of(child: &Transaction, parent: &Transaction) -> bool {
+		let parent_txid = parent.compute_txid();
+		child.input.iter().any(|input| input.previous_output.txid == parent_txid)
+	}
+
+	fn state_of(wallet: &Wallet, txid: Txid) -> Option<BroadcastQueueState> {
+		wallet
+			.broadcast_queue()
+			.list(|_| false)
+			.into_iter()
+			.find(|entry| entry.txid == txid)
+			.map(|entry| entry.state)
+	}
+
+	/// Two opens from one coin in the same second; the second peer answered `funding_signed`
+	/// first, so LDK handed the child to the broadcaster before its parent (mainnet,
+	/// 2026-10-28). Each funding is its own package, as LDK sends them. The child must go out
+	/// once its parent is out, instead of being given up with its channel left pending forever.
+	#[tokio::test]
+	async fn a_funding_refused_for_its_unsent_parent_is_held_and_sent_once_the_parent_is_out() {
+		let (wallet, _coin) = wallet_with_one_confirmed_coin();
+		let parent = funding(&wallet, 1, 24_000, BroadcastPolicy::default());
+		let child = funding(&wallet, 2, 24_000, BroadcastPolicy::default());
+		assert!(spends_output_of(&child, &parent), "the second funding spends the first's change");
+		let network = FakeNetwork::new(&[&parent]);
+		let h = network_harness(&network, Some(Arc::clone(&wallet)));
+
+		h.broadcaster.broadcast_transactions(&[&child]);
+		h.broadcaster.broadcast_transactions(&[&parent]);
+		let _ =
+			tokio::time::timeout(Duration::from_millis(2_500), h.layer.process_broadcast_queue())
+				.await;
+
+		assert_eq!(
+			network.sent(),
+			vec![parent.compute_txid(), child.compute_txid()],
+			"the child is sent right after its parent"
+		);
+		assert!(
+			unconfirmed_txids(&wallet).contains(&child.compute_txid()),
+			"the child's inputs were never released"
+		);
+		assert_eq!(state_of(&wallet, child.compute_txid()), None, "nothing is left queued");
+	}
+
+	/// While its parent is not out, a refused child is held: its inputs stay reserved, a sync
+	/// that finds it in no mempool does not evict it, and the queue shows why it waits.
+	#[tokio::test]
+	async fn a_held_child_keeps_its_inputs_reserved_through_a_sync() {
+		let (wallet, _coin) = wallet_with_one_confirmed_coin();
+		let parent = funding(&wallet, 1, 24_000, BroadcastPolicy::default());
+		let child = funding(&wallet, 2, 24_000, BroadcastPolicy::default());
+		let network = FakeNetwork::new(&[&parent]);
+		let h = network_harness(&network, Some(Arc::clone(&wallet)));
+
+		h.layer.broadcast_package(vec![child.clone()]).await;
+
+		assert!(network.sent().is_empty());
+		assert_eq!(state_of(&wallet, child.compute_txid()), Some(BroadcastQueueState::Waiting));
+		let entry = wallet
+			.broadcast_queue()
+			.list(|_| false)
+			.into_iter()
+			.find(|e| e.txid == child.compute_txid())
+			.unwrap();
+		assert!(entry.waiting_on.contains(&parent.compute_txid()));
+		assert_eq!(entry.attempts, 1);
+		assert!(entry.last_error.as_deref().unwrap_or("").contains("missingorspent"));
+
+		// A mempool view without the child (Electrum's sync, bitcoind's poll) evicts nothing.
+		wallet
+			.apply_mempool_txs(Vec::new(), vec![(child.compute_txid(), unix_now())])
+			.expect("applying a mempool view");
+		assert!(unconfirmed_txids(&wallet).contains(&child.compute_txid()));
+	}
+
+	/// Parents first inside one package, too: a backend sends a package one transaction at a
+	/// time, in order.
+	#[tokio::test]
+	async fn a_package_goes_out_parents_first() {
+		let (wallet, _coin) = wallet_with_one_confirmed_coin();
+		let parent = funding(&wallet, 1, 24_000, BroadcastPolicy::DropOnReject);
+		let child = funding(&wallet, 2, 24_000, BroadcastPolicy::DropOnReject);
+		let network = FakeNetwork::new(&[&parent]);
+		let h = network_harness(&network, Some(Arc::clone(&wallet)));
+
+		h.layer.broadcast_package(vec![child.clone(), parent.clone()]).await;
+
+		assert_eq!(network.sent(), vec![parent.compute_txid(), child.compute_txid()]);
+	}
+
+	/// `DropOnReject` keeps the behaviour every transaction had before the queue: refused for a
+	/// missing input, the child is given up at once and its inputs released.
+	#[tokio::test]
+	async fn drop_on_reject_gives_a_refused_child_up_at_once() {
+		let (wallet, _coin) = wallet_with_one_confirmed_coin();
+		let parent = funding(&wallet, 1, 24_000, BroadcastPolicy::default());
+		let child = funding(&wallet, 2, 24_000, BroadcastPolicy::DropOnReject);
+		let network = FakeNetwork::new(&[&parent]);
+		let h = network_harness(&network, Some(Arc::clone(&wallet)));
+
+		h.layer.broadcast_package(vec![child.clone()]).await;
+		h.layer.broadcast_package(vec![parent.clone()]).await;
+		h.layer.retry_held_broadcasts().await;
+
+		assert_eq!(network.sent(), vec![parent.compute_txid()], "the child is never sent again");
+		assert!(!unconfirmed_txids(&wallet).contains(&child.compute_txid()), "and evicted");
+		assert_eq!(state_of(&wallet, child.compute_txid()), None, "nor recorded as given up");
+	}
+
+	/// An input spent by a different transaction that confirmed is the definitive answer: the
+	/// held transaction is given up, its inputs released, and the give-up recorded.
+	#[tokio::test]
+	async fn a_held_transaction_whose_input_a_confirmed_spend_took_is_given_up() {
+		let (wallet, coin) = wallet_with_one_confirmed_coin();
+		let held = funding(&wallet, 1, 24_000, BroadcastPolicy::default());
+		let network = FakeNetwork::refusing(held.compute_txid(), "Missing inputs (-25)");
+		let h = network_harness(&network, Some(Arc::clone(&wallet)));
+		h.layer.broadcast_package(vec![held.clone()]).await;
+		assert_eq!(state_of(&wallet, held.compute_txid()), Some(BroadcastQueueState::Waiting));
+
+		let conflict = tx_paying(
+			OutPoint { txid: coin.compute_txid(), vout: 0 },
+			FUNDING_SATS - 500,
+			someone_elses_script(),
+		);
+		mine(&wallet, &[&conflict], 2);
+		h.layer.broadcast_package(vec![held.clone()]).await;
+
+		assert!(matches!(
+			state_of(&wallet, held.compute_txid()),
+			Some(BroadcastQueueState::Abandoned { .. })
+		));
+		assert!(!unconfirmed_txids(&wallet).contains(&held.compute_txid()), "inputs released");
+		assert!(wallet.broadcast_queue().definitively_abandoned().contains(&held.compute_txid()));
+	}
+
+	/// A refusal for any other reason than a missing input is final for a queued transaction
+	/// too, and recorded so the dead-funding reaper can close its channel.
+	#[tokio::test]
+	async fn a_queued_transaction_refused_for_another_reason_is_given_up() {
+		let (wallet, _coin) = wallet_with_one_confirmed_coin();
+		let funding_tx = funding(&wallet, 1, 24_000, BroadcastPolicy::default());
+		let network = FakeNetwork::refusing(
+			funding_tx.compute_txid(),
+			"min relay fee not met, 0 < 110 (-26)",
+		);
+		let h = network_harness(&network, Some(Arc::clone(&wallet)));
+
+		h.layer.broadcast_package(vec![funding_tx.clone()]).await;
+
+		assert!(matches!(
+			state_of(&wallet, funding_tx.compute_txid()),
+			Some(BroadcastQueueState::Abandoned { .. })
+		));
+		assert!(!unconfirmed_txids(&wallet).contains(&funding_tx.compute_txid()));
+		assert_eq!(wallet.get_balances(0).expect("balances").1, FUNDING_SATS);
+	}
+
+	/// No backend answering is no verdict: a queued transaction is held, an unregistered one is
+	/// dropped as before.
+	#[tokio::test]
+	async fn an_exhausted_chain_holds_queued_transactions_and_drops_the_rest() {
+		let (wallet, _coin) = wallet_with_one_confirmed_coin();
+		let queued = funding(&wallet, 1, 24_000, BroadcastPolicy::default());
+		let other = unrelated(9);
+		let down = FakeBroadcast::new("down", Behaviour::Unavailable);
+		let h = harness_with_wallet(&[down], false, Arc::clone(&wallet));
+
+		h.layer.broadcast_package(vec![queued.clone(), other.clone()]).await;
+
+		assert_eq!(state_of(&wallet, queued.compute_txid()), Some(BroadcastQueueState::Waiting));
+		assert_eq!(state_of(&wallet, other.compute_txid()), None);
+		assert!(
+			!wallet.broadcast_queue().definitively_abandoned().contains(&queued.compute_txid()),
+			"nothing said no"
+		);
+	}
+
+	/// A batch whose order is not visible in the inputs: `second` waits, unsent, until `first`
+	/// is out, then goes on the next retry.
+	#[tokio::test]
+	async fn an_explicit_dependency_holds_a_transaction_until_it_is_out() {
+		let (wallet, _coin) = wallet_with_one_confirmed_coin();
+		let first = funding(&wallet, 1, 24_000, BroadcastPolicy::default());
+		let second = unrelated(5);
+		let policy = BroadcastPolicy::QueueUntilParents {
+			max_age_secs: 3_600,
+			depends_on: vec![first.compute_txid()],
+		};
+		wallet.broadcast_queue().register(second.compute_txid(), policy, unix_now());
+		let network = FakeNetwork::new(&[]);
+		let h = network_harness(&network, Some(Arc::clone(&wallet)));
+
+		h.layer.broadcast_package(vec![second.clone()]).await;
+		assert!(network.sent().is_empty(), "never sent before its dependency");
+		h.layer.broadcast_package(vec![first.clone()]).await;
+		h.layer.retry_held_broadcasts().await;
+
+		assert_eq!(network.sent(), vec![first.compute_txid(), second.compute_txid()]);
 	}
 
 	#[tokio::test]

@@ -7,6 +7,7 @@
 
 use persist::KVStoreWalletPersister;
 
+use crate::broadcast_queue::{BroadcastPolicy, BroadcastQueue};
 use crate::config::Config;
 use crate::dead_funding::{find_dead_fundings, DeadFundingProof};
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger};
@@ -35,6 +36,7 @@ use lightning::util::message_signing;
 use lightning_invoice::RawBolt11Invoice;
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
+use bdk_chain::ChainOracle;
 use bdk_wallet::{Balance, KeychainKind, PersistedWallet, SignOptions, Update};
 
 use bitcoin::address::NetworkUnchecked;
@@ -66,6 +68,16 @@ fn unix_now_secs() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Whether `txid` is anchored in a block of `wallet`'s best chain.
+fn confirmed_in(wallet: &PersistedWallet<KVStoreWalletPersister>, txid: &Txid) -> bool {
+	let tip = wallet.latest_checkpoint().block_id();
+	wallet.tx_graph().all_anchors().get(txid).map_or(false, |anchors| {
+		anchors.iter().any(|anchor| {
+			matches!(wallet.local_chain().is_block_in_chain(anchor.block_id, tip), Ok(Some(true)))
+		})
+	})
+}
+
 pub(crate) enum OnchainSendAmount {
 	ExactRetainingReserve { amount_sats: u64, cur_anchor_reserve_sats: u64 },
 	AllRetainingReserve { cur_anchor_reserve_sats: u64 },
@@ -85,6 +97,9 @@ where
 	inner: Mutex<PersistedWallet<KVStoreWalletPersister>>,
 	persister: Mutex<KVStoreWalletPersister>,
 	broadcaster: B,
+	/// The broadcast policy of every transaction this wallet builds, and the ones held for a
+	/// rebroadcast, whose inputs stay reserved; see [`crate::broadcast_queue`].
+	broadcast_queue: Arc<BroadcastQueue>,
 	fee_estimator: E,
 	payment_store: Arc<PaymentStore>,
 	config: Arc<Config>,
@@ -97,14 +112,30 @@ where
 	E::Target: FeeEstimator,
 	L::Target: LdkLogger,
 {
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		wallet: bdk_wallet::PersistedWallet<KVStoreWalletPersister>,
-		wallet_persister: KVStoreWalletPersister, broadcaster: B, fee_estimator: E,
-		payment_store: Arc<PaymentStore>, config: Arc<Config>, logger: L,
+		wallet_persister: KVStoreWalletPersister, broadcaster: B,
+		broadcast_queue: Arc<BroadcastQueue>, fee_estimator: E, payment_store: Arc<PaymentStore>,
+		config: Arc<Config>, logger: L,
 	) -> Self {
 		let inner = Mutex::new(wallet);
 		let persister = Mutex::new(wallet_persister);
-		Self { inner, persister, broadcaster, fee_estimator, payment_store, config, logger }
+		Self {
+			inner,
+			persister,
+			broadcaster,
+			broadcast_queue,
+			fee_estimator,
+			payment_store,
+			config,
+			logger,
+		}
+	}
+
+	/// The broadcast policies and held transactions of this wallet's own transactions.
+	pub(crate) fn broadcast_queue(&self) -> &Arc<BroadcastQueue> {
+		&self.broadcast_queue
 	}
 
 	pub(crate) fn get_full_scan_request(&self) -> FullScanRequest<KeychainKind> {
@@ -242,6 +273,10 @@ where
 	}
 
 	pub(crate) fn apply_update(&self, update: impl Into<Update>) -> Result<(), Error> {
+		let mut update: Update = update.into();
+		// A transaction held for a rebroadcast is absent from every mempool by definition; its
+		// inputs stay reserved until the broadcast queue sends it or gives it up.
+		update.tx_update.evicted_ats.retain(|(txid, _)| !self.broadcast_queue.is_held(txid));
 		let mut locked_wallet = self.inner.lock().unwrap();
 		match locked_wallet.apply_update(update) {
 			Ok(()) => {
@@ -266,8 +301,10 @@ where
 	}
 
 	pub(crate) fn apply_mempool_txs(
-		&self, unconfirmed_txs: Vec<(Transaction, u64)>, evicted_txids: Vec<(Txid, u64)>,
+		&self, unconfirmed_txs: Vec<(Transaction, u64)>, mut evicted_txids: Vec<(Txid, u64)>,
 	) -> Result<(), Error> {
+		// See `apply_update`: a held transaction is not evicted on a mempool's word.
+		evicted_txids.retain(|(txid, _)| !self.broadcast_queue.is_held(txid));
 		let mut locked_wallet = self.inner.lock().unwrap();
 		locked_wallet.apply_unconfirmed_txs(unconfirmed_txs);
 		locked_wallet.apply_evicted_txs(evicted_txids);
@@ -416,31 +453,101 @@ where
 	/// Hands the inputs of a funding transaction built by [`Self::create_funding_transaction`]
 	/// back to coin selection, for a funding LDK will never broadcast (the channel closed
 	/// first, or `funding_transaction_generated` refused it).
+	///
+	/// Nothing will ever broadcast it, so it is given up for good
+	/// ([`Self::give_up_transaction`]): with it every transaction built on its outputs — a
+	/// second funding on its change, say — whose inputs are released alongside, and the
+	/// dead-funding reaper then closes their channels ([`crate::dead_funding`]).
 	pub(crate) fn release_funding_transaction(&self, txid: Txid) -> Result<(), Error> {
-		let mut locked_wallet = self.inner.lock().unwrap();
-		if locked_wallet.tx_graph().get_tx(txid).is_none() {
+		let known = self.inner.lock().unwrap().tx_graph().get_tx(txid).is_some();
+		if !known {
 			return Ok(());
 		}
-		locked_wallet.apply_evicted_txs(vec![(txid, unix_now_secs())]);
+		let given_up = self.give_up_transaction(
+			txid,
+			"LDK discarded the funding before broadcasting it".to_string(),
+			true,
+		)?;
+		for child in given_up.iter().filter(|t| **t != txid) {
+			log_info!(
+				self.logger,
+				"Gave up transaction {}: it depends on discarded funding transaction {}",
+				child,
+				txid
+			);
+		}
+		log_debug!(self.logger, "Released the inputs of discarded funding transaction {}", txid);
+		Ok(())
+	}
 
+	/// Gives `txid` up for good in the broadcast queue with `reason` — `definitive` when that
+	/// proves it can never confirm, which the dead-funding reaper acts on — and with it every
+	/// transaction depending on it: the queued ones, and every unconfirmed descendant in the
+	/// wallet's graph, whether or not it was ever broadcast. Releases the inputs of all of
+	/// them, and returns their txids, `txid` first.
+	///
+	/// The descendants go too because a canonical child keeps its parent canonical: releasing
+	/// a funding while the funding built on its change stays reserved would release nothing.
+	pub(crate) fn give_up_transaction(
+		&self, txid: Txid, reason: String, definitive: bool,
+	) -> Result<Vec<Txid>, Error> {
+		let now = unix_now_secs();
+		let mut given_up = self.broadcast_queue.abandon(txid, reason, definitive, now);
+
+		let descendants: Vec<Txid> = {
+			let locked_wallet = self.inner.lock().unwrap();
+			let graph = locked_wallet.tx_graph();
+			let mut descendants: Vec<Txid> = Vec::new();
+			for ancestor in &given_up {
+				for descendant in graph.walk_descendants(*ancestor, |_, d| Some(d)) {
+					if !given_up.contains(&descendant)
+						&& !descendants.contains(&descendant)
+						&& !confirmed_in(&locked_wallet, &descendant)
+					{
+						descendants.push(descendant);
+					}
+				}
+			}
+			descendants
+		};
+		for descendant in descendants {
+			if given_up.contains(&descendant) {
+				continue;
+			}
+			let reason = format!("it depends on {}, which was given up", txid);
+			given_up.extend(self.broadcast_queue.abandon(descendant, reason, true, now));
+		}
+		let mut seen = HashSet::new();
+		given_up.retain(|t| seen.insert(*t));
+
+		let mut locked_wallet = self.inner.lock().unwrap();
+		let evicted: Vec<(Txid, u64)> = given_up
+			.iter()
+			.filter(|t| locked_wallet.tx_graph().get_tx(**t).is_some())
+			.map(|t| (*t, now))
+			.collect();
+		if evicted.is_empty() {
+			return Ok(given_up);
+		}
+		locked_wallet.apply_evicted_txs(evicted);
 		let mut locked_persister = self.persister.lock().unwrap();
 		locked_wallet.persist(&mut locked_persister).map_err(|e| {
 			log_error!(self.logger, "Failed to persist wallet: {}", e);
 			Error::PersistenceFailed
 		})?;
-		log_debug!(self.logger, "Released the inputs of discarded funding transaction {}", txid);
-
-		Ok(())
+		Ok(given_up)
 	}
 
 	/// Which of `candidates` — funding transactions this wallet built — can never confirm, by
 	/// the wallet's own view of the chain, each with the proof. See [`crate::dead_funding`].
 	///
 	/// `known_dead` are fundings proven dead on an earlier pass, so a child of one is still
-	/// caught once its parent's monitor is gone.
+	/// caught once its parent's monitor is gone. The transactions the broadcast queue gave up
+	/// for good count as dead by this node's own word.
 	pub(crate) fn find_dead_fundings(
 		&self, candidates: impl IntoIterator<Item = Txid>, known_dead: &HashSet<Txid>,
 	) -> HashMap<Txid, DeadFundingProof> {
+		let abandoned = self.broadcast_queue.definitively_abandoned();
 		let locked_wallet = self.inner.lock().unwrap();
 		let tip = locked_wallet.latest_checkpoint().block_id();
 		find_dead_fundings(
@@ -449,7 +556,30 @@ where
 			tip,
 			candidates,
 			known_dead,
+			&abandoned,
 		)
+	}
+
+	/// Whether `txid` is confirmed on the wallet's best chain.
+	pub(crate) fn is_tx_confirmed(&self, txid: &Txid) -> bool {
+		let locked_wallet = self.inner.lock().unwrap();
+		confirmed_in(&locked_wallet, txid)
+	}
+
+	/// An input of `tx` spent by a different transaction confirmed on the wallet's best chain —
+	/// the definitive answer that `tx` can never confirm — with that transaction.
+	pub(crate) fn confirmed_conflict(&self, tx: &Transaction) -> Option<(bitcoin::OutPoint, Txid)> {
+		let txid = tx.compute_txid();
+		let locked_wallet = self.inner.lock().unwrap();
+		tx.input.iter().find_map(|input| {
+			let outpoint = input.previous_output;
+			locked_wallet
+				.tx_graph()
+				.outspends(outpoint)
+				.iter()
+				.find(|spender| **spender != txid && confirmed_in(&locked_wallet, spender))
+				.map(|spender| (outpoint, *spender))
+		})
 	}
 
 	/// Builds a fully-signed funding transaction paying `amount` to an arbitrary `output_script`
@@ -457,14 +587,22 @@ where
 	/// with the supplied `locktime`. The returned [`Transaction`] is signed and persisted but **not**
 	/// broadcast; its inputs are reserved in the wallet exactly as for a channel funding.
 	///
-	/// This is a thin swaps-gated wrapper over [`Wallet::create_funding_transaction`]; it does not
-	/// alter the existing behaviour of that method in any way.
+	/// A swaps-gated wrapper over [`Wallet::create_funding_transaction`] that also registers the
+	/// default [`BroadcastPolicy`] for the transaction, so a swap funding refused for a missing
+	/// input is held and rebroadcast like a channel funding.
 	#[cfg(feature = "swaps")]
 	pub(crate) fn create_swap_funding_tx(
 		&self, output_script: ScriptBuf, amount: Amount, confirmation_target: ConfirmationTarget,
 		locktime: LockTime,
 	) -> Result<Transaction, Error> {
-		self.create_funding_transaction(output_script, amount, confirmation_target, locktime)
+		let tx =
+			self.create_funding_transaction(output_script, amount, confirmation_target, locktime)?;
+		self.broadcast_queue.register(
+			tx.compute_txid(),
+			BroadcastPolicy::default(),
+			unix_now_secs(),
+		);
+		Ok(tx)
 	}
 
 	/// Lists the wallet's confirmed, unspent outputs as [`Utxo`]s.
@@ -558,7 +696,7 @@ where
 
 	pub(crate) fn send_to_address(
 		&self, address: &bitcoin::Address, send_amount: OnchainSendAmount,
-		fee_rate: Option<FeeRate>,
+		fee_rate: Option<FeeRate>, broadcast_policy: BroadcastPolicy,
 	) -> Result<Txid, Error> {
 		self.parse_and_validate_address(self.config.network, &address)?;
 
@@ -737,9 +875,9 @@ where
 			})?
 		};
 
-		self.broadcaster.broadcast_transactions(&[&tx]);
-
 		let txid = tx.compute_txid();
+		self.broadcast_queue.register(txid, broadcast_policy, unix_now_secs());
+		self.broadcaster.broadcast_transactions(&[&tx]);
 
 		match send_amount {
 			OnchainSendAmount::ExactRetainingReserve { amount_sats, .. } => {
@@ -1425,6 +1563,8 @@ mod chain_listen_tests {
 	use lightning::util::test_utils::TestStore;
 
 	use super::persist::KVStoreWalletPersister;
+	use super::{unix_now_secs, Update};
+	use crate::broadcast_queue::{BroadcastPolicy, BroadcastQueue};
 	use crate::config::Config;
 	use crate::dead_funding::DeadFundingProof;
 	use crate::fee_estimator::OnchainFeeEstimator;
@@ -1458,6 +1598,7 @@ mod chain_listen_tests {
 			bdk_wallet,
 			persister,
 			Arc::new(TransactionBroadcaster::new(Arc::clone(&logger))),
+			Arc::new(BroadcastQueue::read_or_empty(Arc::clone(&kv_store), Arc::clone(&logger))),
 			Arc::new(OnchainFeeEstimator::new()),
 			payment_store,
 			config,
@@ -1620,6 +1761,74 @@ mod chain_listen_tests {
 		assert!(spends(&funding, coin));
 	}
 
+	/// LDK discarded the first funding of two built from one coin: nothing will broadcast it,
+	/// so the second — built on its change, and queued — is given up with it, both are released,
+	/// and the reaper counts both as dead, so the second's channel is closed rather than left
+	/// waiting for a funding that can never confirm.
+	#[test]
+	fn discarding_a_funding_gives_up_its_queued_children_and_proves_them_dead() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let first = fund_channel(&wallet, 1, 12_000).expect("the coin funds the first channel");
+		let second = fund_channel(&wallet, 2, 12_000).expect("its change funds the second");
+		assert!(second.input.iter().all(|i| i.previous_output.txid == first.compute_txid()));
+		for tx in [&first, &second] {
+			wallet.broadcast_queue().register(tx.compute_txid(), BroadcastPolicy::default(), 1);
+		}
+
+		wallet.release_funding_transaction(first.compute_txid()).expect("release");
+
+		let unconfirmed = wallet.get_unconfirmed_txids();
+		assert!(!unconfirmed.contains(&first.compute_txid()));
+		assert!(!unconfirmed.contains(&second.compute_txid()), "the child is released too");
+		assert!(spends(&fund_channel(&wallet, 3, 30_000).expect("coin is back"), coin));
+
+		let found = dead(&wallet, &[&first, &second]);
+		assert_eq!(found.get(&first.compute_txid()), Some(&DeadFundingProof::Abandoned));
+		assert_eq!(
+			found.get(&second.compute_txid()),
+			Some(&DeadFundingProof::DeadParent { parent_txid: first.compute_txid() })
+		);
+	}
+
+	/// A held transaction is absent from every mempool by definition: neither a mempool view nor
+	/// a chain-source update evicts it, while an unheld one is evicted as before.
+	#[test]
+	fn a_held_transaction_survives_every_eviction_path() {
+		let (wallet, _store, _coin) = wallet_with_one_confirmed_coin();
+		let held = fund_channel(&wallet, 1, 12_000).expect("first");
+		let unheld = fund_channel(&wallet, 2, 12_000).expect("second");
+		let queue = wallet.broadcast_queue();
+		queue.register(held.compute_txid(), BroadcastPolicy::default(), 1);
+		queue.hold(&held, "Missing inputs (-25)".to_string(), true, 1);
+
+		let mut update = Update::default();
+		update.tx_update.evicted_ats.insert((held.compute_txid(), unix_now_secs() + 5));
+		update.tx_update.evicted_ats.insert((unheld.compute_txid(), unix_now_secs() + 5));
+		wallet.apply_update(update).expect("an update applies");
+
+		let unconfirmed = wallet.get_unconfirmed_txids();
+		assert!(unconfirmed.contains(&held.compute_txid()), "the held one stays reserved");
+		assert!(!unconfirmed.contains(&unheld.compute_txid()), "the other is evicted as before");
+	}
+
+	#[test]
+	fn a_confirmed_spend_of_an_input_is_a_conflict_and_the_spend_itself_is_not() {
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let ours = fund_channel(&wallet, 1, 12_000).expect("ours");
+		assert_eq!(wallet.confirmed_conflict(&ours), None, "nothing else spends the coin");
+
+		let theirs = competing_funding(coin, 9, 12_000);
+		mine(&wallet, Some(&theirs), 50);
+
+		assert!(wallet.is_tx_confirmed(&theirs.compute_txid()));
+		assert_eq!(wallet.confirmed_conflict(&ours), Some((coin, theirs.compute_txid())));
+		assert_eq!(
+			wallet.confirmed_conflict(&theirs),
+			None,
+			"a confirmed tx does not conflict itself"
+		);
+	}
+
 	#[test]
 	fn watched_scripts_cover_both_keychains_and_the_lookahead() {
 		let (wallet, _store) = fresh_wallet();
@@ -1690,9 +1899,12 @@ mod chain_listen_tests {
 			a2.input.iter().all(|input| input.previous_output.txid == a.compute_txid()),
 			"A2 is built on the change of A"
 		);
-		// The network rejected A: the BROADCAST tail hands its inputs back. A2 is still
-		// "seen" as far as the wallet knows, which must not shield either of them.
-		wallet.release_funding_transaction(a.compute_txid()).expect("release");
+		// The network rejected A, which was not queued: the BROADCAST tail hands its inputs
+		// back. A2 is still "seen" as far as the wallet knows, which must not shield either of
+		// them. Only the chain proves them dead here — nothing this node gave up.
+		wallet
+			.apply_mempool_txs(Vec::new(), vec![(a.compute_txid(), unix_now_secs())])
+			.expect("evict");
 		let b = competing_funding(coin, 3, 30_000);
 		let b_height = mine(wallet, Some(&b), 77);
 		(a, a2, b, b_height)
@@ -1745,8 +1957,10 @@ mod chain_listen_tests {
 		mine_empty(&wallet, 20);
 		assert!(dead(&wallet, &[&a, &a2]).is_empty(), "unconfirmed, but nothing took its coin");
 
-		// Released, and another spend of the coin seen in the mempool: still no proof.
-		wallet.release_funding_transaction(a.compute_txid()).expect("release");
+		// Evicted from the mempool, and another spend of the coin seen there: still no proof.
+		wallet
+			.apply_mempool_txs(Vec::new(), vec![(a.compute_txid(), unix_now_secs())])
+			.expect("evict");
 		let b = competing_funding(coin, 3, 30_000);
 		wallet.apply_mempool_txs(vec![(b.clone(), 5)], Vec::new()).expect("apply");
 		assert!(dead(&wallet, &[&a, &a2, &b]).is_empty(), "two pending spends prove nothing");

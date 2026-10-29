@@ -89,6 +89,18 @@ pub(crate) fn classify_sendrawtransaction(code: i64, message: &str) -> TxBroadca
 	}
 }
 
+/// Whether a `Rejected` reason produced by [`classify_sendrawtransaction`] says an input is
+/// missing — not yet on the network, or spent. Every backend that can give a verdict
+/// (bitcoind RPC and REST, Esplora and Electrum relaying bitcoind) folds its refusal through
+/// that table, so this one test covers all of them; CBF peers and a Dependent node's provider
+/// never answer a verdict at all.
+///
+/// The broadcast queue holds a transaction refused for this reason rather than giving it up:
+/// its parent may simply not be out yet ([`crate::broadcast_queue`]).
+pub(crate) fn is_missing_inputs_rejection(reason: &str) -> bool {
+	REJECT_MISSING_INPUTS.iter().any(|missing| reason.contains(missing))
+}
+
 /// The JSON electrs relays after the marker.
 #[derive(Deserialize)]
 struct RelayedRpcError {
@@ -137,6 +149,32 @@ mod tests {
 
 	fn rejected(outcome: &TxBroadcastOutcome) -> bool {
 		matches!(outcome, TxBroadcastOutcome::Rejected(_))
+	}
+
+	/// The reason a missing-input verdict carries is what the broadcast queue recognises, from
+	/// bitcoind's RPC directly and from electrs relaying it over HTTP or Electrum; a policy
+	/// refusal is not.
+	#[test]
+	fn missing_input_verdicts_are_recognised_from_every_backend() {
+		let reason = |outcome: Option<TxBroadcastOutcome>| match outcome {
+			Some(TxBroadcastOutcome::Rejected(reason)) => reason,
+			other => panic!("not a verdict: {:?}", other),
+		};
+		let direct = reason(Some(classify_sendrawtransaction(-25, "Missing inputs")));
+		let relayed = reason(classify_relayed_sendrawtransaction(
+			r#"sendrawtransaction RPC error: {"code":-25,"message":"bad-txns-inputs-missingorspent"}"#,
+		));
+		let electrum = reason(classify_electrum_protocol_error(&json!(
+			r#"sendrawtransaction RPC error: {"code":-25,"message":"missing-inputs"}"#
+		)));
+		for missing in [&direct, &relayed, &electrum] {
+			assert!(is_missing_inputs_rejection(missing), "{}", missing);
+		}
+
+		let policy = reason(Some(classify_sendrawtransaction(-26, "txn-mempool-conflict")));
+		assert!(!is_missing_inputs_rejection(&policy));
+		let fee = reason(Some(classify_sendrawtransaction(-26, "min relay fee not met")));
+		assert!(!is_missing_inputs_rejection(&fee));
 	}
 
 	fn unavailable(outcome: &TxBroadcastOutcome) -> bool {
