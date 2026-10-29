@@ -505,9 +505,15 @@ pub const MAX_FILTERS_PER_REQUEST: u32 = 100;
 /// `getcfheaders` batch. The serving node may answer a prefix of the span.
 pub const MAX_FILTER_HEADERS_PER_REQUEST: u32 = 2000;
 
+/// The most bytes the asking node's host accepts as one peer reply — the host
+/// transport's `MAX_RAW_RESPONSE_BYTES`. A longer reply is refused whole
+/// ("peer response exceeds the 1 MiB cap"), so every raw reply, hex and JSON
+/// envelope included, must stay under it.
+pub const MAX_PEER_REPLY_BYTES: usize = 1024 * 1024;
+
 /// Raw bytes per [`WireBlockChunk`]. Hex doubles it, so a chunk reply stays
-/// near 1.5 MiB — well under the 2 MiB a relayed message may carry.
-pub const BLOCK_CHUNK_BYTES: usize = 768 * 1024;
+/// near 768 KiB — under [`MAX_PEER_REPLY_BYTES`] with room for the envelope.
+pub const BLOCK_CHUNK_BYTES: usize = 384 * 1024;
 
 /// The serving node's raw source's best block — where a filter-following
 /// node learns how far to ask.
