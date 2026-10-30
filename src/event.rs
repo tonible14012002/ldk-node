@@ -508,8 +508,12 @@ where
 				counterparty_node_id,
 				channel_value_satoshis,
 				output_script,
-				..
+				user_channel_id,
 			} => {
+				// What the open asked the broadcast to do with this funding; LDK hands it to
+				// the broadcaster later, when the peer answers `funding_signed`.
+				let broadcast_policy =
+					self.wallet.broadcast_queue().take_pending_open(user_channel_id);
 				// Construct the raw transaction with the output that is paid the amount of the
 				// channel.
 				let confirmation_target = ConfirmationTarget::ChannelFunding;
@@ -528,6 +532,14 @@ where
 				) {
 					Ok(final_tx) => {
 						let funding_txid = final_tx.compute_txid();
+						self.wallet.broadcast_queue().register(
+							funding_txid,
+							broadcast_policy,
+							SystemTime::now()
+								.duration_since(UNIX_EPOCH)
+								.map(|d| d.as_secs())
+								.unwrap_or(0),
+						);
 						// Give the funding transaction back to LDK for opening the channel.
 						match self.channel_manager.funding_transaction_generated(
 							temporary_channel_id,
@@ -1512,6 +1524,9 @@ where
 				..
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
+				// An open the peer refused, or that failed, before LDK asked for its funding
+				// leaves the policy it asked for behind; nothing would ever take it.
+				self.wallet.broadcast_queue().forget_pending_open(user_channel_id);
 
 				let event = Event::ChannelClosed {
 					channel_id,

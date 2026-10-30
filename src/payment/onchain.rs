@@ -7,6 +7,7 @@
 
 //! Holds a payment handler allowing to send and receive on-chain payments.
 
+use crate::broadcast_queue::BroadcastPolicy;
 use crate::config::Config;
 use crate::error::Error;
 use crate::logger::{log_info, LdkLogger, Logger};
@@ -72,8 +73,26 @@ impl OnchainPayment {
 	/// a reasonable estimate from the configured chain source.
 	///
 	/// [`BalanceDetails::total_anchor_channels_reserve_sats`]: crate::BalanceDetails::total_anchor_channels_reserve_sats
+	///
+	/// The transaction gets the default [`BroadcastPolicy`]: refused for a missing input, it is
+	/// held and broadcast again; see [`Self::send_to_address_with_policy`].
 	pub fn send_to_address(
 		&self, address: &bitcoin::Address, amount_sats: u64, fee_rate: Option<FeeRate>,
+	) -> Result<Txid, Error> {
+		self.send_to_address_with_policy(address, amount_sats, fee_rate, BroadcastPolicy::default())
+	}
+
+	/// Send an on-chain payment to the given address, as [`Self::send_to_address`], saying what
+	/// the broadcast does when the network does not take the transaction.
+	///
+	/// [`BroadcastPolicy::QueueUntilParents`] holds a transaction refused for a missing input —
+	/// it spends the change of a transaction not on the network yet — or that no chain backend
+	/// could be asked about, keeping its inputs reserved, and broadcasts it again once a parent
+	/// is out. [`BroadcastPolicy::DropOnReject`] gives it up at the first refusal and offers its
+	/// inputs to coin selection again.
+	pub fn send_to_address_with_policy(
+		&self, address: &bitcoin::Address, amount_sats: u64, fee_rate: Option<FeeRate>,
+		broadcast_policy: BroadcastPolicy,
 	) -> Result<Txid, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -85,7 +104,7 @@ impl OnchainPayment {
 		let send_amount =
 			OnchainSendAmount::ExactRetainingReserve { amount_sats, cur_anchor_reserve_sats };
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
-		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
+		self.wallet.send_to_address(address, send_amount, fee_rate_opt, broadcast_policy)
 	}
 
 	/// Send an on-chain payment to the given address, draining the available funds.
@@ -120,6 +139,6 @@ impl OnchainPayment {
 		};
 
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
-		self.wallet.send_to_address(address, send_amount, fee_rate_opt)
+		self.wallet.send_to_address(address, send_amount, fee_rate_opt, BroadcastPolicy::default())
 	}
 }
