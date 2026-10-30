@@ -1524,6 +1524,9 @@ where
 				..
 			} => {
 				log_info!(self.logger, "Channel {} closed due to: {}", channel_id, reason);
+				// An open the peer refused, or that failed, before LDK asked for its funding
+				// leaves the policy it asked for behind; nothing would ever take it.
+				self.wallet.broadcast_queue().forget_pending_open(user_channel_id);
 
 				let event = Event::ChannelClosed {
 					channel_id,
