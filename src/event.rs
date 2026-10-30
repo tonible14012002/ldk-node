@@ -1125,16 +1125,14 @@ where
 				self.payment_store.get(&payment_id).map(|payment| {
 					log_info!(
 						self.logger,
-						"Successfully sent payment of {}msat{} from \
-						payment hash {:?} with preimage {:?}",
+						"Successfully sent payment of {}msat{} from payment hash {:?}",
 						payment.amount_msat.unwrap(),
 						if let Some(fee) = fee_paid_msat {
 							format!(" (fee {} msat)", fee)
 						} else {
 							"".to_string()
 						},
-						hex_utils::to_string(&payment_hash.0),
-						hex_utils::to_string(&payment_preimage.0)
+						hex_utils::to_string(&payment_hash.0)
 					);
 				});
 				let event = Event::PaymentSuccessful {
