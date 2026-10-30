@@ -24,6 +24,7 @@ use lightning_block_sync::rpc::RpcError;
 
 use crate::chain::adapters::classify_sendrawtransaction;
 use crate::chain::bitcoind::{BitcoindClient, FeeRateEstimationMode};
+use crate::chain::pruned_refetch::{PrunedBlockRefetch, RpcBlockFetcher};
 use crate::chain::seam::{
 	ActionResult, Anchored, BroadcastAction, BroadcastRejection, ChainActionError, FeeAction,
 	FeeUpdate, MempoolAction, MempoolAnswer, MempoolQuery, MempoolScope, PackageOutcomes,
@@ -494,14 +495,22 @@ fn mempool_poll_error(e: std::io::Error) -> ChainActionError {
 
 /// bitcoind is the only backend that can answer `gettxout`, so it is the only
 /// one that can verify BOLT-7 channel announcements — and it fetches the
-/// output, so the verification is [`UtxoVerification::Full`].
+/// output, so the verification is [`UtxoVerification::Full`]. On a pruned
+/// bitcoind a block below the prune height is fetched from a full-history
+/// peer when an announcement needs it ([`PrunedBlockRefetch`]); on an
+/// unpruned one the wrapper never acts.
 impl UtxoCapability for BitcoindChainAdapter {
 	fn name(&self) -> &'static str {
 		"bitcoind"
 	}
 
 	fn utxo_source(&self) -> Option<(Arc<dyn UtxoSource>, UtxoVerification)> {
-		Some((self.api_client.utxo_source(), UtxoVerification::Full))
+		let refetch = PrunedBlockRefetch::new(
+			self.api_client.utxo_source(),
+			Arc::new(RpcBlockFetcher(self.api_client.rpc_client())),
+			Arc::clone(&self.logger),
+		);
+		Some((Arc::new(refetch) as Arc<dyn UtxoSource>, UtxoVerification::Full))
 	}
 }
 

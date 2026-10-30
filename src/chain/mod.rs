@@ -21,6 +21,7 @@ pub(crate) mod cbf {
 pub(crate) mod electrum;
 pub(crate) mod engine;
 pub(crate) mod filter_scan;
+pub(crate) mod pruned_refetch;
 pub(crate) mod host;
 mod layer;
 pub mod provider;

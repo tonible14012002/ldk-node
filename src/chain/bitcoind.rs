@@ -102,6 +102,14 @@ impl BitcoindClient {
 		}
 	}
 
+	/// The RPC client, which both variants hold (the REST one for what REST cannot do).
+	pub(crate) fn rpc_client(&self) -> Arc<RpcClient> {
+		match self {
+			BitcoindClient::Rpc { rpc_client, .. } => Arc::clone(rpc_client),
+			BitcoindClient::Rest { rpc_client, .. } => Arc::clone(rpc_client),
+		}
+	}
+
 	pub(crate) fn utxo_source(&self) -> Arc<dyn UtxoSource> {
 		match self {
 			BitcoindClient::Rpc { rpc_client, .. } => Arc::clone(rpc_client) as Arc<dyn UtxoSource>,
