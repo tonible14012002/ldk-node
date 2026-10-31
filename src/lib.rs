@@ -76,6 +76,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod balance;
+mod broadcast_queue;
 mod builder;
 mod chain;
 pub mod config;
@@ -133,6 +134,23 @@ pub use lightning_types;
 pub use vss_client;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
+pub use broadcast_queue::{
+	BroadcastPolicy, BroadcastQueueEntry, BroadcastQueueState, DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS,
+};
+
+/// The choices of a channel open made through [`Node::open_channel_with_options`]. Every field
+/// is stated by the caller: there is deliberately no default, so whether a channel is announced
+/// is never implicit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenChannelOptions {
+	/// Whether the channel is announced to the network for forwarding.
+	pub announce_for_forwarding: bool,
+	/// The reserve the counterparty must keep, in millionths of the channel value; honoured on
+	/// an unannounced channel only. `None` keeps LDK's default.
+	pub counterparty_reserve_proportional_millionths: Option<u32>,
+	/// What the broadcast does with the funding transaction when the network does not take it.
+	pub broadcast_policy: BroadcastPolicy,
+}
 pub use chain::{
 	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
 };
@@ -1536,11 +1554,12 @@ impl Node {
 		Ok(())
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn open_channel_inner(
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
 		announce_for_forwarding: bool, counterparty_reserve_proportional_millionths: Option<u32>,
-		funding: Option<Arc<dyn FundingSource>>,
+		funding: Option<Arc<dyn FundingSource>>, broadcast_policy: BroadcastPolicy,
 	) -> Result<UserChannelId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -1629,6 +1648,10 @@ impl Node {
 		if let Some(source) = funding {
 			self.external_fundings.insert(user_channel_id, source);
 		}
+		// Before the channel exists: the peer's `accept_channel` may come back, and the event
+		// handler build the funding, before `create_channel` returns here.
+		let broadcast_queue = self.wallet.broadcast_queue();
+		broadcast_queue.set_pending_open(user_channel_id, broadcast_policy);
 
 		match self.channel_manager.create_channel(
 			peer_info.node_id,
@@ -1652,6 +1675,7 @@ impl Node {
 				Ok(UserChannelId(user_channel_id))
 			},
 			Err(e) => {
+				broadcast_queue.forget_pending_open(user_channel_id);
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
 				if externally_funded {
 					self.external_fundings.release(
@@ -1694,6 +1718,7 @@ impl Node {
 			false,
 			None,
 			None,
+			BroadcastPolicy::default(),
 		)
 	}
 
@@ -1722,6 +1747,7 @@ impl Node {
 			false,
 			Some(counterparty_reserve_proportional_millionths),
 			None,
+			BroadcastPolicy::default(),
 		)
 	}
 
@@ -1729,8 +1755,7 @@ impl Node {
 	///
 	/// This will return an error if the node has not been sufficiently configured to operate as a
 	/// forwarding node that can properly announce its existence to the publip network graph, i.e.,
-	/// [`Config::listening_addresses`] and [`Config::node_alias`] are unset, or if its
-	/// [`Config::announce_policy`] forbids announcing.
+	/// [`Config::listening_addresses`] and [`Config::node_alias`] are unset.
 	///
 	/// To open an unannounced channel, see [`Node::open_channel`].
 	///
@@ -1765,6 +1790,7 @@ impl Node {
 			true,
 			None,
 			None,
+			BroadcastPolicy::default(),
 		)
 	}
 
@@ -1805,6 +1831,51 @@ impl Node {
 			announce,
 			None,
 			Some(funding),
+			BroadcastPolicy::default(),
+		)
+	}
+
+	/// Connect to a node and open a new channel, every choice stated in `options`: whether it is
+	/// announced, the reserve the counterparty must keep, and what the broadcast does with the
+	/// funding transaction when the network does not take it.
+	///
+	/// An announced open is refused exactly as [`Node::open_announced_channel`] refuses it; a
+	/// counterparty reserve is honoured on an unannounced channel only, as
+	/// [`Node::open_channel_with_counterparty_reserve`] does. Otherwise as
+	/// [`Node::open_channel`].
+	///
+	/// The funding gets `options.broadcast_policy`. With the default
+	/// ([`BroadcastPolicy::QueueUntilParents`]) a funding that spends the change of another
+	/// transaction not yet on the network — a second open from the same coin, whose peer
+	/// answered first — is held when it is refused for that missing input, and broadcast as
+	/// soon as its parent is out, instead of leaving the channel waiting forever.
+	pub fn open_channel_with_options(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		options: OpenChannelOptions,
+	) -> Result<UserChannelId, Error> {
+		if options.announce_for_forwarding {
+			if let Err(err) = may_announce_channel(&self.config) {
+				log_error!(self.logger, "Failed to open announced channel as the node hasn't been sufficiently configured to act as a forwarding node: {}", err);
+				return Err(Error::ChannelCreationFailed);
+			}
+		}
+		let counterparty_reserve = if options.announce_for_forwarding {
+			None
+		} else {
+			options.counterparty_reserve_proportional_millionths
+		};
+
+		self.open_channel_inner(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			options.announce_for_forwarding,
+			counterparty_reserve,
+			None,
+			options.broadcast_policy,
 		)
 	}
 
@@ -1819,6 +1890,27 @@ impl Node {
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.logger),
 		))
+	}
+
+	/// Registers what the broadcast does with the transaction `txid` when the network does not
+	/// take it, before the transaction is handed to the broadcaster.
+	///
+	/// The node registers [`BroadcastPolicy::default`] itself for every transaction its on-chain
+	/// wallet builds — channel fundings, on-chain sends and swap fundings — and a transaction
+	/// nobody registered is [`BroadcastPolicy::DropOnReject`]. Registering again replaces the
+	/// policy; a transaction already held keeps its place in the queue. This is how a batch of
+	/// dependent transactions is ordered: register each with its predecessors in
+	/// [`BroadcastPolicy::QueueUntilParents::depends_on`], then broadcast them in any order.
+	pub fn register_broadcast_policy(&self, txid: bitcoin::Txid, policy: BroadcastPolicy) {
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+		self.wallet.broadcast_queue().register(txid, policy, now);
+	}
+
+	/// Lists the broadcast queue: the transactions with a registered policy not yet on the
+	/// network, the ones held for a rebroadcast after a refusal, and — most recent first — the
+	/// ones given up in the last 30 days, each with why.
+	pub fn list_broadcast_queue(&self) -> Vec<BroadcastQueueEntry> {
+		self.wallet.broadcast_queue().list(|txid| self.wallet.is_tx_confirmed(txid))
 	}
 
 	/// Manually sync the LDK and BDK wallets with the current chain state and update the fee rate

@@ -23,7 +23,10 @@
 //! heuristic: a funding is **dead** when its transaction is in the wallet's graph (we built it)
 //! and, by the wallet's own view of the chain, one of its inputs is spent by a *different*
 //! transaction buried [`ANTI_REORG_DELAY`] deep, or one of its inputs comes from a parent that
-//! is itself dead. A legitimately pending funding is never dead, and a funding the peer built
+//! is itself dead. A transaction this node gave up for good — a funding LDK discarded before
+//! broadcasting it, or one the broadcast queue gave up on a definitive answer
+//! ([`crate::broadcast_queue`]) — is dead by this node's own word: nothing will ever broadcast
+//! it, and its inputs are offered to other spends. A legitimately pending funding is never dead, and a funding the peer built
 //! (an inbound channel) is not in the wallet's graph and is left alone.
 //!
 //! What happens to a dead funding, in order:
@@ -90,6 +93,8 @@ pub(crate) enum DeadFundingProof {
 	ConflictingSpend { input: OutPoint, conflicting_txid: Txid, confirmation_height: u32 },
 	/// An input comes from `parent_txid`, which is itself dead.
 	DeadParent { parent_txid: Txid },
+	/// This node gave the transaction up for good and released its inputs.
+	Abandoned,
 }
 
 impl fmt::Display for DeadFundingProof {
@@ -103,6 +108,7 @@ impl fmt::Display for DeadFundingProof {
 			Self::DeadParent { parent_txid } => {
 				write!(f, "it spends an output of dead transaction {}", parent_txid)
 			},
+			Self::Abandoned => write!(f, "this node gave it up and released its inputs"),
 		}
 	}
 }
@@ -111,13 +117,16 @@ impl fmt::Display for DeadFundingProof {
 /// with its proof.
 ///
 /// `known_dead` are transactions already proven dead earlier — recorded fundings whose
-/// monitors may be archived by now — so a child of one is still caught. A candidate not in
-/// `graph` is never dead: the wallet did not build it, so nothing here can speak for it.
+/// monitors may be archived by now — so a child of one is still caught. `abandoned` are the
+/// transactions this node gave up for good. A candidate not in `graph` is never dead: the
+/// wallet did not build it, so nothing here can speak for it.
 pub(crate) fn find_dead_fundings(
 	graph: &TxGraph<ConfirmationBlockTime>, chain: &LocalChain, tip: BlockId,
 	candidates: impl IntoIterator<Item = Txid>, known_dead: &HashSet<Txid>,
+	abandoned: &HashSet<Txid>,
 ) -> HashMap<Txid, DeadFundingProof> {
-	let mut finder = DeadTxFinder { graph, chain, tip, known_dead, memo: HashMap::new() };
+	let mut finder =
+		DeadTxFinder { graph, chain, tip, known_dead, abandoned, memo: HashMap::new() };
 	candidates
 		.into_iter()
 		.filter_map(|txid| finder.proof(txid).map(|proof| (txid, proof)))
@@ -129,6 +138,7 @@ struct DeadTxFinder<'a> {
 	chain: &'a LocalChain,
 	tip: BlockId,
 	known_dead: &'a HashSet<Txid>,
+	abandoned: &'a HashSet<Txid>,
 	/// Every transaction classified so far, dead or not, so the parent walk visits each once.
 	memo: HashMap<Txid, Option<DeadFundingProof>>,
 }
@@ -190,9 +200,17 @@ impl DeadTxFinder<'_> {
 
 		for input in &tx.input {
 			let parent_txid = input.previous_output.txid;
-			if self.known_dead.contains(&parent_txid) || self.proof(parent_txid).is_some() {
+			if self.known_dead.contains(&parent_txid)
+				|| self.abandoned.contains(&parent_txid)
+				|| self.proof(parent_txid).is_some()
+			{
 				return Some(DeadFundingProof::DeadParent { parent_txid });
 			}
+		}
+
+		// Last, so a chain proof is named whenever there is one.
+		if self.abandoned.contains(&txid) {
+			return Some(DeadFundingProof::Abandoned);
 		}
 
 		None

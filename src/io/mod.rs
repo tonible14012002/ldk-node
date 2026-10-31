@@ -86,3 +86,11 @@ pub(crate) const BDK_WALLET_INDEXER_KEY: &str = "indexer";
 pub(crate) const DEAD_FUNDING_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
 pub(crate) const DEAD_FUNDING_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
 pub(crate) const DEAD_FUNDING_PERSISTENCE_KEY: &str = "dead_fundings";
+
+/// The broadcast queue — per-transaction broadcast policies, the transactions held for a
+/// rebroadcast and the ones given up — will be persisted under this key.
+///
+/// See [`crate::broadcast_queue`].
+pub(crate) const BROADCAST_QUEUE_PERSISTENCE_PRIMARY_NAMESPACE: &str = "";
+pub(crate) const BROADCAST_QUEUE_PERSISTENCE_SECONDARY_NAMESPACE: &str = "";
+pub(crate) const BROADCAST_QUEUE_PERSISTENCE_KEY: &str = "broadcast_queue";

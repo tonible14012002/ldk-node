@@ -501,6 +501,7 @@ pub(crate) mod test_wallet {
 	use bdk_wallet::Wallet as BdkWallet;
 	use bitcoin::Network;
 
+	use crate::broadcast_queue::BroadcastQueue;
 	use crate::config::Config;
 	use crate::fee_estimator::OnchainFeeEstimator;
 	use crate::io::{
@@ -534,6 +535,7 @@ pub(crate) mod test_wallet {
 			bdk_wallet,
 			persister,
 			Arc::clone(broadcaster),
+			Arc::new(BroadcastQueue::read_or_empty(Arc::clone(kv_store), Arc::clone(logger))),
 			Arc::clone(fee_estimator),
 			payment_store,
 			config,

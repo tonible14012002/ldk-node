@@ -537,12 +537,16 @@ where
 	/// not a panic.
 	fn fund_externally(
 		&self, source: Arc<dyn FundingSource>, request: FundingRequest, user_channel_id: u128,
+		broadcast_policy: crate::BroadcastPolicy,
 	) {
 		let temporary_channel_id = request.temporary_channel_id;
 		let counterparty_node_id = request.counterparty_node_id;
 		match source.create_funding_transaction(request) {
 			Ok(final_tx) => {
 				let funding_txid = final_tx.compute_txid();
+				// The funding wallet built it, so its broadcast queue holds the policy: a
+				// funding refused for a missing input is held and rebroadcast there.
+				source.register_broadcast_policy(funding_txid, broadcast_policy);
 				match self.channel_manager.funding_transaction_generated(
 					temporary_channel_id,
 					counterparty_node_id,
@@ -584,6 +588,10 @@ where
 				output_script,
 				user_channel_id,
 			} => {
+				// What the open asked the broadcast to do with this funding; LDK hands it to
+				// the broadcaster later, when the peer answers `funding_signed`.
+				let broadcast_policy =
+					self.wallet.broadcast_queue().take_pending_open(user_channel_id);
 				// Construct the raw transaction with the output that is paid the amount of the
 				// channel.
 				let confirmation_target = ConfirmationTarget::ChannelFunding;
@@ -605,7 +613,7 @@ where
 							.unwrap_or(u32::MAX),
 						locktime,
 					};
-					self.fund_externally(source, request, user_channel_id);
+					self.fund_externally(source, request, user_channel_id, broadcast_policy);
 					return Ok(());
 				}
 
@@ -619,6 +627,14 @@ where
 				) {
 					Ok(final_tx) => {
 						let funding_txid = final_tx.compute_txid();
+						self.wallet.broadcast_queue().register(
+							funding_txid,
+							broadcast_policy,
+							SystemTime::now()
+								.duration_since(UNIX_EPOCH)
+								.map(|d| d.as_secs())
+								.unwrap_or(0),
+						);
 						// Give the funding transaction back to LDK for opening the channel.
 						match self.channel_manager.funding_transaction_generated(
 							temporary_channel_id,
@@ -1594,6 +1610,9 @@ where
 				// An externally funded open that ends here never broadcast its funding (a
 				// broadcast one was forgotten at `ChannelPending`): hand the inputs back.
 				self.external_fundings.release(user_channel_id, channel_id);
+				// An open the peer refused, or that failed, before LDK asked for its funding
+				// leaves the policy it asked for behind; nothing would ever take it.
+				self.wallet.broadcast_queue().forget_pending_open(user_channel_id);
 
 				let event = Event::ChannelClosed {
 					channel_id,

@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
+use crate::broadcast_queue::BroadcastQueue;
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::birthday::birthday_checkpoint;
 #[cfg(feature = "cbf")]
@@ -1714,10 +1715,13 @@ fn build_with_store_internal(
 		},
 	};
 
+	let broadcast_queue =
+		Arc::new(BroadcastQueue::read_or_empty(Arc::clone(&kv_store), Arc::clone(&logger)));
 	let wallet = Arc::new(Wallet::new(
 		bdk_wallet,
 		wallet_persister,
 		Arc::clone(&tx_broadcaster),
+		broadcast_queue,
 		Arc::clone(&fee_estimator),
 		Arc::clone(&payment_store),
 		Arc::clone(&config),

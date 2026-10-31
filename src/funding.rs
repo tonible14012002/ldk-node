@@ -78,6 +78,12 @@ pub trait FundingSource: Send + Sync {
 	/// `temporary_channel_id`: nothing will be released for it. The inputs stay spent in
 	/// the funding wallet, as the broadcast transaction says. Optional.
 	fn funded(&self, _temporary_channel_id: ChannelId) {}
+
+	/// The broadcast policy the open asked for ([`crate::BroadcastPolicy`]), for the funding
+	/// transaction `txid` this source just built. A source over an on-chain wallet registers it
+	/// on that wallet's broadcast queue, so a funding refused for a missing input is held and
+	/// rebroadcast like one the opening node built itself. Optional.
+	fn register_broadcast_policy(&self, _txid: Txid, _policy: crate::BroadcastPolicy) {}
 }
 
 /// One open funded by a [`FundingSource`].
@@ -191,6 +197,14 @@ impl FundingSource for WalletFundingSource {
 
 	fn funded(&self, temporary_channel_id: ChannelId) {
 		self.fundings.lock().unwrap().remove(&temporary_channel_id);
+	}
+
+	fn register_broadcast_policy(&self, txid: Txid, policy: crate::BroadcastPolicy) {
+		let now = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		self.wallet.broadcast_queue().register(txid, policy, now);
 	}
 }
 
