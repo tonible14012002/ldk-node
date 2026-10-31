@@ -88,6 +88,7 @@ mod error;
 mod event;
 mod fee_estimator;
 mod ffi;
+mod funding;
 mod gossip;
 pub mod graph;
 mod hex_utils;
@@ -95,6 +96,7 @@ pub mod io;
 pub mod liquidity;
 pub mod logger;
 mod message_handler;
+mod net;
 mod path_failure;
 pub mod payment;
 mod peer_store;
@@ -211,6 +213,11 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 
+pub use chain::host::{ChainHost, ChainHostBuilder, ChainHostStatus};
+pub use funding::{FundingRequest, FundingSource};
+pub use net::listener::InboundListener;
+pub use types::{Graph, Scorer};
+use chain::target::{SyncTargetSpec, TargetId};
 use chain::ChainLayer;
 use config::{
 	default_user_config, may_announce_channel, ChannelConfig, Config, NODE_ANN_BCAST_INTERVAL,
@@ -221,6 +228,7 @@ use custom_gossip::CustomGossipMessageHandler;
 use event::{EventHandler, EventQueue};
 use gossip::GossipSource;
 use graph::NetworkGraph;
+use io::no_graph_persister::{BackgroundPersister, GraphPersistence};
 use io::utils::write_node_metrics;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
 use payment::{
@@ -229,8 +237,8 @@ use payment::{
 };
 use peer_store::{PeerInfo, PeerStore};
 use types::{
-	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
-	KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper, Wallet,
+	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, GossipSync,
+	KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Sweeper, Wallet,
 };
 pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
 
@@ -244,17 +252,17 @@ use lightning::impl_writeable_tlv_based;
 use lightning::ln::channel_state::ChannelShutdownState;
 use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::SocketAddress;
+use lightning::ln::script::ShutdownScript;
 use lightning::routing::gossip::NodeAlias;
 
 use lightning_background_processor::process_events_async;
 
 use bitcoin::secp256k1::PublicKey;
+use bitcoin::ScriptBuf;
 
 use rand::Rng;
 
 use std::default::Default;
-use std::net::ToSocketAddrs;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -270,6 +278,8 @@ pub struct Node {
 	event_handling_stopped_sender: tokio::sync::watch::Sender<()>,
 	config: Arc<Config>,
 	wallet: Arc<Wallet>,
+	/// The host this node's chain comes from; `chain_source` is its layer.
+	chain_host: Arc<ChainHost>,
 	chain_source: Arc<ChainLayer>,
 	tx_broadcaster: Arc<Broadcaster>,
 	event_queue: Arc<EventQueue<Arc<Logger>>>,
@@ -281,6 +291,9 @@ pub struct Node {
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	keys_manager: Arc<KeysManager>,
 	network_graph: Arc<Graph>,
+	/// Whether `network_graph` and `scorer` are another node's
+	/// ([`Builder::set_shared_graph`]): then this node neither prunes nor persists them.
+	graph_is_shared: bool,
 	gossip_source: Arc<GossipSource>,
 	liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 	custom_gossip_handler: Option<Arc<CustomGossipMessageHandler<Arc<Logger>>>>,
@@ -290,13 +303,25 @@ pub struct Node {
 	scorer: Arc<Mutex<Scorer>>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
-	is_listening: Arc<AtomicBool>,
+	/// The listener the application shares between its nodes
+	/// ([`Builder::set_inbound_listener`]); `None` means this node binds its own on start.
+	shared_inbound_listener: Option<Arc<InboundListener>>,
+	/// The listener this node is registered with, from `start` to `stop`.
+	inbound_listener: Mutex<Option<Arc<InboundListener>>>,
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 	/// Fundings proven dead by the chain; see [`dead_funding`].
 	dead_fundings: Arc<dead_funding::DeadFundingStore>,
+	/// This node's handle in the chain host's target registry, from `start` to `stop`.
+	chain_target: Mutex<Option<TargetId>>,
+	/// Where a filter scan for this node's wallet may start; see
+	/// [`chain::target::SyncTargetSpec::birthday_height`].
+	wallet_birthday_height: Option<u32>,
 	/// Last `PaymentPathFailed` detail per payment (bounded, in-memory). Written by
 	/// the event handler, read via `Node::path_failure`.
 	path_failures: Arc<PathFailureStore>,
+	/// Opens funded by another wallet ([`Node::open_channel_with_funding`]), in memory: an
+	/// unfunded channel does not survive a restart either.
+	external_fundings: Arc<funding::ExternalFundings>,
 	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
 	#[cfg(feature = "swaps")]
 	swap_tx_watch: Arc<chain::SwapTxWatch>,
@@ -323,6 +348,30 @@ impl Node {
 	/// After this returns, the [`Node`] instance can be controlled via the provided API methods in
 	/// a thread-safe manner.
 	pub fn start_with_runtime(&self, runtime: Arc<tokio::runtime::Runtime>) -> Result<(), Error> {
+		self.start_inner(runtime, true)
+	}
+
+	/// Starts like [`Node::start_with_runtime`], but takes no inbound connections: the node
+	/// binds no listener and registers with none, so it only dials out. Its channels, its
+	/// payments and the peers it reconnects to work as usual; no peer can dial it.
+	///
+	/// For a node whose [`Config::listening_addresses`] cannot be bound now — another process
+	/// holds the port, so [`Node::start_with_runtime`] fails with [`Error::ListenFailed`] — and
+	/// that must run anyway. Its configuration is unchanged: [`Node::listening_addresses`]
+	/// still names the addresses, the node may still announce them and open announced
+	/// channels, and its next start listens on them again. [`NodeStatus::is_listening`] stays
+	/// false while it runs this way.
+	///
+	/// [`Config::listening_addresses`]: crate::config::Config::listening_addresses
+	pub fn start_outbound_only_with_runtime(
+		&self, runtime: Arc<tokio::runtime::Runtime>,
+	) -> Result<(), Error> {
+		self.start_inner(runtime, false)
+	}
+
+	fn start_inner(
+		&self, runtime: Arc<tokio::runtime::Runtime>, take_inbound: bool,
+	) -> Result<(), Error> {
 		// Acquire a run lock and hold it until we're setup.
 		let mut runtime_lock = self.runtime.write().unwrap();
 		if runtime_lock.is_some() {
@@ -337,86 +386,55 @@ impl Node {
 			self.config.network
 		);
 
-		// Start up any runtime-dependant chain sources (e.g. Electrum)
-		self.chain_source.start(Arc::clone(&runtime)).map_err(|e| {
-			log_error!(self.logger, "Failed to start chain syncing: {}", e);
-			e
-		})?;
-
-		// Record which adapters occupy each chain ability slot, in chain order,
-		// so a support question about a fee or broadcast answer can be traced
-		// to the thing that produced it without guessing from config.
-		let slots = self.chain_source.slot_adapters();
-		log_info!(self.logger, "Chain ability slots: {}", slots);
-		if slots.utxo.is_none() {
-			// Say this out loud. Without a UTXO source the routing graph accepts
-			// every peer's channel_announcement without checking that the funding
-			// output exists, and nothing else reports it.
-			log_info!(
-				self.logger,
-				"No chain adapter can verify BOLT-7 channel announcements; the routing graph will carry unverified channel capacities."
-			);
-		}
-
-		// Refresh the fee rate cache once on startup — but do NOT let a failure
-		// stop the node coming up.
-		//
-		// DEVIATION from upstream ldk-node, which propagates this error with
-		// `?` and refuses to start. Upstream's rule is a reachability probe on
-		// the chain source, using the cheapest call available: fail fast rather
-		// than come up blind. That is sound for a node whose chain source is an
-		// external server it can retry until the network appears.
-		//
-		// It is wrong for a node whose chain source is reached through this
-		// node's own transport. There the probe is gated on the node it is
-		// gating — identity and message signing are served by the application
-		// wrapping this crate, and that application cannot answer until start()
-		// returns. The node then retries forever against a dependency that can
-		// never be satisfied.
-		//
-		// Two facts make continuing safe rather than reckless:
-		//
-		//   * `FeeEstimator::estimate_fee_rate` cannot fail. Every target has a
-		//     hardcoded fallback, so an empty cache yields constants, not an
-		//     error. A node with no estimates runs.
-		//   * this crate ALREADY tolerates indefinite fee failures — the
-		//     background loop discards them (`let _ = …update_fee_rate_estimates`).
-		//     A node whose provider dies after startup keeps running on a stale
-		//     cache. Only the very first fetch was fatal, which is an asymmetry
-		//     rather than a safety property.
-		//
-		// What replaces the guarantee: the failure is recorded rather than
-		// swallowed. `latest_fee_rate_cache_update_timestamp` stays `None`,
-		// which [`Node::chain_freshness`] reports so the embedding application
-		// can refuse the operations where a wrong fee rate costs money —
-		// building or broadcasting a transaction — while still serving reads.
-		// Degraded and honest beats absent.
-		let chain_source = Arc::clone(&self.chain_source);
-		let runtime_ref = &runtime;
-		let fee_update = tokio::task::block_in_place(move || {
-			runtime_ref.block_on(async move { chain_source.update_fee_rate_estimates().await })
-		});
-		if let Err(e) = fee_update {
-			log_error!(
-				self.logger,
-				"Initial fee rate cache update failed: {}. Continuing startup with fallback fee \
-				 estimates; transaction-building operations should be refused until a refresh \
-				 succeeds (see Node::chain_freshness).",
+		// Join the chain host: the first node to attach starts the chain source, refreshes
+		// the fee cache once and spawns the sync loop and the broadcast drain on `runtime`;
+		// a later one is simply one more target of the running sync.
+		let target_id =
+			self.chain_host.attach(self.sync_target_spec(), Arc::clone(&runtime)).map_err(|e| {
+				log_error!(self.logger, "Failed to join the chain host: {}", e);
 				e
-			);
-		}
+			})?;
+		*self.chain_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(target_id);
 
-		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
-		let stop_sync_receiver = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		runtime.spawn(async move {
-			chain_source
-				.continuously_sync_wallets(stop_sync_receiver, sync_cman, sync_cmon, sync_sweeper)
-				.await;
-		});
+		// Take inbound connections: through the listener the application shares between its
+		// nodes, or through one bound here for this node alone — the same path either way.
+		// Before any task is spawned, so a start that cannot bind leaves nothing running.
+		match &self.config.listening_addresses {
+			Some(listening_addresses) if take_inbound => {
+				let listener = match &self.shared_inbound_listener {
+					Some(shared) => Arc::clone(shared),
+					None => match InboundListener::bind(
+						listening_addresses.clone(),
+						Arc::clone(&runtime),
+						Arc::clone(&self.logger),
+					) {
+						Ok(own) => own,
+						Err(e) => {
+							if let Some(id) =
+								self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).take()
+							{
+								self.chain_host.detach(id);
+							}
+							return Err(e);
+						},
+					},
+				};
+				listener.register(
+					self.node_id(),
+					Arc::clone(&self.keys_manager),
+					Arc::clone(&self.peer_manager),
+				);
+				*self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()) = Some(listener);
+			},
+			Some(listening_addresses) => {
+				log_info!(
+					self.logger,
+					"Taking no inbound connections this run: not listening on {:?}.",
+					listening_addresses
+				);
+			},
+			None => {},
+		}
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
@@ -468,70 +486,6 @@ impl Node {
 			});
 		}
 
-		if let Some(listening_addresses) = &self.config.listening_addresses {
-			// Setup networking
-			let peer_manager_connection_handler = Arc::clone(&self.peer_manager);
-			let mut stop_listen = self.stop_sender.subscribe();
-			let listening_logger = Arc::clone(&self.logger);
-			let listening_indicator = Arc::clone(&self.is_listening);
-
-			let mut bind_addrs = Vec::with_capacity(listening_addresses.len());
-
-			for listening_addr in listening_addresses {
-				let resolved_address = listening_addr.to_socket_addrs().map_err(|e| {
-					log_error!(
-						self.logger,
-						"Unable to resolve listening address: {:?}. Error details: {}",
-						listening_addr,
-						e,
-					);
-					Error::InvalidSocketAddress
-				})?;
-
-				bind_addrs.extend(resolved_address);
-			}
-
-			runtime.spawn(async move {
-				{
-				let listener =
-					tokio::net::TcpListener::bind(&*bind_addrs).await
-										.unwrap_or_else(|e| {
-											log_error!(listening_logger, "Failed to bind to listen addresses/ports - is something else already listening on it?: {}", e);
-											panic!(
-												"Failed to bind to listen address/port - is something else already listening on it?",
-												);
-										});
-
-				listening_indicator.store(true, Ordering::Release);
-
-				loop {
-					let peer_mgr = Arc::clone(&peer_manager_connection_handler);
-					tokio::select! {
-						_ = stop_listen.changed() => {
-							log_debug!(
-								listening_logger,
-								"Stopping listening to inbound connections.",
-							);
-							break;
-						}
-						res = listener.accept() => {
-							let tcp_stream = res.unwrap().0;
-							tokio::spawn(async move {
-								lightning_net_tokio::setup_inbound(
-									Arc::clone(&peer_mgr),
-									tcp_stream.into_std().unwrap(),
-									)
-									.await;
-							});
-						}
-					}
-				}
-				}
-
-				listening_indicator.store(false, Ordering::Release);
-			});
-		}
-
 		// Regularly reconnect to persisted peers.
 		let connect_cm = Arc::clone(&self.connection_manager);
 		let connect_pm = Arc::clone(&self.peer_manager);
@@ -577,7 +531,7 @@ impl Node {
 		let bcast_node_metrics = Arc::clone(&self.node_metrics);
 		let mut stop_bcast = self.stop_sender.subscribe();
 		let node_alias = self.config.node_alias.clone();
-		if may_announce_channel(&self.config).is_ok() {
+		if broadcasts_node_announcements(&self.config) {
 			runtime.spawn(async move {
 				// We check every 30 secs whether our last broadcast is NODE_ANN_BCAST_INTERVAL away.
 				#[cfg(not(test))]
@@ -652,29 +606,6 @@ impl Node {
 			});
 		}
 
-		let mut stop_tx_bcast = self.stop_sender.subscribe();
-		let chain_source = Arc::clone(&self.chain_source);
-		let tx_bcast_logger = Arc::clone(&self.logger);
-		runtime.spawn(async move {
-			// Every second we try to clear our broadcasting queue.
-			let mut interval = tokio::time::interval(Duration::from_secs(1));
-			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-			loop {
-				tokio::select! {
-						_ = stop_tx_bcast.changed() => {
-							log_debug!(
-								tx_bcast_logger,
-								"Stopping broadcasting transactions.",
-							);
-							return;
-						}
-						_ = interval.tick() => {
-							chain_source.process_broadcast_queue().await;
-						}
-				}
-			}
-		});
-
 		let bump_tx_event_handler = Arc::new(BumpTransactionEventHandler::new(
 			Arc::clone(&self.tx_broadcaster),
 			Arc::new(LdkWallet::new(Arc::clone(&self.wallet), Arc::clone(&self.logger))),
@@ -694,17 +625,33 @@ impl Node {
 			Arc::clone(&self.payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.path_failures),
+			Arc::clone(&self.external_fundings),
 			Arc::clone(&self.runtime),
 			Arc::clone(&self.logger),
 			Arc::clone(&self.config),
 		));
 
-		// Setup background processing
-		let background_persister = Arc::clone(&self.kv_store);
+		// Setup background processing. A node on a shared graph hands the processor no
+		// gossip sync and a persister that skips the graph and scorer: pruning and persisting
+		// them is the owning node's job, and a copy in this node's store would be ~130 MB
+		// nobody reads back.
+		let (background_persister, background_gossip_sync) = if self.graph_is_shared {
+			(
+				Arc::new(BackgroundPersister::new(
+					Arc::clone(&self.kv_store),
+					GraphPersistence::Shared,
+				)),
+				GossipSync::None,
+			)
+		} else {
+			(
+				Arc::new(BackgroundPersister::new(Arc::clone(&self.kv_store), GraphPersistence::Own)),
+				self.gossip_source.as_gossip_sync(),
+			)
+		};
 		let background_event_handler = Arc::clone(&event_handler);
 		let background_chain_mon = Arc::clone(&self.chain_monitor);
 		let background_chan_man = Arc::clone(&self.channel_manager);
-		let background_gossip_sync = self.gossip_source.as_gossip_sync();
 		let background_peer_man = Arc::clone(&self.peer_manager);
 		let background_onion_messenger = Arc::clone(&self.onion_messenger);
 		let background_logger = Arc::clone(&self.logger);
@@ -797,6 +744,11 @@ impl Node {
 	/// Disconnects all peers, stops all running background tasks, and shuts down [`Node`].
 	///
 	/// After this returns most API methods will return [`Error::NotRunning`].
+	///
+	/// Errors with [`Error::EventHandlingStopFailed`] — the node is stopped all the same —
+	/// when the background processor ended without saying so, which upstream treats as a
+	/// panic. An application about to export the node's data wants the answer, not the
+	/// abort: see [`Node::stop_and_quiesce`].
 	pub fn stop(&self) -> Result<(), Error> {
 		let runtime = self.runtime.write().unwrap().take().ok_or(Error::NotRunning)?;
 		#[cfg(tokio_unstable)]
@@ -804,8 +756,10 @@ impl Node {
 
 		log_info!(self.logger, "Shutting down LDK Node with node ID {}...", self.node_id());
 
-		// Stop any runtime-dependant chain sources.
-		self.chain_source.stop();
+		// Leave the chain host; the last node out stops the chain source and its tasks.
+		if let Some(id) = self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).take() {
+			self.chain_host.detach(id);
+		}
 
 		// Stop the runtime.
 		match self.stop_sender.send(()) {
@@ -818,6 +772,15 @@ impl Node {
 				);
 				debug_assert!(false);
 			},
+		}
+
+		// Stop taking inbound connections: leave a shared listener, stop a private one.
+		if let Some(listener) = self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()).take()
+		{
+			listener.unregister(&self.node_id());
+			if self.shared_inbound_listener.is_none() {
+				listener.stop();
+			}
 		}
 
 		// Disconnect all peers.
@@ -840,8 +803,9 @@ impl Node {
 			})
 		});
 
+		let mut stop_res = Ok(());
 		match timeout_res {
-			Ok(stop_res) => match stop_res {
+			Ok(changed) => match changed {
 				Ok(()) => {},
 				Err(e) => {
 					log_error!(
@@ -849,7 +813,8 @@ impl Node {
 						"Stopping event handling failed. This should never happen: {}",
 						e
 					);
-					panic!("Stopping event handling failed. This should never happen.");
+					debug_assert!(false, "Stopping event handling failed. This should never happen.");
+					stop_res = Err(Error::EventHandlingStopFailed);
 				},
 			},
 			Err(e) => {
@@ -871,7 +836,54 @@ impl Node {
 		}
 
 		log_info!(self.logger, "Shutdown complete.");
-		Ok(())
+		stop_res
+	}
+
+	/// [`Node::stop`], then make the node's data safe to copy: the SQLite store, if the node
+	/// has one at the default path, has its write-ahead log folded into the database file
+	/// (`PRAGMA wal_checkpoint(TRUNCATE)`), so a copy of `ldk_node_data.sqlite` alone is the
+	/// whole store.
+	///
+	/// Returns what an export should know: the block the Lightning wallet is synced to and
+	/// how many events still wait to be handled. Errors with [`Error::NotRunning`] if the
+	/// node was not running, with [`Error::EventHandlingStopFailed`] as [`Node::stop`] does,
+	/// and with [`Error::PersistenceFailed`] when the checkpoint could not be run — the node
+	/// is stopped in every case.
+	pub fn stop_and_quiesce(&self) -> Result<QuiesceReport, Error> {
+		self.stop()?;
+
+		let db_path = std::path::PathBuf::from(&self.config.storage_dir_path)
+			.join(io::sqlite_store::SQLITE_DB_FILE_NAME);
+		if db_path.exists() {
+			let checkpoint = rusqlite::Connection::open(&db_path).and_then(|connection| {
+				// Returns (busy, log frames, checkpointed frames); busy means a reader held
+				// the WAL open and the checkpoint stopped short.
+				connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+					row.get::<_, i64>(0)
+				})
+			});
+			match checkpoint {
+				Ok(0) => {
+					log_debug!(self.logger, "Checkpointed the SQLite store for export.");
+				},
+				Ok(_busy) => {
+					log_error!(
+						self.logger,
+						"The SQLite store's write-ahead log could not be fully checkpointed: another connection holds it open."
+					);
+					return Err(Error::PersistenceFailed);
+				},
+				Err(e) => {
+					log_error!(self.logger, "Failed to checkpoint the SQLite store: {}", e);
+					return Err(Error::PersistenceFailed);
+				},
+			}
+		}
+
+		Ok(QuiesceReport {
+			last_block_height: self.channel_manager.current_best_block().height,
+			pending_events: self.event_queue.len(),
+		})
 	}
 
 	/// Returns the status of the [`Node`].
@@ -932,7 +944,12 @@ impl Node {
 	/// Returns the status of the [`Node`].
 	pub fn status(&self) -> NodeStatus {
 		let is_running = self.runtime.read().unwrap().is_some();
-		let is_listening = self.is_listening.load(Ordering::Acquire);
+		let is_listening = self
+			.inbound_listener
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.as_ref()
+			.map_or(false, |l| l.is_listening() && l.is_registered(&self.node_id()));
 		let current_best_block = self.channel_manager.current_best_block().into();
 		let locked_node_metrics = self.node_metrics.read().unwrap();
 		let latest_lightning_wallet_sync_timestamp =
@@ -1542,7 +1559,7 @@ impl Node {
 		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
 		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
 		announce_for_forwarding: bool, counterparty_reserve_proportional_millionths: Option<u32>,
-		broadcast_policy: BroadcastPolicy,
+		funding: Option<Arc<dyn FundingSource>>, broadcast_policy: BroadcastPolicy,
 	) -> Result<UserChannelId, Error> {
 		let rt_lock = self.runtime.read().unwrap();
 		if rt_lock.is_none() {
@@ -1561,8 +1578,12 @@ impl Node {
 		let spendable_amount_sats =
 			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
 
+		// Funded by another wallet, this node's own coins only need to cover the anchor
+		// reserve below: the channel value is the source's to find.
+		let channel_funds_sats = if funding.is_some() { 0 } else { channel_amount_sats };
+
 		// Fail early if we have less than the channel value available.
-		if spendable_amount_sats < channel_amount_sats {
+		if spendable_amount_sats < channel_funds_sats {
 			log_error!(self.logger,
 				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
 				spendable_amount_sats, channel_amount_sats
@@ -1584,7 +1605,7 @@ impl Node {
 			.peer_by_node_id(&node_id)
 			.ok_or(Error::ConnectionFailed)?
 			.init_features;
-		let required_funds_sats = channel_amount_sats
+		let required_funds_sats = channel_funds_sats
 			+ self.config.anchor_channels_config.as_ref().map_or(0, |c| {
 				if init_features.requires_anchors_zero_fee_htlc_tx()
 					&& !c.trusted_peers_no_reserve.contains(&node_id)
@@ -1622,6 +1643,11 @@ impl Node {
 		let push_msat = push_to_counterparty_msat.unwrap_or(0);
 		let user_channel_id: u128 = rand::thread_rng().gen::<u128>();
 
+		// Recorded before the channel exists, so `FundingGenerationReady` always finds it.
+		let externally_funded = funding.is_some();
+		if let Some(source) = funding {
+			self.external_fundings.insert(user_channel_id, source);
+		}
 		// Before the channel exists: the peer's `accept_channel` may come back, and the event
 		// handler build the funding, before `create_channel` returns here.
 		let broadcast_queue = self.wallet.broadcast_queue();
@@ -1635,18 +1661,28 @@ impl Node {
 			None,
 			Some(user_config),
 		) {
-			Ok(_) => {
+			Ok(temporary_channel_id) => {
 				log_info!(
 					self.logger,
 					"Initiated channel creation with peer {}. ",
 					peer_info.node_id
 				);
+				if externally_funded {
+					self.external_fundings
+						.set_temporary_channel_id(user_channel_id, temporary_channel_id);
+				}
 				self.peer_store.add_peer(peer_info)?;
 				Ok(UserChannelId(user_channel_id))
 			},
 			Err(e) => {
 				broadcast_queue.forget_pending_open(user_channel_id);
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
+				if externally_funded {
+					self.external_fundings.release(
+						user_channel_id,
+						lightning::ln::types::ChannelId([0u8; 32]),
+					);
+				}
 				Err(Error::ChannelCreationFailed)
 			},
 		}
@@ -1681,6 +1717,7 @@ impl Node {
 			channel_config,
 			false,
 			None,
+			None,
 			BroadcastPolicy::default(),
 		)
 	}
@@ -1709,6 +1746,7 @@ impl Node {
 			channel_config,
 			false,
 			Some(counterparty_reserve_proportional_millionths),
+			None,
 			BroadcastPolicy::default(),
 		)
 	}
@@ -1751,6 +1789,48 @@ impl Node {
 			channel_config,
 			true,
 			None,
+			None,
+			BroadcastPolicy::default(),
+		)
+	}
+
+	/// Connect to a node and open a channel whose funding transaction `funding` builds,
+	/// instead of this node's on-chain wallet — typically another wallet in this process,
+	/// through its [`Node::funding_source`].
+	///
+	/// When the peer accepts, `funding` is asked for a transaction paying the channel's
+	/// funding output (`FundingSource::create_funding_transaction`); this node's channel
+	/// manager broadcasts it once the peer has signed. If the open fails or the channel
+	/// closes before that, `FundingSource::release` is called. Which source funds which open
+	/// is kept in memory only: an unfunded channel does not survive a restart either.
+	///
+	/// This node's own wallet still has to hold the anchor reserve for the new channel, if
+	/// anchors are negotiated (see [`AnchorChannelsConfig::per_channel_reserve_sats`]): it is
+	/// what bumps the channel's fees on a force-close. `announce` opens an announced
+	/// channel, with the same requirements as [`Node::open_announced_channel`].
+	///
+	/// [`AnchorChannelsConfig::per_channel_reserve_sats`]: crate::config::AnchorChannelsConfig::per_channel_reserve_sats
+	pub fn open_channel_with_funding(
+		&self, node_id: PublicKey, address: SocketAddress, channel_amount_sats: u64,
+		push_to_counterparty_msat: Option<u64>, channel_config: Option<ChannelConfig>,
+		announce: bool, funding: Arc<dyn FundingSource>,
+	) -> Result<UserChannelId, Error> {
+		if announce {
+			if let Err(err) = may_announce_channel(&self.config) {
+				log_error!(self.logger, "Failed to open announced channel as the node hasn't been sufficiently configured to act as a forwarding node: {}", err);
+				return Err(Error::ChannelCreationFailed);
+			}
+		}
+
+		self.open_channel_inner(
+			node_id,
+			address,
+			channel_amount_sats,
+			push_to_counterparty_msat,
+			channel_config,
+			announce,
+			None,
+			Some(funding),
 			BroadcastPolicy::default(),
 		)
 	}
@@ -1794,8 +1874,22 @@ impl Node {
 			channel_config,
 			options.announce_for_forwarding,
 			counterparty_reserve,
+			None,
 			options.broadcast_policy,
 		)
+	}
+
+	/// A [`FundingSource`] over this node's on-chain wallet, for another node in the process
+	/// to fund its channels from ([`Node::open_channel_with_funding`]).
+	///
+	/// It builds and signs from this wallet and reserves the inputs exactly as this node does
+	/// for its own channels — its own coin selection skips them until the funding is
+	/// broadcast or released — and never broadcasts: the opening node does.
+	pub fn funding_source(&self) -> Arc<dyn FundingSource> {
+		Arc::new(funding::WalletFundingSource::new(
+			Arc::clone(&self.wallet),
+			Arc::clone(&self.logger),
+		))
 	}
 
 	/// Registers what the broadcast does with the transaction `txid` when the network does not
@@ -1847,14 +1941,30 @@ impl Node {
 		// one per call.
 		let rt_lock = self.runtime.read().unwrap();
 		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
+		let target_id = self
+			.chain_target
+			.lock()
+			.unwrap_or_else(|e| e.into_inner())
+			.ok_or(Error::NotRunning)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		let sync_cman = Arc::clone(&self.channel_manager);
-		let sync_cmon = Arc::clone(&self.chain_monitor);
-		let sync_sweeper = Arc::clone(&self.output_sweeper);
-		runtime.block_on(async move {
-			chain_source.sync_wallets_once(sync_cman, sync_cmon, sync_sweeper).await
-		})
+		runtime.block_on(async move { chain_source.sync_wallets_once(target_id).await })
+	}
+
+	/// Everything of this node the chain layer keeps in step; see [`chain::target`].
+	fn sync_target_spec(&self) -> SyncTargetSpec {
+		let node_id = self.node_id().to_string();
+		SyncTargetSpec {
+			label: node_id.chars().take(8).collect(),
+			onchain_wallet: Arc::clone(&self.wallet),
+			channel_manager: Arc::clone(&self.channel_manager),
+			chain_monitor: Arc::clone(&self.chain_monitor),
+			output_sweeper: Arc::clone(&self.output_sweeper),
+			kv_store: Arc::clone(&self.kv_store),
+			node_metrics: Arc::clone(&self.node_metrics),
+			dead_fundings: Arc::clone(&self.dead_fundings),
+			birthday_height: self.wallet_birthday_height,
+		}
 	}
 
 	/// Serve this node's fee-rate cache to another node.
@@ -2068,7 +2178,45 @@ impl Node {
 	pub fn close_channel(
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 	) -> Result<(), Error> {
-		self.close_channel_internal(user_channel_id, counterparty_node_id, false, None)
+		self.close_channel_internal(
+			user_channel_id,
+			counterparty_node_id,
+			ChannelClose::Cooperative {
+				target_feerate_sat_per_1000_weight: None,
+				shutdown_script: None,
+			},
+		)
+	}
+
+	/// Close a previously opened channel cooperatively, paying our side out to
+	/// `shutdown_script` instead of this node's own wallet — e.g. the address of another
+	/// wallet in the process — at `target_feerate_sat_per_1000_weight` if given.
+	///
+	/// The script must be a segwit output LDK will send in `shutdown` (P2WPKH, P2WSH, or a
+	/// v1+ witness program such as P2TR; LDK refuses legacy P2PKH and P2SH for its own side);
+	/// anything else is refused with [`Error::InvalidShutdownScript`] before the channel is
+	/// touched. A segwit v1+ script (e.g. taproot) also needs the
+	/// counterparty to support `option_shutdown_anysegwit`, and a channel opened with an
+	/// upfront shutdown script cannot be redirected: both fail with
+	/// [`Error::ChannelClosingFailed`]. `None` pays out to this node's wallet, as
+	/// [`Node::close_channel`] does. As there, the peer is forgotten when this was its last
+	/// channel.
+	pub fn close_channel_to(
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		shutdown_script: Option<ScriptBuf>, target_feerate_sat_per_1000_weight: Option<u32>,
+	) -> Result<(), Error> {
+		let shutdown_script = match shutdown_script {
+			Some(script) => Some(shutdown_script_from(script).map_err(|e| {
+				log_error!(self.logger, "Refusing to close channel to a non-standard script");
+				e
+			})?),
+			None => None,
+		};
+		self.close_channel_internal(
+			user_channel_id,
+			counterparty_node_id,
+			ChannelClose::Cooperative { target_feerate_sat_per_1000_weight, shutdown_script },
+		)
 	}
 
 	/// Force-close a previously opened channel.
@@ -2088,23 +2236,23 @@ impl Node {
 		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
 		reason: Option<String>,
 	) -> Result<(), Error> {
-		self.close_channel_internal(user_channel_id, counterparty_node_id, true, reason)
+		self.close_channel_internal(
+			user_channel_id,
+			counterparty_node_id,
+			ChannelClose::Force { reason },
+		)
 	}
 
 	fn close_channel_internal(
-		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey, force: bool,
-		force_close_reason: Option<String>,
+		&self, user_channel_id: &UserChannelId, counterparty_node_id: PublicKey,
+		close: ChannelClose,
 	) -> Result<(), Error> {
-		debug_assert!(
-			force_close_reason.is_none() || force,
-			"Reason can only be set for force closures"
-		);
 		let open_channels =
 			self.channel_manager.list_channels_with_counterparty(&counterparty_node_id);
 		if let Some(channel_details) =
 			open_channels.iter().find(|c| c.user_channel_id == user_channel_id.0)
 		{
-			if force {
+			if let ChannelClose::Force { reason: force_close_reason } = close {
 				if self.config.anchor_channels_config.as_ref().map_or(false, |acc| {
 					acc.trusted_peers_no_reserve.contains(&counterparty_node_id)
 				}) {
@@ -2134,9 +2282,18 @@ impl Node {
 							Error::ChannelClosingFailed
 						})?;
 				}
-			} else {
+			} else if let ChannelClose::Cooperative {
+				target_feerate_sat_per_1000_weight,
+				shutdown_script,
+			} = close
+			{
 				self.channel_manager
-					.close_channel(&channel_details.channel_id, &counterparty_node_id)
+					.close_channel_with_feerate_and_script(
+						&channel_details.channel_id,
+						&counterparty_node_id,
+						target_feerate_sat_per_1000_weight,
+						shutdown_script,
+					)
 					.map_err(|e| {
 						log_error!(self.logger, "Failed to close channel: {:?}", e);
 						Error::ChannelClosingFailed
@@ -2334,6 +2491,18 @@ impl Node {
 		peers
 	}
 
+	/// The routing graph this node routes over, for another [`Node`] in this process to
+	/// share through [`Builder::set_shared_graph`].
+	pub fn network_graph_handle(&self) -> Arc<Graph> {
+		Arc::clone(&self.network_graph)
+	}
+
+	/// The pathfinding scorer this node routes with, for another [`Node`] in this process
+	/// to share through [`Builder::set_shared_graph`].
+	pub fn scorer_handle(&self) -> Arc<Mutex<Scorer>> {
+		Arc::clone(&self.scorer)
+	}
+
 	/// Returns a handler allowing to query the network graph.
 	#[cfg(not(feature = "uniffi"))]
 	pub fn network_graph(&self) -> NetworkGraph {
@@ -2386,6 +2555,15 @@ impl Drop for Node {
 	fn drop(&mut self) {
 		let _ = self.stop();
 	}
+}
+
+/// What [`Node::stop_and_quiesce`] found once the node had stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuiesceReport {
+	/// The height the Lightning wallet is synced to.
+	pub last_block_height: u32,
+	/// How many events wait in the persisted queue for the application to handle.
+	pub pending_events: usize,
 }
 
 /// Represents the status of the [`Node`].
@@ -2549,6 +2727,29 @@ impl_writeable_tlv_based!(NodeMetrics, {
 	(10, latest_channel_monitor_archival_height, option),
 });
 
+/// How [`Node::close_channel_internal`] closes a channel.
+enum ChannelClose {
+	/// Cooperatively; `None`s are LDK's defaults (its fee estimate, the node's own wallet).
+	Cooperative {
+		target_feerate_sat_per_1000_weight: Option<u32>,
+		shutdown_script: Option<ShutdownScript>,
+	},
+	/// Unilaterally, with the reason given to the peer.
+	Force { reason: Option<String> },
+}
+
+/// A caller's payout script as a `shutdown` script: only the segwit forms LDK sends for its own
+/// side of a close (P2WPKH, P2WSH, v1+ witness programs).
+pub(crate) fn shutdown_script_from(script: ScriptBuf) -> Result<ShutdownScript, Error> {
+	ShutdownScript::try_from(script).map_err(|_| Error::InvalidShutdownScript)
+}
+
+/// Whether a node runs the periodic node-announcement broadcast: only one that may announce,
+/// which includes its [`config::AnnouncePolicy`].
+pub(crate) fn broadcasts_node_announcements(config: &Config) -> bool {
+	may_announce_channel(config).is_ok()
+}
+
 pub(crate) fn total_anchor_channels_reserve_sats(
 	channel_manager: &ChannelManager, config: &Config,
 ) -> u64 {
@@ -2567,4 +2768,200 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 			.count() as u64;
 		anchor_channels_config.total_reserve_sats(count)
 	})
+}
+
+#[cfg(test)]
+mod announce_policy_tests {
+	use super::*;
+
+	use bitcoin::Network;
+	use lightning::util::test_utils::TestStore;
+
+	fn announcing_config(announce: bool) -> Config {
+		let mut config = Config::default();
+		config.network = Network::Regtest;
+		config.node_alias = Some(NodeAlias([7u8; 32]));
+		config.listening_addresses = Some(vec![SocketAddress::TcpIpV4 {
+			addr: [127, 0, 0, 1],
+			port: 19735,
+		}]);
+		config.announce_policy.announce = announce;
+		config
+	}
+
+	fn node(config: Config, seed: u8) -> Node {
+		let mut builder = Builder::from_config(config);
+		builder.set_log_facade_logger();
+		builder.set_entropy_seed_bytes([seed; 64]);
+		builder.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None);
+		builder.build_with_store(Arc::new(TestStore::new(false))).unwrap()
+	}
+
+	fn peer() -> PublicKey {
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let key = bitcoin::secp256k1::SecretKey::from_slice(&[3u8; 32]).unwrap();
+		PublicKey::from_secret_key(&secp, &key)
+	}
+
+	/// The announced open is refused up front for a node whose policy says no, although its
+	/// alias and addresses are complete; the same node announcing gets past the check (and
+	/// stops at "not running", the next one).
+	#[test]
+	fn an_unannounced_node_refuses_announced_opens() {
+		let address = SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 9 };
+		let quiet = node(announcing_config(false), 61);
+		assert_eq!(
+			quiet.open_announced_channel(peer(), address.clone(), 100_000, None, None),
+			Err(Error::ChannelCreationFailed)
+		);
+		let public = node(announcing_config(true), 62);
+		assert_eq!(
+			public.open_announced_channel(peer(), address, 100_000, None, None),
+			Err(Error::NotRunning)
+		);
+	}
+
+	/// The node-announcement loop is not even started for such a node.
+	#[test]
+	fn an_unannounced_node_never_broadcasts_its_announcement() {
+		assert!(broadcasts_node_announcements(&announcing_config(true)));
+		assert!(!broadcasts_node_announcements(&announcing_config(false)));
+	}
+}
+
+#[cfg(test)]
+mod close_to_tests {
+	use super::*;
+
+	use bitcoin::hashes::Hash;
+	use bitcoin::key::TweakedPublicKey;
+	use bitcoin::opcodes::all::OP_RETURN;
+	use bitcoin::script::Builder as ScriptBuilder;
+	use bitcoin::{PubkeyHash, ScriptHash, WPubkeyHash, WScriptHash, XOnlyPublicKey};
+	use lightning::util::test_utils::TestStore;
+
+	fn xonly() -> XOnlyPublicKey {
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let key = bitcoin::secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+		key.x_only_public_key(&secp).0
+	}
+
+	/// Every segwit payout form converts, unchanged.
+	#[test]
+	fn segwit_payout_scripts_are_accepted() {
+		for script in [
+			ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([1u8; 20])),
+			ScriptBuf::new_p2wsh(&WScriptHash::from_byte_array([2u8; 32])),
+			ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(xonly())),
+		] {
+			let shutdown = shutdown_script_from(script.clone()).expect("a segwit script");
+			let back: ScriptBuf = shutdown.into();
+			assert_eq!(back, script);
+		}
+	}
+
+	/// Legacy outputs, which LDK will not send for its own side, and anything non-standard.
+	#[test]
+	fn other_scripts_are_refused() {
+		for script in [
+			ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array([3u8; 20])),
+			ScriptBuf::new_p2sh(&ScriptHash::from_byte_array([4u8; 20])),
+			ScriptBuf::new(),
+			ScriptBuilder::new().push_opcode(OP_RETURN).push_slice([0u8; 8]).into_script(),
+			ScriptBuf::from_bytes(vec![0x00, 0x05, 1, 2, 3, 4, 5]),
+		] {
+			assert_eq!(shutdown_script_from(script).err(), Some(Error::InvalidShutdownScript));
+		}
+	}
+
+	/// The script is checked before anything else, so a bad one is refused even for a
+	/// channel that does not exist; a good one for an unknown channel is the no-op
+	/// `close_channel` has always been.
+	#[test]
+	fn close_channel_to_checks_the_script_first() {
+		let mut builder = Builder::new();
+		builder.set_network(bitcoin::Network::Regtest);
+		builder.set_log_facade_logger();
+		builder.set_entropy_seed_bytes([81u8; 64]);
+		builder.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None);
+		let node = builder.build_with_store(Arc::new(TestStore::new(false))).unwrap();
+		let peer = {
+			let secp = bitcoin::secp256k1::Secp256k1::new();
+			let key = bitcoin::secp256k1::SecretKey::from_slice(&[8u8; 32]).unwrap();
+			PublicKey::from_secret_key(&secp, &key)
+		};
+		let unknown = UserChannelId(42);
+		assert_eq!(
+			node.close_channel_to(&unknown, peer, Some(ScriptBuf::new()), None),
+			Err(Error::InvalidShutdownScript)
+		);
+		let payout = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([1u8; 20]));
+		assert_eq!(node.close_channel_to(&unknown, peer, Some(payout), Some(253)), Ok(()));
+	}
+}
+
+#[cfg(test)]
+mod quiesce_tests {
+	use super::*;
+
+	use std::sync::Arc;
+
+	use bitcoin::Network;
+	use lightning::util::test_utils::TestStore;
+
+	fn builder(seed: u8) -> Builder {
+		let mut builder = Builder::new();
+		builder.set_network(Network::Regtest);
+		builder.set_log_facade_logger();
+		builder.set_entropy_seed_bytes([seed; 64]);
+		builder.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None);
+		builder
+	}
+
+	/// Start, stop, and a quiesce on a node that is not running: the first stop is clean,
+	/// the quiesce says so.
+	#[test]
+	fn stop_then_quiesce_on_an_in_memory_node() {
+		let node = builder(11).build_with_store(Arc::new(TestStore::new(false))).unwrap();
+		node.start().unwrap();
+		assert!(node.status().is_running);
+		node.stop().unwrap();
+		assert!(!node.status().is_running);
+		assert_eq!(node.stop_and_quiesce(), Err(Error::NotRunning));
+
+		node.start().unwrap();
+		let report = node.stop_and_quiesce().unwrap();
+		assert_eq!(report, QuiesceReport { last_block_height: 0, pending_events: 0 });
+		assert!(!node.status().is_running);
+	}
+
+	/// With a SQLite store at the default path the quiesce checkpoints it, and the file
+	/// is there to copy afterwards.
+	#[test]
+	fn quiesce_checkpoints_the_sqlite_store() {
+		let dir = std::env::temp_dir().join(format!(
+			"ldk-node-quiesce-{}-{:?}",
+			std::process::id(),
+			std::time::Instant::now()
+		));
+		let _ = std::fs::remove_dir_all(&dir);
+		let mut builder = builder(12);
+		builder.set_storage_dir_path(dir.to_string_lossy().into_owned());
+		let node = builder.build().unwrap();
+		node.start().unwrap();
+
+		let report = node.stop_and_quiesce().unwrap();
+		assert_eq!(report.last_block_height, 0);
+		assert_eq!(report.pending_events, 0);
+
+		let db_path = dir.join(io::sqlite_store::SQLITE_DB_FILE_NAME);
+		assert!(db_path.exists(), "the store is where an export copies it from");
+		let wal = db_path.with_extension("sqlite-wal");
+		assert!(
+			!wal.exists() || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) == 0,
+			"the write-ahead log is folded into the database"
+		);
+		drop(node);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
 }

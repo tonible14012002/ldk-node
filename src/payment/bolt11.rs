@@ -616,7 +616,11 @@ impl Bolt11Payment {
 				Error::InvoiceCreationFailed
 			})?;
 
-		log_info!(self.logger, "Invoice (with manual route hints) created: {}", invoice);
+		log_info!(
+			self.logger,
+			"Invoice (with manual route hints) created: payment hash {}",
+			invoice.payment_hash()
+		);
 
 		let payment_hash = PaymentHash(invoice.payment_hash().to_byte_array());
 		let id = PaymentId(payment_hash.0);
@@ -660,7 +664,7 @@ impl Bolt11Payment {
 
 			match self.channel_manager.create_bolt11_invoice(invoice_params) {
 				Ok(inv) => {
-					log_info!(self.logger, "Invoice created: {}", inv);
+					log_info!(self.logger, "Invoice created: payment hash {}", inv.payment_hash());
 					inv
 				},
 				Err(e) => {

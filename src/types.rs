@@ -90,9 +90,19 @@ pub(crate) type Router = DefaultRouter<
 	ProbabilisticScoringFeeParameters,
 	Scorer,
 >;
-pub(crate) type Scorer = ProbabilisticScorer<Arc<Graph>, Arc<Logger>>;
+/// The pathfinding scorer over a [`Graph`], as [`Node::scorer_handle`] hands it out and
+/// [`Builder::set_shared_graph`] takes it.
+///
+/// [`Node::scorer_handle`]: crate::Node::scorer_handle
+/// [`Builder::set_shared_graph`]: crate::Builder::set_shared_graph
+pub type Scorer = ProbabilisticScorer<Arc<Graph>, Arc<Logger>>;
 
-pub(crate) type Graph = gossip::NetworkGraph<Arc<Logger>>;
+/// The routing graph, as [`Node::network_graph_handle`] hands it out and
+/// [`Builder::set_shared_graph`] takes it.
+///
+/// [`Node::network_graph_handle`]: crate::Node::network_graph_handle
+/// [`Builder::set_shared_graph`]: crate::Builder::set_shared_graph
+pub type Graph = gossip::NetworkGraph<Arc<Logger>>;
 
 pub(crate) type UtxoLookup = GossipVerifier<RuntimeSpawner, Arc<dyn UtxoSource>, Arc<Logger>>;
 

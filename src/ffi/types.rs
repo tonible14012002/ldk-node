@@ -11,7 +11,7 @@
 // Make sure to add any re-exported items that need to be used in uniffi below.
 
 pub use crate::config::{
-	default_config, AnchorChannelsConfig, BackgroundSyncConfig, ElectrumSyncConfig,
+	default_config, AnchorChannelsConfig, AnnouncePolicy, BackgroundSyncConfig, ElectrumSyncConfig,
 	EsploraSyncConfig, MaxDustHTLCExposure,
 };
 pub use crate::graph::{ChannelInfo, ChannelUpdateInfo, NodeAnnouncementInfo, NodeInfo};

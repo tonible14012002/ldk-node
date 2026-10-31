@@ -198,6 +198,30 @@ where
 			.collect()
 	}
 
+	/// Whether `tx` touches this wallet: it pays one of the wallet's scripts, or spends an
+	/// output the wallet's graph holds as its own.
+	///
+	/// The BROADCAST tail asks this to tell which of several wallets a package belongs to.
+	/// Ownership is decided on the graph as it stands, so a funding transaction built by this
+	/// wallet is its own (it spends the wallet's coins) even before it is inserted.
+	pub(crate) fn is_relevant_tx(&self, tx: &Transaction) -> bool {
+		let locked_wallet = self.inner.lock().unwrap();
+		if tx.output.iter().any(|o| locked_wallet.is_mine(o.script_pubkey.clone())) {
+			return true;
+		}
+		let graph = locked_wallet.tx_graph();
+		tx.input.iter().any(|i| {
+			graph
+				.get_txout(i.previous_output)
+				.map_or(false, |txout| locked_wallet.is_mine(txout.script_pubkey.clone()))
+		})
+	}
+
+	/// Whether the wallet's graph holds a transaction with `txid`.
+	pub(crate) fn knows_tx(&self, txid: &Txid) -> bool {
+		self.inner.lock().unwrap().tx_graph().get_tx(*txid).is_some()
+	}
+
 	pub(crate) fn get_cached_txs(&self) -> Vec<Arc<Transaction>> {
 		self.inner.lock().unwrap().tx_graph().full_txs().map(|tx_node| tx_node.tx).collect()
 	}
@@ -397,7 +421,20 @@ where
 		locktime: LockTime,
 	) -> Result<Transaction, Error> {
 		let fee_rate = self.fee_estimator.estimate_fee_rate(confirmation_target);
+		self.create_funding_transaction_at_fee_rate(output_script, amount, fee_rate, locktime)
+	}
 
+	/// The fee rate this wallet would fund at for `confirmation_target`: what a channel
+	/// funded by another wallet ([`crate::funding::FundingSource`]) is asked to pay.
+	pub(crate) fn funding_fee_rate(&self, confirmation_target: ConfirmationTarget) -> FeeRate {
+		self.fee_estimator.estimate_fee_rate(confirmation_target)
+	}
+
+	/// [`Self::create_funding_transaction`] at an explicit fee rate — the rate the wallet
+	/// whose channel this funds asked for. Inputs are reserved the same way.
+	pub(crate) fn create_funding_transaction_at_fee_rate(
+		&self, output_script: ScriptBuf, amount: Amount, fee_rate: FeeRate, locktime: LockTime,
+	) -> Result<Transaction, Error> {
 		let mut locked_wallet = self.inner.lock().unwrap();
 		let mut tx_builder = locked_wallet.build_tx();
 
@@ -1997,6 +2034,70 @@ mod chain_listen_tests {
 		assert_eq!(
 			found.get(&a2.compute_txid()),
 			Some(&DeadFundingProof::DeadParent { parent_txid: a.compute_txid() })
+		);
+	}
+
+	fn funding_request(seed: u8, sats: u64) -> crate::funding::FundingRequest {
+		crate::funding::FundingRequest {
+			temporary_channel_id: lightning::ln::types::ChannelId([seed; 32]),
+			counterparty_node_id: bitcoin::secp256k1::PublicKey::from_secret_key(
+				&bitcoin::secp256k1::Secp256k1::new(),
+				&bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap(),
+			),
+			output_script: channel_output(seed),
+			amount_sats: sats,
+			confirmation_target_sat_per_kw: 253,
+			locktime: absolute::LockTime::ZERO,
+		}
+	}
+
+	/// Another node's channel funded from this wallet: the inputs are reserved here, so this
+	/// wallet's own next funding cannot pick them, and they come back on release.
+	#[test]
+	fn a_wallet_funding_source_reserves_its_inputs_until_released() {
+		use crate::funding::{FundingSource, WalletFundingSource};
+
+		let (wallet, _store, coin) = wallet_with_one_confirmed_coin();
+		let source =
+			WalletFundingSource::new(Arc::clone(&wallet), Arc::new(Logger::new_log_facade()));
+
+		let request = funding_request(1, 30_000);
+		let tx = source.create_funding_transaction(request.clone()).expect("the coin funds it");
+		assert!(spends(&tx, coin));
+		assert!(
+			tx.output.iter().any(|o| o.script_pubkey == request.output_script
+				&& o.value == Amount::from_sat(30_000)),
+			"pays the channel output exactly"
+		);
+		assert!(tx.input.iter().all(|i| !i.witness.is_empty()), "signed, segwit inputs");
+		assert_eq!(
+			fund_channel(&wallet, 2, 30_000).map(|tx| tx.compute_txid()),
+			Err(crate::Error::InsufficientFunds),
+			"the funding wallet's own coin selection skips the reserved coin"
+		);
+
+		source.release(request.temporary_channel_id);
+		let retry = fund_channel(&wallet, 2, 30_000).expect("released, the coin is spendable");
+		assert!(spends(&retry, coin));
+	}
+
+	/// Once the opening node broadcast the funding, a late release must not hand back
+	/// inputs that are spent on the network.
+	#[test]
+	fn a_funded_open_is_not_released() {
+		use crate::funding::{FundingSource, WalletFundingSource};
+
+		let (wallet, _store, _coin) = wallet_with_one_confirmed_coin();
+		let source =
+			WalletFundingSource::new(Arc::clone(&wallet), Arc::new(Logger::new_log_facade()));
+		let request = funding_request(1, 30_000);
+		source.create_funding_transaction(request.clone()).expect("the coin funds it");
+		source.funded(request.temporary_channel_id);
+		source.release(request.temporary_channel_id);
+		assert_eq!(
+			fund_channel(&wallet, 2, 30_000).map(|tx| tx.compute_txid()),
+			Err(crate::Error::InsufficientFunds),
+			"the broadcast funding still spends the coin"
 		);
 	}
 }

@@ -49,10 +49,10 @@ use lightning::chain::WatchedOutput;
 use crate::chain::provider::{
 	WireLightningSyncRequest, WireLightningSyncResponse, WireSyncRequest, WireUpdate,
 };
+use crate::chain::target::{SyncTarget, TargetId};
 use crate::chain::ChainLayer;
 use crate::config::{BackgroundSyncConfig, WALLET_SYNC_INTERVAL_MINIMUM_SECS};
 use crate::logger::{log_trace, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, Sweeper, Wallet};
 use crate::Error;
 
 use async_trait::async_trait;
@@ -61,26 +61,32 @@ use async_trait::async_trait;
 ///
 /// Esplora and Electrum implement these completely differently; only the loop
 /// that drives them is common, so only the loop is shared.
+///
+/// The on-chain side is per target: each wallet has its own descriptors, its
+/// own checkpoint chain and its own "first sync or incremental" decision. The
+/// Lightning side takes every target at once, because `lightning-transaction-sync`
+/// syncs a list of `Confirm`s against one chain tip in one pass — N nodes' channel
+/// managers, chain monitors and sweepers are just a longer list.
 #[async_trait]
 pub(crate) trait TxBasedBackend: Send + Sync {
-	async fn sync_onchain_wallet(&self) -> Result<(), Error>;
+	async fn sync_onchain_wallet(&self, target: &SyncTarget) -> Result<(), Error>;
 
-	async fn sync_lightning_wallet(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error>;
+	/// Sync the Lightning side of every target in `targets` in one pass. A
+	/// target whose Lightning sync is already in progress is skipped by the
+	/// implementation (it subscribes to the running pass instead when every
+	/// target is), so the loop never has to know.
+	async fn sync_lightning_wallets(&self, targets: &[Arc<SyncTarget>]) -> Result<(), Error>;
 }
 
 /// The background loop shared by both transaction-based engines.
 ///
 /// Moved verbatim from `ChainSource::start_tx_based_sync_loop`; the only
-/// changes are that the backend is a parameter rather than `self`, and fee
-/// refreshes go through the layer's FEE slot.
-#[allow(clippy::too_many_arguments)]
+/// changes are that the backend is a parameter rather than `self`, fee
+/// refreshes go through the layer's FEE slot, and every tick runs over the
+/// layer's current targets rather than one fixed triple.
 pub(crate) async fn run_tx_based_sync_loop(
 	backend: &dyn TxBasedBackend, layer: Arc<ChainLayer>,
-	mut stop_sync_receiver: tokio::sync::watch::Receiver<()>, channel_manager: Arc<ChannelManager>,
-	chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
+	mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
 	background_sync_config: &BackgroundSyncConfig, logger: Arc<Logger>,
 ) {
 	// Setup syncing intervals
@@ -118,19 +124,22 @@ pub(crate) async fn run_tx_based_sync_loop(
 				return;
 			}
 			_ = onchain_wallet_sync_interval.tick() => {
-				if backend.sync_onchain_wallet().await.is_ok() {
-					layer.reap_dead_fundings(&channel_manager, &chain_monitor);
+				// Each wallet on its own: one that fails does not hold the others back,
+				// and the dead-funding pass only follows a wallet that did sync.
+				for target in layer.targets().snapshot() {
+					if backend.sync_onchain_wallet(&target).await.is_ok() {
+						layer.reap_dead_fundings_of(&target);
+					}
 				}
 			}
 			_ = fee_rate_update_interval.tick() => {
 				let _ = layer.update_fee_rate_estimates().await;
 			}
 			_ = lightning_wallet_sync_interval.tick() => {
-				let _ = backend.sync_lightning_wallet(
-					Arc::clone(&channel_manager),
-					Arc::clone(&chain_monitor),
-					Arc::clone(&output_sweeper),
-					).await;
+				if !layer.targets().is_empty() {
+					let targets = layer.targets().snapshot();
+					let _ = backend.sync_lightning_wallets(&targets).await;
+				}
 			}
 		}
 	}
@@ -164,21 +173,37 @@ pub(crate) trait SyncEngine: Send + Sync {
 	/// applies to a foreground pass exactly as to a background one. A
 	/// transaction-based engine carries unconfirmed transactions in its own
 	/// sync and asks nothing of the layer here.
-	async fn sync_once(
-		&self, layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
-		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error>;
+	///
+	/// `target` is the node that asked. An engine whose pass is per target
+	/// syncs that one; an engine whose pass is one poll for everyone (the
+	/// block-polling engine) runs the poll and answers for `target`.
+	async fn sync_once(&self, layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error>;
 
-	/// Run until `stop_sync_receiver` fires.
+	/// Run until `stop_sync_receiver` fires, over whatever targets the layer
+	/// holds at each pass ([`ChainLayer::targets`]).
 	///
 	/// Takes the layer so fee refreshes go through the FEE slot rather than
 	/// through the engine's own backend — otherwise a swapped fee adapter
 	/// would apply to foreground calls and silently not to background ones.
 	async fn run_background(
 		&self, layer: Arc<ChainLayer>, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
 	);
+
+	/// A target was added to the layer's registry. Called after the registry
+	/// holds it, so a background pass may already be syncing it.
+	///
+	/// Defaults to accepting: every engine that reads the registry per pass
+	/// needs nothing more. An engine with per-target state built at launch —
+	/// the filter-driven engine's listeners — hooks in here to build it for a
+	/// late target, and may refuse (`Err`) a registration it cannot honour;
+	/// the layer then removes the target again and returns the error.
+	fn target_registered(&self, _target: &Arc<SyncTarget>) -> Result<(), Error> {
+		Ok(())
+	}
+
+	/// A target left the registry; the counterpart of
+	/// [`SyncEngine::target_registered`].
+	fn target_unregistered(&self, _id: TargetId) {}
 
 	/// Whether this engine has no mempool view of its own, so the on-chain
 	/// wallet only learns of the node's own broadcasts if the BROADCAST tail
@@ -192,12 +217,6 @@ pub(crate) trait SyncEngine: Send + Sync {
 	/// spent are gone.
 	fn tracks_own_broadcasts(&self) -> bool {
 		false
-	}
-
-	/// The on-chain wallet this engine keeps in step, for the BROADCAST tail
-	/// to record what left the node. `None` for an engine that has none.
-	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
-		None
 	}
 
 	/// Whether this node's MEMPOOL chain answers from a mempool this node

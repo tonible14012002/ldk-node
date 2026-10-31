@@ -10,13 +10,14 @@ use crate::broadcast_queue::BroadcastQueue;
 use crate::chain::cbf::birthday::birthday_checkpoint;
 #[cfg(feature = "cbf")]
 use crate::chain::cbf::source::FilterSource;
+use crate::chain::host::{ChainHost, ChainHostBuilder};
+use crate::net::listener::InboundListener;
 use crate::chain::provider::ChainDataProvider;
-use crate::chain::{ChainLayer, DEFAULT_ESPLORA_SERVER_URL};
 #[cfg(feature = "cbf")]
 use crate::config::CbfConfig;
 use crate::config::{
-	default_user_config, may_announce_channel, AnnounceError, BitcoindRestClientConfig, Config,
-	ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
+	check_announce_configuration, default_user_config, AnnounceError,
+	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
 	WALLET_KEYS_SEED_LEN,
 };
 
@@ -24,7 +25,6 @@ use crate::connection::ConnectionManager;
 use crate::custom_gossip::CustomGossipMessageHandler;
 use crate::dead_funding;
 use crate::event::EventQueue;
-use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::GossipSource;
 use crate::io::sqlite_store::SqliteStore;
 use crate::io::utils::{read_node_metrics, write_node_metrics};
@@ -35,13 +35,12 @@ use crate::io::{
 use crate::liquidity::{
 	LSPS1ClientConfig, LSPS2ClientConfig, LSPS2ServiceConfig, LiquiditySourceBuilder,
 };
-use crate::logger::{log_error, log_info, log_warn, LdkLogger, LogLevel, LogWriter, Logger};
+use crate::logger::{log_error, log_info, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::peer_store::PeerStore;
-use crate::tx_broadcaster::TransactionBroadcaster;
 use crate::types::{
 	ChainMonitor, ChannelManager, DynStore, GossipSync, Graph, KeysManager, MessageRouter,
-	OnionMessenger, PaymentStore, PeerManager,
+	OnionMessenger, P2PGossipSync, PaymentStore, PeerManager, Scorer, UtxoLookup,
 };
 use crate::wallet::persist::KVStoreWalletPersister;
 use crate::wallet::Wallet;
@@ -85,7 +84,6 @@ use std::default::Default;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use vss_client::headers::{FixedHeaders, LnurlAuthToJwtProvider, VssHeaderProvider};
@@ -95,7 +93,7 @@ const VSS_LNURL_AUTH_HARDENED_CHILD_INDEX: u32 = 138;
 const LSPS_HARDENED_CHILD_INDEX: u32 = 577;
 
 #[derive(Clone)]
-enum ChainDataSourceConfig {
+pub(crate) enum ChainDataSourceConfig {
 	Esplora {
 		server_url: String,
 		sync_config: Option<EsploraSyncConfig>,
@@ -134,13 +132,13 @@ enum ChainDataSourceConfig {
 /// Where this node reads the raw BIP157/158 data it serves to other nodes;
 /// see [`NodeBuilder::set_raw_chain_source_bitcoind_rpc`].
 #[derive(Clone)]
-struct RawChainSourceConfig {
-	url: String,
-	user: String,
-	password: String,
-	cert_sha256: Option<String>,
+pub(crate) struct RawChainSourceConfig {
+	pub(crate) url: String,
+	pub(crate) user: String,
+	pub(crate) password: String,
+	pub(crate) cert_sha256: Option<String>,
 	/// See [`NodeBuilder::set_raw_chain_source_allow_insecure_http`].
-	allow_insecure_http: bool,
+	pub(crate) allow_insecure_http: bool,
 }
 
 // Hand-written so the credentials never reach a log.
@@ -306,6 +304,15 @@ pub enum BuildError {
 	/// does not parse, or an external fee server whose client could not be
 	/// built. The log says which.
 	ChainSourceSetupFailed,
+	/// A [`ChainHost`] was given ([`NodeBuilder::set_chain_host`]) beside a
+	/// chain source of the node's own; the two would disagree on where the
+	/// chain comes from, so neither is picked.
+	ChainHostConflict,
+	/// A shared network graph ([`NodeBuilder::set_shared_graph`]) was given
+	/// beside a Rapid Gossip Sync source. Only the node that owns the graph
+	/// syncs it from RGS; a second one would write the same snapshots into
+	/// the same graph.
+	SharedGraphWithRgs,
 }
 
 impl fmt::Display for BuildError {
@@ -334,6 +341,12 @@ impl fmt::Display for BuildError {
 				write!(f, "Given network does not match the node's previously configured network.")
 			},
 			Self::ChainSourceSetupFailed => write!(f, "Failed to set up the chain source."),
+			Self::ChainHostConflict => {
+				write!(f, "A chain host and a chain source were both configured.")
+			},
+			Self::SharedGraphWithRgs => {
+				write!(f, "A shared network graph cannot be synced from Rapid Gossip Sync.")
+			},
 		}
 	}
 }
@@ -358,6 +371,10 @@ pub struct NodeBuilder {
 	cbf_filter_source: Option<CbfFilterSource>,
 	raw_chain_source_config: Option<RawChainSourceConfig>,
 	raw_chain_source_allow_insecure_http: bool,
+	chain_host: Option<Arc<ChainHost>>,
+	shared_graph: Option<SharedGraph>,
+	inbound_listener: Option<Arc<InboundListener>>,
+	wallet_birthday: Option<BestBlock>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
 	log_writer_config: Option<LogWriterConfig>,
@@ -389,11 +406,95 @@ impl NodeBuilder {
 			cbf_filter_source: None,
 			raw_chain_source_config: None,
 			raw_chain_source_allow_insecure_http: false,
+			chain_host: None,
+			shared_graph: None,
+			inbound_listener: None,
+			wallet_birthday: None,
 			gossip_source_config,
 			liquidity_source_config,
 			log_writer_config,
 			custom_gossip_enabled,
 		}
+	}
+
+	/// Attaches the [`Node`] to a [`ChainHost`] shared with other nodes in this process,
+	/// instead of giving it a chain source of its own.
+	///
+	/// The node then takes the host's chain source, sync engine, fee estimator and
+	/// broadcaster; its wallet and channels are one target of the host's sync, started with
+	/// the node and stopped with it. The chain source setters on this builder must not be
+	/// used beside this one: the build fails with [`BuildError::ChainHostConflict`].
+	pub fn set_chain_host(&mut self, host: Arc<ChainHost>) -> &mut Self {
+		self.chain_host = Some(host);
+		self
+	}
+
+	/// Routes over a network graph and scorer another [`Node`] in this process owns, from
+	/// [`Node::network_graph_handle`] and [`Node::scorer_handle`], instead of reading and
+	/// keeping a copy of its own.
+	///
+	/// This node still runs P2P gossip over the shared graph — what its peers announce
+	/// feeds the one graph — but it never prunes or persists it: that is the owner's job,
+	/// into the owner's store, and a ~130 MB second copy would buy nothing. A Rapid Gossip
+	/// Sync source beside a shared graph fails the build with
+	/// [`BuildError::SharedGraphWithRgs`]: only the owner syncs RGS.
+	pub fn set_shared_graph(&mut self, graph: Arc<Graph>, scorer: Arc<Mutex<Scorer>>) -> &mut Self {
+		self.shared_graph = Some(SharedGraph { graph, scorer });
+		self
+	}
+
+	/// Seeds a wallet that has never been scanned at `best_block` instead of genesis: a
+	/// wallet created beside a running node (a secondary) cannot hold anything older than
+	/// its creation, and a fresh wallet rooted at genesis asks a pruned or block-polling
+	/// chain source for history it does not have. Ignored once the wallet has persisted a
+	/// block of its own; a filter-following host's compiled birthday wins over it.
+	pub fn set_wallet_birthday(&mut self, best_block: BestBlock) -> &mut Self {
+		self.wallet_birthday = Some(best_block);
+		self
+	}
+
+	/// Takes inbound connections through an [`InboundListener`] shared with other nodes in
+	/// this process, instead of binding a listener of the node's own.
+	///
+	/// On start, a node with [`Config::listening_addresses`] registers with the listener —
+	/// connections dialed for its node id are routed to it — and on stop it unregisters;
+	/// [`NodeStatus::is_listening`] reflects the registration. The addresses still say what
+	/// the node announces; the listener is bound wherever the application bound it.
+	///
+	/// [`NodeStatus::is_listening`]: crate::NodeStatus::is_listening
+	pub fn set_inbound_listener(&mut self, listener: Arc<InboundListener>) -> &mut Self {
+		self.inbound_listener = Some(listener);
+		self
+	}
+
+	/// Where this node's chain comes from: the host it was given, or a private host built
+	/// from the chain setters on this builder — the one path every node takes.
+	fn chain_selection(&self, logger: &Arc<Logger>) -> Result<ChainSelection, BuildError> {
+		if let Some(host) = &self.chain_host {
+			let own_chain_source = self.chain_data_source_config.is_some()
+				|| self.raw_chain_source_config.is_some()
+				|| self.chain_provider_fallback().is_some();
+			#[cfg(feature = "cbf")]
+			let own_chain_source = own_chain_source || self.cbf_filter_source().is_some();
+			if own_chain_source {
+				log_error!(
+					logger,
+					"A chain host and a chain source of the node's own were both configured; pick one."
+				);
+				return Err(BuildError::ChainHostConflict);
+			}
+			return Ok(ChainSelection::Shared(Arc::clone(host)));
+		}
+		Ok(ChainSelection::Own(Box::new(ChainHostBuilder::from_node_config(
+			self.config.clone(),
+			self.chain_data_source_config.clone(),
+			#[cfg(feature = "cbf")]
+			self.chain_provider_fallback(),
+			#[cfg(feature = "cbf")]
+			self.cbf_filter_source(),
+			self.raw_chain_source_config_for_build(),
+			Arc::clone(logger),
+		))))
 	}
 
 	/// Configures the [`Node`] instance to source its wallet entropy from a seed file on disk.
@@ -991,11 +1092,10 @@ impl NodeBuilder {
 			})?;
 		build_with_store_internal(
 			config,
-			self.chain_data_source_config.as_ref(),
-			self.chain_provider_fallback(),
-			#[cfg(feature = "cbf")]
-			self.cbf_filter_source(),
-			self.raw_chain_source_config_for_build().as_ref(),
+			self.chain_selection(&logger)?,
+			self.shared_graph.clone(),
+			self.inbound_listener.clone(),
+			self.wallet_birthday,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1018,11 +1118,10 @@ impl NodeBuilder {
 
 		build_with_store_internal(
 			config,
-			self.chain_data_source_config.as_ref(),
-			self.chain_provider_fallback(),
-			#[cfg(feature = "cbf")]
-			self.cbf_filter_source(),
-			self.raw_chain_source_config_for_build().as_ref(),
+			self.chain_selection(&logger)?,
+			self.shared_graph.clone(),
+			self.inbound_listener.clone(),
+			self.wallet_birthday,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
 			self.custom_gossip_enabled,
@@ -1425,7 +1524,6 @@ impl ArcedNodeBuilder {
 /// crash window between wallet creation and the first persisted block, which
 /// would otherwise resurrect a genesis-rooted wallet next to a
 /// `ChannelManager` already initialised at the anchor.
-#[cfg(feature = "cbf")]
 fn seed_wallet_at_birthday(
 	wallet: &mut bdk_wallet::PersistedWallet<KVStoreWalletPersister>,
 	persister: &mut KVStoreWalletPersister, anchor: BestBlock, logger: &Logger,
@@ -1451,20 +1549,37 @@ fn seed_wallet_at_birthday(
 	Ok(())
 }
 
+/// Where a node's chain comes from; see [`NodeBuilder::chain_selection`].
+enum ChainSelection {
+	/// A host shared with other nodes.
+	Shared(Arc<ChainHost>),
+	/// A host of this node's own, built from its chain setters. Boxed: the builder
+	/// carries every chain setting and dwarfs the other variant.
+	Own(Box<ChainHostBuilder>),
+}
+
+/// A graph and scorer another node owns; see [`NodeBuilder::set_shared_graph`].
+#[derive(Clone)]
+struct SharedGraph {
+	graph: Arc<Graph>,
+	scorer: Arc<Mutex<Scorer>>,
+}
+
+impl std::fmt::Debug for SharedGraph {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SharedGraph").finish_non_exhaustive()
+	}
+}
+
 /// Builds a [`Node`] instance according to the options previously configured.
-///
-/// `chain_provider_fallback` is consulted by the CBF preset alone; see
-/// [`NodeBuilder::set_chain_provider_fallback`].
 fn build_with_store_internal(
-	config: Arc<Config>, chain_data_source_config: Option<&ChainDataSourceConfig>,
-	chain_provider_fallback: Option<Arc<dyn ChainDataProvider>>,
-	#[cfg(feature = "cbf")] cbf_filter_source: Option<Arc<dyn FilterSource>>,
-	raw_chain_source_config: Option<&RawChainSourceConfig>,
+	config: Arc<Config>, chain: ChainSelection, shared_graph: Option<SharedGraph>,
+	inbound_listener: Option<Arc<InboundListener>>, wallet_birthday: Option<BestBlock>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
 ) -> Result<Node, BuildError> {
-	if let Err(err) = may_announce_channel(&config) {
+	if let Err(err) = check_announce_configuration(&config) {
 		if config.announcement_addresses.is_some() {
 			log_error!(logger, "Announcement addresses were set but some required configuration options for node announcement are missing: {}", err);
 			let build_error = if matches!(err, AnnounceError::MissingNodeAlias) {
@@ -1482,7 +1597,6 @@ fn build_with_store_internal(
 	}
 
 	// Initialize the status fields.
-	let is_listening = Arc::new(AtomicBool::new(false));
 	let node_metrics = match read_node_metrics(Arc::clone(&kv_store), Arc::clone(&logger)) {
 		Ok(metrics) => Arc::new(RwLock::new(metrics)),
 		Err(e) => {
@@ -1493,6 +1607,15 @@ fn build_with_store_internal(
 			}
 		},
 	};
+
+	// The chain layer: the host's, which every node attached to it shares. Built before
+	// the wallet, which takes the host's broadcaster and fee estimator.
+	let chain_host = match chain {
+		ChainSelection::Shared(host) => host,
+		ChainSelection::Own(host_builder) => host_builder.build()?,
+	};
+	let tx_broadcaster = Arc::clone(chain_host.tx_broadcaster());
+	let fee_estimator = Arc::clone(chain_host.fee_estimator());
 
 	// Initialize the on-chain wallet and chain access
 	let xprv = bitcoin::bip32::Xpriv::new_master(config.network, &seed_bytes).map_err(|e| {
@@ -1546,13 +1669,18 @@ fn build_with_store_internal(
 	// engine resolves — and logs — the same anchor as its resume floor; this
 	// one seeds what the engine cannot reach from the outside.
 	#[cfg(feature = "cbf")]
-	let cbf_birthday: Option<BestBlock> = match chain_data_source_config {
-		Some(ChainDataSourceConfig::Cbf { config: cbf_config, .. }) => cbf_config
-			.wallet_birthday_height
-			.and_then(|height| birthday_checkpoint(config.network, height))
-			.map(|checkpoint| BestBlock::new(checkpoint.hash, checkpoint.height)),
-		_ => None,
-	};
+	let cbf_birthday: Option<BestBlock> = chain_host
+		.wallet_birthday_height()
+		.and_then(|height| birthday_checkpoint(config.network, height))
+		.map(|checkpoint| BestBlock::new(checkpoint.hash, checkpoint.height));
+
+	// The block a fresh wallet's components start at: a filter-following host's compiled
+	// birthday checkpoint, else the birthday the caller set (a secondary created beside a
+	// running node), else genesis.
+	#[cfg(feature = "cbf")]
+	let fresh_birthday: Option<BestBlock> = cbf_birthday.or(wallet_birthday);
+	#[cfg(not(feature = "cbf"))]
+	let fresh_birthday: Option<BestBlock> = wallet_birthday;
 
 	// A wallet whose persisted chain is still rooted at genesis has never been
 	// scanned — created just now, or created earlier and never synced — and is
@@ -1564,19 +1692,15 @@ fn build_with_store_internal(
 	// between wallet creation and the first persisted block: a genesis-rooted
 	// wallet next to a `ChannelManager` initialised at the anchor is a resume
 	// the filter engine refuses.
-	#[cfg(feature = "cbf")]
 	let bdk_wallet = {
 		let mut wallet = bdk_wallet;
-		if let Some(anchor) = cbf_birthday {
+		if let Some(anchor) = fresh_birthday {
 			if wallet.latest_checkpoint().height() == 0 {
 				seed_wallet_at_birthday(&mut wallet, &mut wallet_persister, anchor, &logger)?;
 			}
 		}
 		wallet
 	};
-
-	let tx_broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
-	let fee_estimator = Arc::new(OnchainFeeEstimator::new());
 
 	let payment_store = match io::utils::read_payments(Arc::clone(&kv_store), Arc::clone(&logger)) {
 		Ok(payments) => Arc::new(PaymentStore::new(
@@ -1604,158 +1728,7 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 	));
 
-	// The chain ability seam. Every consumer below talks to `ChainLayer`; none
-	// of them knows which backend fills its slots.
-	//
-	// The fallback provider goes to the one preset that consults it; every
-	// other arm hands it back untouched, to be announced as ignored below.
-	let (chain_source, unconsulted_fallback) = match chain_data_source_config {
-		Some(ChainDataSourceConfig::Esplora { server_url, sync_config }) => {
-			let sync_config = sync_config.unwrap_or(EsploraSyncConfig::default());
-			let layer = ChainLayer::new_esplora(
-				server_url.clone(),
-				sync_config,
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			);
-			(layer, chain_provider_fallback)
-		},
-		Some(ChainDataSourceConfig::Electrum { server_url, sync_config }) => {
-			let sync_config = sync_config.unwrap_or(ElectrumSyncConfig::default());
-			let layer = ChainLayer::new_electrum(
-				server_url.clone(),
-				sync_config,
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			);
-			(layer, chain_provider_fallback)
-		},
-		Some(ChainDataSourceConfig::Bitcoind {
-			rpc_host,
-			rpc_port,
-			rpc_user,
-			rpc_password,
-			rest_client_config,
-		}) => {
-			let layer = match rest_client_config {
-				Some(rest_client_config) => ChainLayer::new_bitcoind_rest(
-					rpc_host.clone(),
-					*rpc_port,
-					rpc_user.clone(),
-					rpc_password.clone(),
-					Arc::clone(&wallet),
-					Arc::clone(&fee_estimator),
-					Arc::clone(&tx_broadcaster),
-					Arc::clone(&kv_store),
-					Arc::clone(&config),
-					rest_client_config.clone(),
-					Arc::clone(&logger),
-					Arc::clone(&node_metrics),
-				),
-				None => ChainLayer::new_bitcoind_rpc(
-					rpc_host.clone(),
-					*rpc_port,
-					rpc_user.clone(),
-					rpc_password.clone(),
-					Arc::clone(&wallet),
-					Arc::clone(&fee_estimator),
-					Arc::clone(&tx_broadcaster),
-					Arc::clone(&kv_store),
-					Arc::clone(&config),
-					Arc::clone(&logger),
-					Arc::clone(&node_metrics),
-				),
-			};
-			(layer, chain_provider_fallback)
-		},
-
-		Some(ChainDataSourceConfig::Dependent { provider, sync_config }) => {
-			let sync_config = sync_config.clone().unwrap_or(EsploraSyncConfig::default());
-			let layer = ChainLayer::new_dependent(
-				Arc::clone(provider),
-				sync_config,
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			);
-			(layer, chain_provider_fallback)
-		},
-
-		#[cfg(feature = "cbf")]
-		Some(ChainDataSourceConfig::Cbf { peers, config: cbf_config }) => {
-			let layer = ChainLayer::new_cbf(
-				peers.clone(),
-				cbf_config.clone(),
-				chain_provider_fallback,
-				cbf_filter_source,
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			)
-			.map_err(|e| {
-				log_error!(logger, "Failed to set up the CBF chain source: {}", e);
-				BuildError::ChainSourceSetupFailed
-			})?;
-			(layer, None)
-		},
-
-		None => {
-			// Default to Esplora client.
-			let server_url = DEFAULT_ESPLORA_SERVER_URL.to_string();
-			let sync_config = EsploraSyncConfig::default();
-			let layer = ChainLayer::new_esplora(
-				server_url.clone(),
-				sync_config,
-				Arc::clone(&wallet),
-				Arc::clone(&fee_estimator),
-				Arc::clone(&tx_broadcaster),
-				Arc::clone(&kv_store),
-				Arc::clone(&config),
-				Arc::clone(&logger),
-				Arc::clone(&node_metrics),
-			);
-			(layer, chain_provider_fallback)
-		},
-	};
-
-	if let Some(provider) = unconsulted_fallback {
-		log_warn!(
-			logger,
-			"A chain provider fallback ({}) is set, but the configured chain source scans its own backend and never consults one; ignoring it.",
-			provider.name()
-		);
-	}
-
-	let mut chain_source = chain_source;
-	if let Some(raw) = raw_chain_source_config {
-		// A refused configuration turns raw serving off and is logged; the node still builds.
-		chain_source.set_raw_source_bitcoind_rpc(
-			&raw.url,
-			Some(raw.user.clone()),
-			Some(raw.password.clone()),
-			raw.cert_sha256.as_deref(),
-			raw.allow_insecure_http,
-		);
-	}
-
-	let chain_source = Arc::new(chain_source);
+	let chain_source = Arc::clone(chain_host.layer());
 
 	let runtime = Arc::new(RwLock::new(None));
 
@@ -1783,36 +1756,46 @@ fn build_with_store_internal(
 		Arc::clone(&logger),
 	));
 
-	// Initialize the network graph, scorer, and router
-	let network_graph =
-		match io::utils::read_network_graph(Arc::clone(&kv_store), Arc::clone(&logger)) {
-			Ok(graph) => Arc::new(graph),
-			Err(e) => {
-				if e.kind() == std::io::ErrorKind::NotFound {
-					Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
-				} else {
-					return Err(BuildError::ReadFailed);
-				}
-			},
-		};
+	// Initialize the network graph, scorer, and router. A shared graph is another node's:
+	// nothing of it is read from — or ever written to — this node's store.
+	let graph_is_shared = shared_graph.is_some();
+	let (network_graph, scorer) = match shared_graph {
+		Some(SharedGraph { graph, scorer }) => (graph, scorer),
+		None => {
+			let network_graph = match io::utils::read_network_graph(
+				Arc::clone(&kv_store),
+				Arc::clone(&logger),
+			) {
+				Ok(graph) => Arc::new(graph),
+				Err(e) => {
+					if e.kind() == std::io::ErrorKind::NotFound {
+						Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
+					} else {
+						return Err(BuildError::ReadFailed);
+					}
+				},
+			};
 
-	let scorer = match io::utils::read_scorer(
-		Arc::clone(&kv_store),
-		Arc::clone(&network_graph),
-		Arc::clone(&logger),
-	) {
-		Ok(scorer) => Arc::new(Mutex::new(scorer)),
-		Err(e) => {
-			if e.kind() == std::io::ErrorKind::NotFound {
-				let params = ProbabilisticScoringDecayParameters::default();
-				Arc::new(Mutex::new(ProbabilisticScorer::new(
-					params,
-					Arc::clone(&network_graph),
-					Arc::clone(&logger),
-				)))
-			} else {
-				return Err(BuildError::ReadFailed);
-			}
+			let scorer = match io::utils::read_scorer(
+				Arc::clone(&kv_store),
+				Arc::clone(&network_graph),
+				Arc::clone(&logger),
+			) {
+				Ok(scorer) => Arc::new(Mutex::new(scorer)),
+				Err(e) => {
+					if e.kind() == std::io::ErrorKind::NotFound {
+						let params = ProbabilisticScoringDecayParameters::default();
+						Arc::new(Mutex::new(ProbabilisticScorer::new(
+							params,
+							Arc::clone(&network_graph),
+							Arc::clone(&logger),
+						)))
+					} else {
+						return Err(BuildError::ReadFailed);
+					}
+				},
+			};
+			(network_graph, scorer)
 		},
 	};
 
@@ -1847,7 +1830,10 @@ fn build_with_store_internal(
 	// of the `ChannelManager` and the `ChainMonitor`: a monitor cannot leave a running
 	// `ChainMonitor`, so this is where the rebroadcast loop over a dead funding ends. See
 	// `crate::dead_funding`.
-	let dead_fundings = Arc::clone(chain_source.dead_fundings());
+	let dead_fundings = Arc::new(dead_funding::DeadFundingStore::read_or_empty(
+		Arc::clone(&kv_store),
+		Arc::clone(&logger),
+	));
 	let archived_dead_monitors = if dead_fundings.is_empty() {
 		HashSet::new()
 	} else {
@@ -1967,8 +1953,7 @@ fn build_with_store_internal(
 			// birthday, where a fresh wallet was seeded above: nothing of this
 			// node's can be older, and a listener at genesis would be a resume
 			// the filter engine refuses.
-			#[cfg(feature = "cbf")]
-			let best_block = cbf_birthday.unwrap_or(best_block);
+			let best_block = fresh_birthday.unwrap_or(best_block);
 
 			let chain_params = ChainParameters { network: config.network.into(), best_block };
 			channelmanager::ChannelManager::new(
@@ -2016,6 +2001,14 @@ fn build_with_store_internal(
 	// Initialize the GossipSource
 	// Use the configured gossip source, if the user set one, otherwise default to P2PNetwork.
 	let gossip_source_config = gossip_source_config.unwrap_or(&GossipSourceConfig::P2PNetwork);
+
+	if graph_is_shared && matches!(gossip_source_config, GossipSourceConfig::RapidGossipSync(_)) {
+		log_error!(
+			logger,
+			"A shared network graph was given beside a Rapid Gossip Sync source; only the node that owns the graph may sync it from RGS."
+		);
+		return Err(BuildError::SharedGraphWithRgs);
+	}
 
 	let gossip_source = match gossip_source_config {
 		GossipSourceConfig::P2PNetwork => {
@@ -2168,24 +2161,24 @@ fn build_with_store_internal(
 	// Extract custom gossip handler for later use
 	let custom_gossip_handler = custom_message_handler.custom_gossip_handler();
 
-	let msg_handler = match gossip_source.as_gossip_sync() {
-		GossipSync::P2P(p2p_gossip_sync) => MessageHandler {
-			chan_handler: Arc::clone(&channel_manager),
-			route_handler: Arc::clone(&p2p_gossip_sync)
-				as Arc<dyn RoutingMessageHandler + Sync + Send>,
-			onion_message_handler: Arc::clone(&onion_messenger),
-			custom_message_handler,
-		},
-		GossipSync::Rapid(_) => MessageHandler {
-			chan_handler: Arc::clone(&channel_manager),
-			route_handler: Arc::new(IgnoringMessageHandler {})
-				as Arc<dyn RoutingMessageHandler + Sync + Send>,
-			onion_message_handler: Arc::clone(&onion_messenger),
-			custom_message_handler,
-		},
-		GossipSync::None => {
-			unreachable!("We must always have a gossip sync!");
-		},
+	// The peers' gossip handler. A node without a gossip sync of its own still answers
+	// its peers' routing messages over the (shared) graph, through a P2P sync built here
+	// for that alone; nothing persists or prunes through it.
+	let route_handler: Arc<dyn RoutingMessageHandler + Sync + Send> =
+		match gossip_source.as_gossip_sync() {
+			GossipSync::P2P(p2p_gossip_sync) => p2p_gossip_sync,
+			GossipSync::Rapid(_) => Arc::new(IgnoringMessageHandler {}),
+			GossipSync::None => Arc::new(P2PGossipSync::new(
+				Arc::clone(&network_graph),
+				None::<Arc<UtxoLookup>>,
+				Arc::clone(&logger),
+			)),
+		};
+	let msg_handler = MessageHandler {
+		chan_handler: Arc::clone(&channel_manager),
+		route_handler,
+		onion_message_handler: Arc::clone(&onion_messenger),
+		custom_message_handler,
 	};
 
 	let cur_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|e| {
@@ -2299,6 +2292,7 @@ fn build_with_store_internal(
 		connection_manager,
 		keys_manager,
 		network_graph,
+		graph_is_shared,
 		gossip_source,
 		liquidity_source,
 		custom_gossip_handler,
@@ -2308,10 +2302,15 @@ fn build_with_store_internal(
 		scorer,
 		peer_store,
 		payment_store,
-		is_listening,
+		shared_inbound_listener: inbound_listener,
+		inbound_listener: Mutex::new(None),
 		node_metrics,
 		dead_fundings,
+		chain_host,
+		chain_target: Mutex::new(None),
+		wallet_birthday_height: fresh_birthday.map(|b| b.height),
 		path_failures: Arc::new(crate::path_failure::PathFailureStore::new()),
+		external_fundings: Arc::new(crate::funding::ExternalFundings::default()),
 		#[cfg(feature = "swaps")]
 		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
 	})

@@ -1917,6 +1917,7 @@ mod tests {
 					Op::Disconnect(heights)
 				},
 				ChainOp::Synced { tip_height } => Op::Synced(tip_height),
+				ChainOp::Rescan { .. } => unreachable!("the node source never asks for a rescan"),
 				ChainOp::TipConfirmed { tip_height } => Op::TipConfirmed(tip_height),
 			}
 		}
@@ -2288,6 +2289,12 @@ mod tests {
 		use crate::chain::cbf::fee::new_block_fee_cache;
 		use crate::chain::cbf::WatchLedger;
 		use lightning::util::test_utils::TestStore;
+		use crate::chain::target::test_support::target_spec;
+		use crate::chain::target::TargetRegistry;
+		use crate::chain::test_wallet::fresh_regtest_wallet;
+		use crate::fee_estimator::OnchainFeeEstimator;
+		use crate::tx_broadcaster::TransactionBroadcaster;
+		use crate::types::DynStore;
 
 		let source = Arc::new(source);
 		let anchor = BlockId { height: 10, hash: source.block_at(10).block_hash() };
@@ -2297,6 +2304,17 @@ mod tests {
 		let (stop_tx, stop_rx) = watch::channel(false);
 		let metrics = Arc::new(RwLock::new(NodeMetrics::default()));
 		let logger = Arc::new(Logger::new_log_facade());
+		// The applicator stamps every registered target's metrics: one regtest target that
+		// shares `metrics`, so the stamps the test reads are the ones the applicator wrote.
+		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
+		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let wallet = fresh_regtest_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
+		let mut spec =
+			target_spec("t", wallet, kv_store, broadcaster, fee_estimator, Arc::clone(&logger));
+		spec.node_metrics = Arc::clone(&metrics);
+		let targets = Arc::new(TargetRegistry::new());
+		targets.register(spec);
 		let applicator = BlockApplicator::new(
 			Arc::new(NoListeners),
 			ops_rx,
@@ -2304,8 +2322,7 @@ mod tests {
 			sync_state_tx.clone(),
 			new_block_fee_cache(),
 			Arc::new(WatchLedger::new()),
-			Arc::new(TestStore::new(false)),
-			Arc::clone(&metrics),
+			targets,
 			Arc::clone(&logger),
 		);
 		tokio::spawn(applicator.run());

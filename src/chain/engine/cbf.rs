@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bitcoin::Block;
+
 use bip157::chain::BlockHeaderChanges;
 use bip157::{
 	Builder as KyotoBuilder, ChainState, Client, Event as KyotoEvent, HashCheckpoint, Info,
@@ -38,7 +40,7 @@ use bitcoin::{BlockHash, Script, ScriptBuf, Txid};
 
 use bdk_chain::BlockId;
 
-use lightning::chain::WatchedOutput;
+use lightning::chain::{BestBlock, WatchedOutput};
 
 use tokio::sync::{mpsc, watch, Semaphore};
 
@@ -57,12 +59,15 @@ use crate::chain::cbf::source_sync::{
 	SourceSync, SourceSyncEnd, SourceTuning, WatchedScripts,
 };
 use crate::chain::cbf::{
-	mark_syncing, parse_trusted_peer, resume_checkpoint, simplify_sync_state, CbfSyncState,
+	mark_syncing, parse_trusted_peer, resume_checkpoint_for, simplify_sync_state, CbfSyncState,
 	ResumeRefusal, WatchLedger, CBF_BLOCK_FETCH_TIMEOUT_SECS, CBF_HEADER_LOOKUP_TIMEOUT_SECS,
 };
 use crate::chain::engine::SyncEngine;
 use crate::chain::seam::{ActionResult, MempoolQuery, MempoolScope};
+use crate::chain::target::{SyncTarget, TargetId, TargetRegistry};
 use crate::chain::{BorrowedMempool, MempoolEvictions};
+use crate::fee_estimator::OnchainFeeEstimator;
+use crate::types::Broadcaster;
 use crate::chain::{CbfSyncStatus, ChainLayer, ElectrumRuntimeStatus};
 use crate::config::{
 	BackgroundSyncConfig, CbfSource, Config, BDK_WALLET_SYNC_TIMEOUT_SECS,
@@ -70,8 +75,7 @@ use crate::config::{
 };
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::Error;
 
 use async_trait::async_trait;
 
@@ -116,6 +120,12 @@ const CBF_SYNC_WAIT_TIMEOUT: Duration = Duration::from_secs(BDK_WALLET_SYNC_TIME
 /// is its own blocks it cannot succeed; waiting out the regular ten-minute tick would leave the
 /// node on hardcoded fallbacks — and `Node::chain_freshness` stale — for that long.
 const CBF_FEE_RECOVERY_RETRY: Duration = Duration::from_secs(15);
+
+/// How far below the applied tip a target that joins a running kyoto sync without a
+/// birthday of its own is rescanned from. A day of blocks: a wallet with no birthday is a
+/// wallet made just now, and a day covers any clock skew between the node that made it and
+/// the chain.
+const CBF_LATE_TARGET_RESCAN_WINDOW: u32 = 144;
 
 /// [`CbfSyncEngine::active_source`]: kyoto feeds the applicator.
 const ACTIVE_P2P: u8 = 0;
@@ -162,9 +172,8 @@ struct KyotoParams {
 }
 
 impl KyotoParams {
-	fn build(&self, listener: &ChainListener) -> Result<(KyotoNode, Client), ResumeRefusal> {
-		let checkpoint =
-			resume_checkpoint(&self.logger, listener, self.birthday, self.config.network)?;
+	fn build(&self, listener: &MultiListener) -> Result<(KyotoNode, Client), ResumeRefusal> {
+		let checkpoint = listener.resume_checkpoint(&self.logger, self.birthday, self.config.network)?;
 
 		let data_dir = PathBuf::from(&self.config.storage_dir_path).join("bip157_data");
 		let mut kyoto_builder =
@@ -194,6 +203,108 @@ fn kyoto_builder(
 		.required_peers(required_peers)
 		.fetch_witness_data()
 		.response_timeout(Duration::from_secs(DEFAULT_RESPONSE_TIMEOUT_SECS))
+}
+
+/// The gated listeners of every target, as one fan-out for the applicator.
+///
+/// One [`ChainListener`] per target, each with its own monitor gate and replay ledger: a
+/// block is offered to every target's listeners, and each decides for itself whether it can
+/// take it (the resume-from-minimum rule). The set can grow while kyoto runs — see
+/// [`CbfSyncEngine::target_registered`] — and shrink when a node stops.
+pub(crate) struct MultiListener {
+	listeners: RwLock<Vec<(TargetId, Arc<ChainListener>)>>,
+}
+
+impl MultiListener {
+	fn new(listeners: Vec<(TargetId, Arc<ChainListener>)>) -> Self {
+		Self { listeners: RwLock::new(listeners) }
+	}
+
+	fn add(&self, id: TargetId, listener: Arc<ChainListener>) {
+		self.listeners.write().unwrap_or_else(|e| e.into_inner()).push((id, listener));
+	}
+
+	fn remove(&self, id: TargetId) {
+		self.listeners.write().unwrap_or_else(|e| e.into_inner()).retain(|(t, _)| *t != id);
+	}
+
+	fn snapshot(&self) -> Vec<Arc<ChainListener>> {
+		self.listeners
+			.read()
+			.unwrap_or_else(|e| e.into_inner())
+			.iter()
+			.map(|(_, l)| Arc::clone(l))
+			.collect()
+	}
+
+	/// The furthest-behind block across every target's listeners; `None` with no target.
+	fn get_best_block(&self) -> Option<BestBlock> {
+		self.snapshot().iter().map(|l| l.get_best_block()).min_by_key(|b| b.height)
+	}
+
+	/// The height a replay must resume from so that no target misses a block: the
+	/// furthest-behind listener's, or 0 with no target.
+	fn best_block_height(&self) -> u32 {
+		self.get_best_block().map_or(0, |b| b.height)
+	}
+
+	/// The lowest resume checkpoint over every target; see
+	/// [`crate::chain::cbf::resume_checkpoint_for`].
+	fn resume_checkpoint(
+		&self, logger: &Logger, birthday: Option<HashCheckpoint>, network: bitcoin::Network,
+	) -> Result<HashCheckpoint, ResumeRefusal> {
+		resume_checkpoint_for(logger, &self.snapshot(), birthday, network)
+	}
+}
+
+impl ChainFanout for MultiListener {
+	fn connect_block(&self, block: &Block, height: u32) {
+		for listener in self.snapshot() {
+			listener.connect_block(block, height);
+		}
+	}
+
+	fn connect_filtered(&self, header: &Header, height: u32) {
+		for listener in self.snapshot() {
+			listener.connect_filtered(header, height);
+		}
+	}
+
+	fn disconnect(&self, header: &Header, height: u32) {
+		for listener in self.snapshot() {
+			listener.disconnect(header, height);
+		}
+	}
+
+	fn take_divergence(&self) -> Option<String> {
+		self.snapshot().iter().find_map(|l| l.take_divergence())
+	}
+
+	fn record_stranded_listeners(&self, tip_height: u32) -> bool {
+		// Every listener is judged, not just the first stranded one: each drains its own
+		// ledger at the tip boundary.
+		let mut stranded = false;
+		for listener in self.snapshot() {
+			stranded |= listener.record_stranded_listeners(tip_height);
+		}
+		stranded
+	}
+
+	fn set_bulk_chain_persistence(&self, enabled: bool) {
+		for listener in self.snapshot() {
+			listener.set_bulk_chain_persistence(enabled);
+		}
+	}
+
+	fn flush_chain_persistence(&self) -> Result<(), Error> {
+		let mut res = Ok(());
+		for listener in self.snapshot() {
+			if let Err(e) = listener.flush_chain_persistence() {
+				res = Err(e);
+			}
+		}
+		res
+	}
 }
 
 pub(crate) struct CbfSyncEngine {
@@ -229,10 +340,22 @@ pub(crate) struct CbfSyncEngine {
 	/// The runtime handed over by [`SyncEngine::start`]; the background tasks are spawned on it.
 	runtime: Mutex<Option<Arc<tokio::runtime::Runtime>>>,
 	external_electrum: Option<ExternalElectrum>,
-	onchain_wallet: Arc<Wallet>,
+	/// The nodes the layer keeps in step; the match set and the applicator read it.
+	targets: Arc<TargetRegistry>,
+	/// The fan-out the running applicator delivers to, from launch until `stop()`. A target
+	/// registered while this is `Some` is added to it and rescanned for; one registered
+	/// before launch is picked up when the fan-out is built.
+	listeners: Mutex<Option<Arc<MultiListener>>>,
+	/// The running applicator's op queue, for the rescan a late target needs; see
+	/// [`ChainOp::Rescan`].
+	ops_tx: Mutex<Option<mpsc::Sender<ChainOp>>>,
+	/// The height the running launch resumed from. Kyoto holds no headers below it, so a
+	/// late target's rescan can start no lower.
+	launched_from: Mutex<Option<u32>>,
+	/// What a gated listener hands a channel monitor it rewinds on its own: the layer's
+	/// broadcaster and fee estimator, kept from `run_background` for a late target's listener.
+	listener_deps: Mutex<Option<(Arc<Broadcaster>, Arc<OnchainFeeEstimator>)>>,
 	config: Arc<Config>,
-	kv_store: Arc<DynStore>,
-	node_metrics: Arc<RwLock<NodeMetrics>>,
 	logger: Arc<Logger>,
 }
 
@@ -243,9 +366,8 @@ impl CbfSyncEngine {
 	pub(crate) fn new(
 		peers: Vec<String>, required_peers: u8, wallet_birthday_height: Option<u32>,
 		source_mode: CbfSource, filter_source: Option<Arc<dyn FilterSource>>,
-		external_electrum: Option<ExternalElectrum>, onchain_wallet: Arc<Wallet>,
-		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
-		node_metrics: Arc<RwLock<NodeMetrics>>,
+		external_electrum: Option<ExternalElectrum>, targets: Arc<TargetRegistry>,
+		config: Arc<Config>, logger: Arc<Logger>,
 	) -> Result<Self, Error> {
 		let filter_source = match (source_mode.uses_node_source(), filter_source) {
 			(true, Some(source)) => Some(source),
@@ -310,11 +432,38 @@ impl CbfSyncEngine {
 			sync_state_tx,
 			runtime: Mutex::new(None),
 			external_electrum,
-			onchain_wallet,
+			targets,
+			listeners: Mutex::new(None),
+			ops_tx: Mutex::new(None),
+			launched_from: Mutex::new(None),
+			listener_deps: Mutex::new(None),
 			config,
-			kv_store,
-			node_metrics,
 			logger,
+		})
+	}
+
+	/// The gated listener of one target; see [`ChainListener::new_gated`].
+	fn gated_listener_of(
+		&self, target: &SyncTarget, tx_broadcaster: &Arc<Broadcaster>,
+		fee_estimator: &Arc<OnchainFeeEstimator>,
+	) -> Arc<ChainListener> {
+		Arc::new(ChainListener::new_gated(
+			Arc::clone(&target.onchain_wallet),
+			Arc::clone(&target.channel_manager),
+			Arc::clone(&target.chain_monitor),
+			Arc::clone(&target.output_sweeper),
+			Arc::clone(tx_broadcaster),
+			Arc::clone(fee_estimator),
+			Arc::clone(&self.logger),
+		))
+	}
+
+	/// The scripts every filter is matched against: every target's wallet and LDK's
+	/// registrations.
+	fn engine_scripts(&self) -> Arc<EngineScripts> {
+		Arc::new(EngineScripts {
+			targets: Arc::clone(&self.targets),
+			registered: Arc::clone(&self.registered_scripts),
 		})
 	}
 
@@ -328,11 +477,10 @@ impl CbfSyncEngine {
 	/// starting sync state. A resume the engine refuses (see [`ResumeRefusal`]) is published as
 	/// a failed sync and nothing is spawned: the node comes up, `wait_until_synced` errors, and
 	/// the log says what to configure.
-	fn launch(&self, runtime: Arc<tokio::runtime::Runtime>, listener: Arc<ChainListener>) {
+	fn launch(&self, runtime: Arc<tokio::runtime::Runtime>, listener: Arc<MultiListener>) {
 		if self.source_mode.uses_node_source() {
-			let anchor = match resume_checkpoint(
+			let anchor = match listener.resume_checkpoint(
 				&self.logger,
-				&listener,
 				self.kyoto.birthday,
 				self.config.network,
 			) {
@@ -343,9 +491,10 @@ impl CbfSyncEngine {
 					return;
 				},
 			};
-			let best_block_height = listener.get_best_block().height;
+			let best_block_height = listener.best_block_height();
 			let fallback =
 				(self.source_mode == CbfSource::NodeThenP2p).then(|| Arc::clone(&listener));
+			*self.launched_from.lock().unwrap_or_else(|e| e.into_inner()) = Some(anchor.height);
 			self.launch_source(runtime.handle(), listener, anchor, best_block_height, fallback);
 			return;
 		}
@@ -373,7 +522,9 @@ impl CbfSyncEngine {
 
 		let (ops_tx, ops_rx) = mpsc::channel(CBF_CHAIN_OP_QUEUE_DEPTH);
 		let full_block_permits = Arc::clone(&self.full_block_permits);
-		let best_block_height = listener.get_best_block().height;
+		let best_block_height = listener.best_block_height();
+		*self.launched_from.lock().unwrap_or_else(|e| e.into_inner()) = Some(best_block_height);
+		*self.ops_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(ops_tx.clone());
 		self.sync_state_tx.send_replace(CbfSyncState::Active {
 			applied_tip: Some(best_block_height),
 			synced_to_tip: false,
@@ -385,8 +536,7 @@ impl CbfSyncEngine {
 			self.sync_state_tx.clone(),
 			Arc::clone(&self.block_fee_cache),
 			Arc::clone(&self.watch_ledger),
-			Arc::clone(&self.kv_store),
-			Arc::clone(&self.node_metrics),
+			Arc::clone(&self.targets),
 			Arc::clone(&self.logger),
 		);
 		runtime.spawn(applicator.run());
@@ -397,7 +547,7 @@ impl CbfSyncEngine {
 			kyoto: self.kyoto.clone(),
 			generation,
 			listener,
-			registered_scripts: Arc::clone(&self.registered_scripts),
+			scripts: self.engine_scripts(),
 			runtime_status: Arc::clone(&self.runtime_status),
 			sync_state_tx: self.sync_state_tx.clone(),
 			ops_tx,
@@ -415,7 +565,7 @@ impl CbfSyncEngine {
 	/// Generic over the fan-out so it can be driven without a `ChannelManager`.
 	fn launch_source<F: ChainFanout + 'static>(
 		&self, handle: &tokio::runtime::Handle, fanout: Arc<F>, anchor: BlockId,
-		best_block_height: u32, fallback_listener: Option<Arc<ChainListener>>,
+		best_block_height: u32, fallback_listener: Option<Arc<MultiListener>>,
 	) {
 		let Some(source) = self.filter_source.clone() else {
 			debug_assert!(false, "a node-source launch without a filter source");
@@ -453,8 +603,7 @@ impl CbfSyncEngine {
 			self.sync_state_tx.clone(),
 			Arc::clone(&self.block_fee_cache),
 			Arc::clone(&self.watch_ledger),
-			Arc::clone(&self.kv_store),
-			Arc::clone(&self.node_metrics),
+			Arc::clone(&self.targets),
 			Arc::clone(&self.logger),
 		);
 		handle.spawn(applicator.run());
@@ -465,10 +614,7 @@ impl CbfSyncEngine {
 			self.config.network,
 			anchor,
 			Arc::clone(&self.source_headers),
-			Arc::new(EngineScripts {
-				wallet: Arc::clone(&self.onchain_wallet),
-				registered: Arc::clone(&self.registered_scripts),
-			}),
+			self.engine_scripts(),
 			ops_tx.clone(),
 			self.sync_state_tx.clone(),
 			Arc::clone(&self.full_block_permits),
@@ -487,7 +633,7 @@ impl CbfSyncEngine {
 			kyoto: self.kyoto.clone(),
 			generation,
 			listener,
-			registered_scripts: Arc::clone(&self.registered_scripts),
+			scripts: self.engine_scripts(),
 			runtime_status: Arc::clone(&self.runtime_status),
 			sync_state_tx: self.sync_state_tx.clone(),
 			ops_tx,
@@ -591,20 +737,24 @@ impl CbfSyncEngine {
 	/// fresh own broadcasts from being evicted on a borrowed word, and stamps the answer on
 	/// this node's clock ([`ChainLayer::borrow_mempool`]). Evictions are applied only as
 	/// `evictions` says; see [`Self::mempool_borrow_due`].
+	///
+	/// One borrow per target: each wallet's view is its own scripts and its own known
+	/// unconfirmed transactions, and the answer is applied to that wallet alone.
+	// TODO(multi-wallet P2): one question for every target's scripts, split on apply.
 	async fn borrow_mempool(
-		&self, layer: &ChainLayer, evictions: MempoolEvictions,
+		&self, layer: &ChainLayer, target: &SyncTarget, evictions: MempoolEvictions,
 	) -> ActionResult<BorrowedMempool> {
-		let mut scripts = self.onchain_wallet.list_watched_scripts();
+		let mut scripts = target.onchain_wallet.list_watched_scripts();
 		scripts.extend(
 			self.registered_scripts.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned(),
 		);
 		let query = MempoolQuery {
 			scripts,
-			known_unconfirmed: self.onchain_wallet.get_unconfirmed_txids(),
+			known_unconfirmed: target.onchain_wallet.get_unconfirmed_txids(),
 			scope: MempoolScope::Incremental { best_processed_height: self.applied_tip_height() },
 		};
 		let started = std::time::Instant::now();
-		let borrowed = layer.borrow_mempool(&query, evictions).await?;
+		let borrowed = layer.borrow_mempool(target, &query, evictions).await?;
 		log_trace!(
 			self.logger,
 			"Borrowed a mempool view of {} unconfirmed and {} evicted transactions via {} in {}ms",
@@ -806,21 +956,31 @@ impl FeeBlockSource for CbfFeeSource {
 	}
 }
 
-/// The scripts the node-source sync matches filters against: the wallet's and LDK's, as the
-/// kyoto event loop's `MatchSet` reads them.
+/// The scripts a filter is matched against: every target's wallet and LDK's registrations,
+/// as both the kyoto event loop's `MatchSet` and the node-source sync read them.
 struct EngineScripts {
-	wallet: Arc<Wallet>,
+	targets: Arc<TargetRegistry>,
 	registered: Arc<Mutex<HashSet<ScriptBuf>>>,
 }
 
 impl WatchedScripts for EngineScripts {
+	/// The first number folds the registry's generation above the wallets' script counts:
+	/// a wallet's set only grows, but a target leaving and another of the same size
+	/// joining would leave the sum unchanged over a different set, so the pair must move
+	/// on that too. Forty bits for the sum is more scripts than a node will ever watch.
 	fn counts(&self) -> (usize, usize) {
 		let registered = self.registered.lock().unwrap_or_else(|e| e.into_inner()).len();
-		(self.wallet.watched_script_count(), registered)
+		let wallets: usize =
+			self.targets.snapshot().iter().map(|t| t.onchain_wallet.watched_script_count()).sum();
+		let generation = self.targets.generation() as usize;
+		((generation << 40) | (wallets & ((1usize << 40) - 1)), registered)
 	}
 
 	fn scripts(&self) -> Vec<ScriptBuf> {
-		let mut scripts = self.wallet.list_watched_scripts();
+		let mut scripts = Vec::new();
+		for target in self.targets.snapshot() {
+			scripts.extend(target.onchain_wallet.list_watched_scripts());
+		}
 		scripts.extend(self.registered.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
 		scripts
 	}
@@ -963,6 +1123,10 @@ impl SyncEngine for CbfSyncEngine {
 			}
 		}
 		self.sync_state_tx.send_replace(CbfSyncState::Failed(Error::NotRunning));
+		*self.listeners.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		*self.listener_deps.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		*self.ops_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		*self.launched_from.lock().unwrap_or_else(|e| e.into_inner()) = None;
 		if let Some(external) = &self.external_electrum {
 			external.status.write().unwrap().stop();
 		}
@@ -975,15 +1139,12 @@ impl SyncEngine for CbfSyncEngine {
 	/// provider that cannot answer this pass does not make the pass fail — the chain is
 	/// synced regardless. The background loop borrows on its own cadence too; this pass asks
 	/// again so a caller of `sync_wallets` sees the mempool as of now.
-	async fn sync_once(
-		&self, layer: &ChainLayer, _channel_manager: Arc<ChannelManager>,
-		_chain_monitor: Arc<ChainMonitor>, _output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
+	async fn sync_once(&self, layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error> {
 		self.wait_until_synced_within(CBF_SYNC_WAIT_TIMEOUT).await?;
 
 		if layer.has_mempool_chain() {
 			// Just waited for the sync, but a block may have landed since: ask again.
-			if let Err(e) = self.borrow_mempool(layer, self.mempool_evictions()).await {
+			if let Err(e) = self.borrow_mempool(layer, target, self.mempool_evictions()).await {
 				log_error!(
 					self.logger,
 					"Could not borrow a mempool view this pass; the filter sync is complete \
@@ -995,12 +1156,13 @@ impl SyncEngine for CbfSyncEngine {
 
 		let unix_time_secs_opt =
 			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-		let mut locked_node_metrics = self.node_metrics.write().unwrap();
+		let mut locked_node_metrics =
+			target.node_metrics.write().unwrap_or_else(|e| e.into_inner());
 		locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
 		locked_node_metrics.latest_onchain_wallet_sync_timestamp = unix_time_secs_opt;
 		write_node_metrics(
 			&*locked_node_metrics,
-			Arc::clone(&self.kv_store),
+			Arc::clone(&target.kv_store),
 			Arc::clone(&self.logger),
 		)
 		.map_err(|e| {
@@ -1015,8 +1177,6 @@ impl SyncEngine for CbfSyncEngine {
 	/// event-driven and runs on the spawned tasks; this loop owns only the two ticks.
 	async fn run_background(
 		&self, layer: Arc<ChainLayer>, mut stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
 	) {
 		let runtime = self.runtime.lock().unwrap_or_else(|e| e.into_inner()).clone();
 		let Some(runtime) = runtime else {
@@ -1028,17 +1188,24 @@ impl SyncEngine for CbfSyncEngine {
 			return;
 		};
 
-		// Snapshots the channel monitors before the first block is delivered; the resume height
-		// `launch` derives is read from the same, still untouched, state.
-		let listener = Arc::new(ChainListener::new_gated(
-			Arc::clone(&self.onchain_wallet),
-			Arc::clone(&channel_manager),
-			Arc::clone(&chain_monitor),
-			output_sweeper,
-			Arc::clone(layer.tx_broadcaster()),
-			Arc::clone(layer.fee_estimator()),
-			Arc::clone(&self.logger),
+		// Snapshots every target's channel monitors before the first block is delivered; the
+		// resume height `launch` derives is read from the same, still untouched, state. The
+		// fan-out is published before the launch so a target registering from here on is
+		// added to the running sync rather than waiting for one that already started.
+		let deps = (Arc::clone(layer.tx_broadcaster()), Arc::clone(layer.fee_estimator()));
+		let listener = Arc::new(MultiListener::new(
+			layer
+				.targets()
+				.snapshot()
+				.iter()
+				.map(|t| (t.id, self.gated_listener_of(t, &deps.0, &deps.1)))
+				.collect(),
 		));
+		{
+			// Lock order: deps before listeners, as `target_registered` reads them.
+			*self.listener_deps.lock().unwrap_or_else(|e| e.into_inner()) = Some(deps);
+			*self.listeners.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&listener));
+		}
 		self.launch(Arc::clone(&runtime), listener);
 
 		// Samples the fee window's blocks in its own task: a block download takes seconds
@@ -1102,24 +1269,26 @@ impl SyncEngine for CbfSyncEngine {
 				_ = mempool_interval.tick() => {
 					// Blocks apply on the applicator's task; this tick is where the loop
 					// looks at what they left behind.
-					layer.reap_dead_fundings(&channel_manager, &chain_monitor);
+					layer.reap_dead_fundings();
 					let Some(evictions) = self.mempool_borrow_due(&layer) else {
 						continue;
 					};
-					// A borrow runs up to its chain's budget; a stop must not wait it out.
-					tokio::select! {
-						_ = stop_sync_receiver.changed() => {
-							log_trace!(self.logger, "Stopping CBF background loop mid-borrow.");
-							return;
-						}
-						borrowed = self.borrow_mempool(&layer, evictions) => {
-							// Every tick asks again, so one that cannot answer is not news.
-							if let Err(e) = borrowed {
-								log_debug!(
-									self.logger,
-									"CBF background mempool borrow failed this tick: {}",
-									e
-								);
+					for target in layer.targets().snapshot() {
+						// A borrow runs up to its chain's budget; a stop must not wait it out.
+						tokio::select! {
+							_ = stop_sync_receiver.changed() => {
+								log_trace!(self.logger, "Stopping CBF background loop mid-borrow.");
+								return;
+							}
+							borrowed = self.borrow_mempool(&layer, &target, evictions) => {
+								// Every tick asks again, so one that cannot answer is not news.
+								if let Err(e) = borrowed {
+									log_debug!(
+										self.logger,
+										"CBF background mempool borrow failed this tick: {}",
+										e
+									);
+								}
 							}
 						}
 					}
@@ -1134,12 +1303,98 @@ impl SyncEngine for CbfSyncEngine {
 		true
 	}
 
-	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
-		Some(&self.onchain_wallet)
-	}
-
 	fn cbf_sync_status(&self) -> Option<CbfSyncStatus> {
 		Some(self.sync_status())
+	}
+
+	/// A target registered before the launch is picked up by it. One registered while kyoto
+	/// runs joins the fan-out and has the filters after its birthday re-emitted: the
+	/// applicator is rewound to the birthday ([`ChainOp::Rescan`]), then kyoto is asked to
+	/// replay from there; the targets already past it skip the replay block by block and
+	/// the new one takes it. The rescan can start no lower than the height this launch
+	/// resumed from — kyoto holds no headers below it — so a wallet older than the running
+	/// sync should be registered before the launch; the floor is logged when it bites.
+	///
+	/// The node filter source has no replay request, so a target registered while it feeds
+	/// the applicator is refused: the layer removes it again and the node does not start.
+	// TODO(multi-wallet P2): re-anchor the node-source sync for a late target.
+	fn target_registered(&self, target: &Arc<SyncTarget>) -> Result<(), Error> {
+		let listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner()).clone();
+		let Some(listeners) = listeners else {
+			// Not launched: `run_background` builds the fan-out from the registry.
+			return Ok(());
+		};
+		if self.node_source_active() {
+			log_error!(
+				self.logger,
+				"CBF cannot take on node {} while the node filter source is running; start it before the chain source, or on a P2P source.",
+				target.label
+			);
+			return Err(Error::NotRunning);
+		}
+		let (Some(requester), Some(ops_tx), Some(runtime)) = (
+			self.requester(),
+			self.ops_tx.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+			self.runtime.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+		) else {
+			log_error!(
+				self.logger,
+				"CBF cannot take on node {}: kyoto is not running.",
+				target.label
+			);
+			return Err(Error::NotRunning);
+		};
+
+		let floor = self.launched_from.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(0);
+		let wanted = target
+			.birthday_height
+			.unwrap_or_else(|| self.applied_tip_height().saturating_sub(CBF_LATE_TARGET_RESCAN_WINDOW));
+		let from = wanted.max(floor);
+		if from > wanted {
+			log_warn!(
+				self.logger,
+				"CBF rescan for node {} floored at height {} (asked for {}): the running sync holds no headers below it, so blocks between are not scanned for this wallet.",
+				target.label,
+				from,
+				wanted
+			);
+		}
+
+		let Some((tx_broadcaster, fee_estimator)) =
+			self.listener_deps.lock().unwrap_or_else(|e| e.into_inner()).clone()
+		else {
+			debug_assert!(false, "a running CBF fan-out without listener dependencies");
+			return Err(Error::NotRunning);
+		};
+		// This target's monitor snapshots are taken now, before any replayed block reaches it.
+		let listener = self.gated_listener_of(target, &tx_broadcaster, &fee_estimator);
+		listeners.add(target.id, listener);
+		log_info!(
+			self.logger,
+			"CBF node {} joined the running sync; replaying filters after height {}.",
+			target.label,
+			from
+		);
+		let logger = Arc::clone(&self.logger);
+		let label = target.label.clone();
+		// Rewind first, then ask for the replay: both ride queues, and the applicator must
+		// expect the replayed heights before the first of them arrives.
+		runtime.spawn(async move {
+			if ops_tx.send(ChainOp::Rescan { from_height: from }).await.is_err() {
+				log_error!(logger, "CBF rescan for node {} dropped: the applicator is gone.", label);
+				return;
+			}
+			if let Err(e) = requester.rescan_from(from) {
+				log_error!(logger, "CBF rescan for node {} refused by kyoto: {:?}", label, e);
+			}
+		});
+		Ok(())
+	}
+
+	fn target_unregistered(&self, id: TargetId) {
+		if let Some(listeners) = self.listeners.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+			listeners.remove(id);
+		}
 	}
 
 	/// The script joins the match set, and the ledger holds LDK's registration apart from any
@@ -1220,8 +1475,8 @@ impl SyncEngine for CbfSyncEngine {
 struct KyotoFallback {
 	kyoto: KyotoParams,
 	generation: u64,
-	listener: Arc<ChainListener>,
-	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
+	listener: Arc<MultiListener>,
+	scripts: Arc<EngineScripts>,
 	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	ops_tx: mpsc::Sender<ChainOp>,
@@ -1266,7 +1521,7 @@ impl KyotoFallback {
 			kyoto: self.kyoto,
 			generation: self.generation,
 			listener: self.listener,
-			registered_scripts: self.registered_scripts,
+			scripts: self.scripts,
 			runtime_status: self.runtime_status,
 			sync_state_tx: self.sync_state_tx,
 			ops_tx: self.ops_tx,
@@ -1283,8 +1538,8 @@ struct KyotoLoop {
 	kyoto: KyotoParams,
 	/// The launch this loop belongs to; see [`CbfRuntimeStatus::Started`].
 	generation: u64,
-	listener: Arc<ChainListener>,
-	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
+	listener: Arc<MultiListener>,
+	scripts: Arc<EngineScripts>,
 	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	ops_tx: mpsc::Sender<ChainOp>,
@@ -1635,10 +1890,9 @@ impl KyotoLoop {
 	fn event_loop(&self, synced: Arc<AtomicBool>) -> EventLoop {
 		EventLoop {
 			generation: self.generation,
-			registered_scripts: Arc::clone(&self.registered_scripts),
+			scripts: Arc::clone(&self.scripts),
 			runtime_status: Arc::clone(&self.runtime_status),
 			ops_tx: self.ops_tx.clone(),
-			onchain_wallet: Arc::clone(&self.listener.onchain_wallet),
 			sync_state_tx: self.sync_state_tx.clone(),
 			full_block_permits: Arc::clone(&self.full_block_permits),
 			synced,
@@ -1742,7 +1996,7 @@ impl KyotoLoop {
 			*status = CbfRuntimeStatus::Started { requester, generation: self.generation };
 		}
 		self.sync_state_tx.send_replace(CbfSyncState::Active {
-			applied_tip: Some(self.listener.get_best_block().height),
+			applied_tip: Some(self.listener.best_block_height()),
 			synced_to_tip: false,
 		});
 		Some((node, info_rx, warn_rx, event_rx))
@@ -1859,26 +2113,20 @@ async fn process_warn_messages(mut warn_rx: mpsc::UnboundedReceiver<Warning>, lo
 /// filter — thousands of them, tens of thousands of filters on a catch-up — was the single
 /// largest allocation in the event loop.
 struct MatchSet {
-	wallet_count: usize,
-	registered_count: usize,
+	counts: Option<(usize, usize)>,
 	scripts: Vec<ScriptBuf>,
 }
 
 impl MatchSet {
 	fn new() -> Self {
-		Self { wallet_count: usize::MAX, registered_count: usize::MAX, scripts: Vec::new() }
+		Self { counts: None, scripts: Vec::new() }
 	}
 
-	fn current(
-		&mut self, onchain_wallet: &Wallet, registered_scripts: &Mutex<HashSet<ScriptBuf>>,
-	) -> &[ScriptBuf] {
-		let wallet_count = onchain_wallet.watched_script_count();
-		let registered = registered_scripts.lock().unwrap_or_else(|e| e.into_inner());
-		if wallet_count != self.wallet_count || registered.len() != self.registered_count {
-			self.scripts = onchain_wallet.list_watched_scripts();
-			self.scripts.extend(registered.iter().cloned());
-			self.wallet_count = wallet_count;
-			self.registered_count = registered.len();
+	fn current(&mut self, watched: &dyn WatchedScripts) -> &[ScriptBuf] {
+		let counts = watched.counts();
+		if self.counts != Some(counts) {
+			self.scripts = watched.scripts();
+			self.counts = Some(counts);
 		}
 		&self.scripts
 	}
@@ -1901,10 +2149,9 @@ enum EventLoopEnd {
 /// One node's consumer of kyoto's events, turning them into [`ChainOp`]s for the applicator.
 struct EventLoop {
 	generation: u64,
-	registered_scripts: Arc<Mutex<HashSet<ScriptBuf>>>,
+	scripts: Arc<EngineScripts>,
 	runtime_status: Arc<Mutex<CbfRuntimeStatus>>,
 	ops_tx: mpsc::Sender<ChainOp>,
-	onchain_wallet: Arc<Wallet>,
 	sync_state_tx: watch::Sender<CbfSyncState>,
 	full_block_permits: Arc<Semaphore>,
 	/// Raised on `FiltersSynced`, for the restart loop's failure budget.
@@ -1926,8 +2173,7 @@ impl EventLoop {
 
 					let block_hash = indexed_filter.block_hash();
 					let matched = {
-						let scripts =
-							match_set.current(&self.onchain_wallet, &self.registered_scripts);
+						let scripts = match_set.current(&*self.scripts);
 						indexed_filter.contains_any(scripts.iter())
 					};
 
@@ -2275,17 +2521,7 @@ mod tests {
 		source_mode: CbfSource, filter_source: Option<Arc<dyn FilterSource>>,
 		storage_dir_path: String,
 	) -> CbfSyncEngine {
-		use lightning::util::test_utils::TestStore;
-
-		use crate::chain::test_wallet::fresh_regtest_wallet;
-		use crate::fee_estimator::OnchainFeeEstimator;
-		use crate::tx_broadcaster::TransactionBroadcaster;
-
 		let logger = Arc::new(Logger::new_log_facade());
-		let kv_store: Arc<DynStore> = Arc::new(TestStore::new(false));
-		let broadcaster = Arc::new(TransactionBroadcaster::new(Arc::clone(&logger)));
-		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
-		let wallet = fresh_regtest_wallet(&kv_store, &broadcaster, &fee_estimator, &logger);
 		let config = Arc::new(Config {
 			network: bitcoin::Network::Regtest,
 			storage_dir_path,
@@ -2298,11 +2534,9 @@ mod tests {
 			source_mode,
 			filter_source,
 			None,
-			wallet,
-			kv_store,
+			Arc::new(TargetRegistry::new()),
 			config,
 			logger,
-			Arc::new(RwLock::new(NodeMetrics::default())),
 		)
 		.expect("an engine that connects to nothing")
 	}

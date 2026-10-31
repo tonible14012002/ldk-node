@@ -129,6 +129,14 @@ pub enum Error {
 	LiquiditySourceUnavailable,
 	/// The given operation failed due to the LSP's required opening fee being too high.
 	LiquidityFeeTooHigh,
+	/// Stopping the node's event handling failed: the background processor ended without
+	/// signalling, so the node may not have quiesced. Returned by [`crate::Node::stop`]
+	/// where it used to panic, so an application exporting the node's data can refuse to.
+	EventHandlingStopFailed,
+	/// None of the listening addresses could be bound — something else listens there.
+	ListenFailed,
+	/// The given script is not one a channel may close to (BOLT 2 `shutdown`).
+	InvalidShutdownScript,
 }
 
 impl fmt::Display for Error {
@@ -136,6 +144,15 @@ impl fmt::Display for Error {
 		match *self {
 			Self::AlreadyRunning => write!(f, "Node is already running."),
 			Self::NotRunning => write!(f, "Node is not running."),
+			Self::EventHandlingStopFailed => {
+				write!(f, "Stopping event handling failed; the node may not have quiesced.")
+			},
+			Self::InvalidShutdownScript => {
+				write!(f, "The given script is not a standard channel shutdown script.")
+			},
+			Self::ListenFailed => {
+				write!(f, "Failed to bind to the listening addresses.")
+			},
 			Self::OnchainTxCreationFailed => {
 				write!(f, "On-chain transaction could not be created.")
 			},

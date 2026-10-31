@@ -10,7 +10,7 @@
 //! Drives `Confirm` via `lightning-transaction-sync`, so it must be told which
 //! transactions and outputs to watch — hence the `Filter` registrations.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::{Script, Txid};
@@ -32,28 +32,23 @@ use crate::chain::wire_convert::{
 	block_hash_from_wire, header_to_wire, outpoint_from_wire, sync_response_to_wire, tx_to_wire,
 	txid_from_wire, wire_to_sync_request,
 };
-use crate::chain::{periodically_archive_fully_resolved_monitors, ChainLayer, WalletSyncStatus};
+use crate::chain::target::SyncTarget;
+use crate::chain::{periodically_archive_fully_resolved_monitors, ChainLayer};
 use crate::config::{
 	EsploraSyncConfig, BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP, BDK_WALLET_SYNC_TIMEOUT_SECS,
 	LDK_WALLET_SYNC_TIMEOUT_SECS,
 };
 use crate::io::utils::write_node_metrics;
 use crate::logger::{log_error, log_info, LdkLogger, Logger};
-use crate::types::{ChainMonitor, ChannelManager, DynStore, Sweeper, Wallet};
-use crate::{Error, NodeMetrics};
+use crate::Error;
 
 use async_trait::async_trait;
 
 pub(crate) struct EsploraSyncEngine {
 	pub(crate) sync_config: EsploraSyncConfig,
 	pub(crate) esplora_client: EsploraAsyncClient,
-	pub(crate) onchain_wallet: Arc<Wallet>,
-	pub(crate) onchain_wallet_sync_status: Mutex<WalletSyncStatus>,
 	pub(crate) tx_sync: Arc<EsploraSyncClient<Arc<Logger>>>,
-	pub(crate) lightning_wallet_sync_status: Mutex<WalletSyncStatus>,
-	pub(crate) kv_store: Arc<DynStore>,
 	pub(crate) logger: Arc<Logger>,
-	pub(crate) node_metrics: Arc<RwLock<NodeMetrics>>,
 }
 
 impl EsploraSyncEngine {
@@ -87,16 +82,10 @@ impl EsploraSyncEngine {
 
 #[async_trait]
 impl TxBasedBackend for EsploraSyncEngine {
-	async fn sync_onchain_wallet(&self) -> Result<(), Error> {
-		let Self {
-			esplora_client,
-			onchain_wallet,
-			onchain_wallet_sync_status,
-			kv_store,
-			logger,
-			node_metrics,
-			..
-		} = self;
+	async fn sync_onchain_wallet(&self, target: &SyncTarget) -> Result<(), Error> {
+		let Self { esplora_client, logger, .. } = self;
+		let SyncTarget { onchain_wallet, onchain_wallet_sync_status, kv_store, node_metrics, .. } =
+			target;
 		let receiver_res = {
 			let mut status_lock = onchain_wallet_sync_status.lock().unwrap();
 			status_lock.register_or_subscribe_pending_sync()
@@ -202,33 +191,24 @@ impl TxBasedBackend for EsploraSyncEngine {
 		res
 	}
 
-	async fn sync_lightning_wallet(
-		&self, channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
-		let Self { tx_sync, lightning_wallet_sync_status, kv_store, logger, node_metrics, .. } =
-			self;
-		let sync_cman = Arc::clone(&channel_manager);
-		let sync_cmon = Arc::clone(&chain_monitor);
-		let sync_sweeper = Arc::clone(&output_sweeper);
-		let confirmables = vec![
-			&*sync_cman as &(dyn Confirm + Sync + Send),
-			&*sync_cmon as &(dyn Confirm + Sync + Send),
-			&*sync_sweeper as &(dyn Confirm + Sync + Send),
-		];
+	async fn sync_lightning_wallets(&self, targets: &[Arc<SyncTarget>]) -> Result<(), Error> {
+		let Self { tx_sync, logger, .. } = self;
 
-		let receiver_res = {
-			let mut status_lock = lightning_wallet_sync_status.lock().unwrap();
-			status_lock.register_or_subscribe_pending_sync()
+		let Some(pass) = LightningPass::begin(targets, logger).await? else {
+			return Ok(());
 		};
-		if let Some(mut sync_receiver) = receiver_res {
-			log_info!(logger, "Sync in progress, skipping.");
-			return sync_receiver.recv().await.map_err(|e| {
-				debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
-				log_error!(logger, "Failed to receive wallet sync result: {:?}", e);
-				Error::WalletOperationFailed
-			})?;
-		}
+		let confirmables: Vec<&(dyn Confirm + Sync + Send)> = pass
+			.targets
+			.iter()
+			.flat_map(|t| {
+				[
+					&*t.channel_manager as &(dyn Confirm + Sync + Send),
+					&*t.chain_monitor as &(dyn Confirm + Sync + Send),
+					&*t.output_sweeper as &(dyn Confirm + Sync + Send),
+				]
+			})
+			.collect();
+
 		let res = {
 			let timeout_fut = tokio::time::timeout(
 				Duration::from_secs(LDK_WALLET_SYNC_TIMEOUT_SECS),
@@ -243,28 +223,7 @@ impl TxBasedBackend for EsploraSyncEngine {
 							"Sync of Lightning wallet finished in {}ms.",
 							now.elapsed().as_millis()
 						);
-
-						let unix_time_secs_opt =
-							SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
-						{
-							let mut locked_node_metrics = node_metrics.write().unwrap();
-							locked_node_metrics.latest_lightning_wallet_sync_timestamp =
-								unix_time_secs_opt;
-							write_node_metrics(
-								&*locked_node_metrics,
-								Arc::clone(&kv_store),
-								Arc::clone(&logger),
-							)?;
-						}
-
-						periodically_archive_fully_resolved_monitors(
-							Arc::clone(&channel_manager),
-							Arc::clone(&chain_monitor),
-							Arc::clone(&kv_store),
-							Arc::clone(&logger),
-							Arc::clone(&node_metrics),
-						)?;
-						Ok(())
+						pass.record_success(logger)
 					},
 					Err(e) => {
 						log_error!(logger, "Sync of Lightning wallet failed: {}", e);
@@ -278,9 +237,98 @@ impl TxBasedBackend for EsploraSyncEngine {
 			}
 		};
 
-		lightning_wallet_sync_status.lock().unwrap().propagate_result_to_subscribers(res);
+		pass.finish(res);
 
 		res
+	}
+}
+
+/// One Lightning sync pass over several targets, with each target's in-progress latch.
+///
+/// Every target's latch is registered up front. A target whose latch is already taken —
+/// a foreground `sync_wallets` of that node is running — is left out of this pass; it
+/// gets its result from the pass that holds it. When every target is taken there is
+/// nothing to sync, and this pass subscribes to the first running one and returns its
+/// result, exactly as the single-wallet engine did ("Sync in progress, skipping.").
+pub(crate) struct LightningPass {
+	/// The targets this pass syncs: those whose latch it holds.
+	pub(crate) targets: Vec<Arc<SyncTarget>>,
+}
+
+impl LightningPass {
+	/// Registers the latches. `Ok(None)` means another pass covered every target and its
+	/// result was `Ok`; its `Err` is returned as this pass's.
+	pub(crate) async fn begin(
+		targets: &[Arc<SyncTarget>], logger: &Arc<Logger>,
+	) -> Result<Option<Self>, Error> {
+		let mut held = Vec::with_capacity(targets.len());
+		let mut busy = None;
+		for target in targets {
+			let receiver_res = {
+				let mut status_lock =
+					target.lightning_wallet_sync_status.lock().unwrap_or_else(|e| e.into_inner());
+				status_lock.register_or_subscribe_pending_sync()
+			};
+			match receiver_res {
+				None => held.push(Arc::clone(target)),
+				Some(receiver) => {
+					if busy.is_none() {
+						busy = Some(receiver);
+					}
+				},
+			}
+		}
+		if held.is_empty() {
+			let Some(mut sync_receiver) = busy else {
+				return Ok(None);
+			};
+			log_info!(logger, "Sync in progress, skipping.");
+			sync_receiver.recv().await.map_err(|e| {
+				debug_assert!(false, "Failed to receive wallet sync result: {:?}", e);
+				log_error!(logger, "Failed to receive wallet sync result: {:?}", e);
+				Error::WalletOperationFailed
+			})??;
+			return Ok(None);
+		}
+		Ok(Some(Self { targets: held }))
+	}
+
+	/// The pass synced: stamp every target's metrics and run its monitor archival.
+	pub(crate) fn record_success(&self, logger: &Arc<Logger>) -> Result<(), Error> {
+		let unix_time_secs_opt =
+			SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs());
+		for target in &self.targets {
+			{
+				let mut locked_node_metrics =
+					target.node_metrics.write().unwrap_or_else(|e| e.into_inner());
+				locked_node_metrics.latest_lightning_wallet_sync_timestamp = unix_time_secs_opt;
+				write_node_metrics(
+					&*locked_node_metrics,
+					Arc::clone(&target.kv_store),
+					Arc::clone(logger),
+				)?;
+			}
+
+			periodically_archive_fully_resolved_monitors(
+				Arc::clone(&target.channel_manager),
+				Arc::clone(&target.chain_monitor),
+				Arc::clone(&target.kv_store),
+				Arc::clone(logger),
+				Arc::clone(&target.node_metrics),
+			)?;
+		}
+		Ok(())
+	}
+
+	/// Releases every latch this pass held, handing `res` to whoever subscribed.
+	pub(crate) fn finish(self, res: Result<(), Error>) {
+		for target in &self.targets {
+			target
+				.lightning_wallet_sync_status
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.propagate_result_to_subscribers(res);
+		}
 	}
 }
 
@@ -288,10 +336,6 @@ impl TxBasedBackend for EsploraSyncEngine {
 impl SyncEngine for EsploraSyncEngine {
 	fn name(&self) -> &'static str {
 		"esplora-tx-sync"
-	}
-
-	fn onchain_wallet(&self) -> Option<&Arc<Wallet>> {
-		Some(&self.onchain_wallet)
 	}
 
 	/// Every slot is filled from this node's own Esplora server: a real
@@ -425,29 +469,21 @@ impl SyncEngine for EsploraSyncEngine {
 		})
 	}
 
-	async fn sync_once(
-		&self, _layer: &ChainLayer, channel_manager: Arc<ChannelManager>,
-		chain_monitor: Arc<ChainMonitor>, output_sweeper: Arc<Sweeper>,
-	) -> Result<(), Error> {
+	async fn sync_once(&self, _layer: &ChainLayer, target: &Arc<SyncTarget>) -> Result<(), Error> {
 		// ORDER IS LOAD-BEARING: Lightning wallet before on-chain wallet.
-		self.sync_lightning_wallet(channel_manager, chain_monitor, output_sweeper).await?;
-		self.sync_onchain_wallet().await?;
+		self.sync_lightning_wallets(std::slice::from_ref(target)).await?;
+		self.sync_onchain_wallet(target).await?;
 		Ok(())
 	}
 
 	async fn run_background(
 		&self, layer: Arc<ChainLayer>, stop_sync_receiver: tokio::sync::watch::Receiver<()>,
-		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
-		output_sweeper: Arc<Sweeper>,
 	) {
 		if let Some(background_sync_config) = self.sync_config.background_sync_config.as_ref() {
 			run_tx_based_sync_loop(
 				self,
 				layer,
 				stop_sync_receiver,
-				channel_manager,
-				chain_monitor,
-				output_sweeper,
 				background_sync_config,
 				Arc::clone(&self.logger),
 			)

@@ -25,7 +25,7 @@ pub(crate) mod source_sync;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bip157::{HashCheckpoint, TrustedPeer};
 
@@ -316,6 +316,24 @@ pub(crate) fn resume_checkpoint(
 		);
 	}
 	Ok(chosen)
+}
+
+/// [`resume_checkpoint`] over several listeners: the lowest of their checkpoints, so no
+/// listener misses a block. One listener refusing refuses the launch — a node whose wallet
+/// cannot be anchored must not be synced from somewhere above its history — and no listener
+/// at all is a launch with nothing to sync, refused as having no anchor.
+pub(crate) fn resume_checkpoint_for(
+	logger: &Logger, chain_listeners: &[Arc<ChainListener>], birthday: Option<HashCheckpoint>,
+	network: Network,
+) -> Result<HashCheckpoint, ResumeRefusal> {
+	let mut lowest: Option<HashCheckpoint> = None;
+	for listener in chain_listeners {
+		let checkpoint = resume_checkpoint(logger, listener, birthday, network)?;
+		if lowest.map_or(true, |l| checkpoint.height < l.height) {
+			lowest = Some(checkpoint);
+		}
+	}
+	lowest.ok_or(ResumeRefusal::NoAnchor { listener_height: 0 })
 }
 
 /// Walks `bdk_cp` back toward `target_height` without ever stepping onto genesis.

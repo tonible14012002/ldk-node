@@ -7,6 +7,7 @@
 
 //! Objects and traits for data persistence.
 
+pub(crate) mod no_graph_persister;
 pub mod sqlite_store;
 #[cfg(test)]
 pub(crate) mod test_utils;

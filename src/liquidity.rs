@@ -1041,7 +1041,7 @@ where
 			expiry_secs,
 		)?;
 
-		log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
+		log_info!(self.logger, "JIT-channel invoice created: payment hash {}", invoice.payment_hash());
 		Ok((invoice, min_total_fee_msat))
 	}
 
@@ -1084,7 +1084,7 @@ where
 		let invoice =
 			self.lsps2_create_jit_invoice(buy_response, None, description, expiry_secs)?;
 
-		log_info!(self.logger, "JIT-channel invoice created: {}", invoice);
+		log_info!(self.logger, "JIT-channel invoice created: payment hash {}", invoice.payment_hash());
 		Ok((invoice, min_prop_fee_ppm_msat))
 	}
 
