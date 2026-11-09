@@ -5,7 +5,11 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-//! The process-level network surface shared by the nodes in it.
+//! The process-level network surface shared by the nodes in it: the TCP listener, the overlay
+//! (Lightning over the Node's own QUIC network), and the act-one door both route through.
+//! The transport itself — streams, dialing, the BOLT 8 act-one demux, LDK's `SocketDescriptor`
+//! — lives in `node-net` / `node-net-ldk` (node-net ADR 0001).
 
-pub(crate) mod act_one;
 pub(crate) mod listener;
+pub(crate) mod overlay;
+pub(crate) mod target;

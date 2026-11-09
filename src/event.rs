@@ -1565,16 +1565,21 @@ where
 					if !pending_channel.is_outbound
 						&& self.peer_store.get_peer(&counterparty_node_id).is_none()
 					{
-						if let Some(address) = network_graph
+						// A peer with no announced address that the node can reach over its
+						// overlay is kept under the overlay address, so this side redials it
+						// too (node-net ADR 0001 §7).
+						let address = network_graph
 							.nodes()
 							.get(&NodeId::from_pubkey(&counterparty_node_id))
 							.and_then(|node_info| node_info.announcement_info.as_ref())
-							.and_then(|ann_info| ann_info.addresses().first())
-						{
-							let peer = PeerInfo {
-								node_id: counterparty_node_id,
-								address: address.clone(),
-							};
+							.and_then(|ann_info| ann_info.addresses().first().cloned())
+							.or_else(|| {
+								self.connection_manager
+									.overlay()
+									.map(|_| node_net_ldk::overlay_address())
+							});
+						if let Some(address) = address {
+							let peer = PeerInfo { node_id: counterparty_node_id, address };
 
 							self.peer_store.add_peer(peer).unwrap_or_else(|e| {
 								log_error!(

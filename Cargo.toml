@@ -47,7 +47,13 @@ cbf = ["dep:bip157", "tokio/net"]
 lightning = { version = "0.1.0", features = ["std"] }
 lightning-types = { version = "0.2.0" }
 lightning-invoice = { version = "0.33.0", features = ["std"] }
-lightning-net-tokio = { version = "0.1.0" }
+# The peer transport (node-net ADR 0001): LDK's PeerManager runs over
+# `node_net_ldk::Descriptor`, a SocketDescriptor for any byte stream — TCP, or an
+# overlay stream such as a host pipe spliced to iroh/QUIC. It replaces
+# lightning-net-tokio; rust-lightning itself is untouched. Local paths while the
+# experiment is unpublished.
+node-net = { path = "../node-net/crates/node-net" }
+node-net-ldk = { path = "../node-net/crates/node-net-ldk" }
 lightning-persister = { version = "0.1.0" }
 lightning-background-processor = { version = "0.1.0", features = ["futures"] }
 lightning-rapid-gossip-sync = { version = "0.1.0" }

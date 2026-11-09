@@ -31,7 +31,7 @@ use lightning::util::sweep::OutputSweeper;
 
 use lightning_block_sync::gossip::{GossipVerifier, UtxoSource};
 
-use lightning_net_tokio::SocketDescriptor;
+use node_net_ldk::Descriptor as SocketDescriptor;
 
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::OutPoint;

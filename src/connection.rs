@@ -6,18 +6,23 @@
 // accordance with one or both of these licenses.
 
 use crate::logger::{log_debug, log_error, log_info, LdkLogger};
+use crate::net::overlay::Overlay;
 use crate::types::PeerManager;
 use crate::Error;
 
 use lightning::ln::msgs::SocketAddress;
 
+use node_net::{DialError, NetStats, PeerAddress, PeerEvents, PeerStream, TcpTransport, Transport};
+
 use bitcoin::secp256k1::PublicKey;
 
 use std::collections::hash_map::{self, HashMap};
-use std::net::ToSocketAddrs;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long a TCP dial may take (lightning-net-tokio's figure, kept).
+const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Number of consecutive failed dial attempts between ERROR-level reports for a
 /// single peer.
@@ -40,6 +45,10 @@ where
 	/// the map is bounded by the number of peers that are currently failing.
 	connect_failures: Mutex<HashMap<PublicKey, u64>>,
 	peer_manager: Arc<PeerManager>,
+	/// Dialled first when present; see [`Overlay`].
+	overlay: Option<Arc<Overlay>>,
+	/// Every dial attempt, per transport.
+	stats: Arc<NetStats>,
 	logger: L,
 }
 
@@ -47,10 +56,23 @@ impl<L: Deref + Clone + Sync + Send> ConnectionManager<L>
 where
 	L::Target: LdkLogger,
 {
-	pub(crate) fn new(peer_manager: Arc<PeerManager>, logger: L) -> Self {
+	pub(crate) fn new(
+		peer_manager: Arc<PeerManager>, overlay: Option<Arc<Overlay>>, logger: L,
+	) -> Self {
 		let pending_connections = Mutex::new(HashMap::new());
 		let connect_failures = Mutex::new(HashMap::new());
-		Self { pending_connections, connect_failures, peer_manager, logger }
+		let stats = Arc::new(NetStats::default());
+		Self { pending_connections, connect_failures, peer_manager, overlay, stats, logger }
+	}
+
+	/// The overlay this node dials first, if any.
+	pub(crate) fn overlay(&self) -> Option<&Arc<Overlay>> {
+		self.overlay.as_ref()
+	}
+
+	/// What this node's dials did, per transport.
+	pub(crate) fn stats(&self) -> &Arc<NetStats> {
+		&self.stats
 	}
 
 	pub(crate) async fn connect_peer_if_necessary(
@@ -80,57 +102,101 @@ where
 
 		log_debug!(self.logger, "Connecting to peer: {}@{}", node_id, addr);
 
-		let socket_addr = addr
-			.to_socket_addrs()
-			.map_err(|e| {
-				log_error!(self.logger, "Failed to resolve network address {}: {}", addr, e);
-				self.propagate_result_to_subscribers(&node_id, Err(Error::InvalidSocketAddress));
-				Error::InvalidSocketAddress
-			})?
-			.next()
-			.ok_or_else(|| {
-				log_error!(self.logger, "Failed to resolve network address {}", addr);
-				self.propagate_result_to_subscribers(&node_id, Err(Error::InvalidSocketAddress));
-				Error::InvalidSocketAddress
-			})?;
+		let res = self.dial_and_handshake(node_id, &addr).await;
+		match res {
+			Ok(()) => self.clear_connect_failures(&node_id),
+			Err(Error::ConnectionFailed) => self.log_connect_failure(&node_id, &addr),
+			Err(_) => {},
+		}
+		self.propagate_result_to_subscribers(&node_id, res);
+		res
+	}
 
-		let connection_future = lightning_net_tokio::connect_outbound(
-			Arc::clone(&self.peer_manager),
-			node_id,
-			socket_addr,
-		);
+	/// Overlay first, then TCP: the first stream on which the BOLT 8 handshake completes.
+	///
+	/// A stream is not yet a connection — the handshake can still fail on it (an endpoint that
+	/// is not the node, a peer that refuses) — so a failed handshake on the overlay falls
+	/// through to TCP like a failed dial does.
+	async fn dial_and_handshake(
+		&self, node_id: PublicKey, addr: &SocketAddress,
+	) -> Result<(), Error> {
+		let peer = node_net_ldk::peer_id(&node_id);
+		let target = node_net_ldk::peer_address(addr);
 
-		let res = match connection_future.await {
-			Some(connection_closed_future) => {
-				let mut connection_closed_future = Box::pin(connection_closed_future);
-				loop {
-					tokio::select! {
-						_ = &mut connection_closed_future => {
-							log_info!(self.logger, "Peer connection closed: {}@{}", node_id, addr);
-							break Err(Error::ConnectionFailed);
-						},
-						_ = tokio::time::sleep(Duration::from_millis(10)) => {},
-					};
-
-					match self.peer_manager.peer_by_node_id(&node_id) {
-						Some(_) => break Ok(()),
-						None => continue,
+		if let Some(overlay) = &self.overlay {
+			match overlay.dial(peer, &*self.stats).await {
+				Ok(stream) => {
+					if self.handshake(node_id, stream, overlay.name()).await.is_ok() {
+						return Ok(());
 					}
-				}
-			},
-			None => {
-				self.log_connect_failure(&node_id, &addr);
-				Err(Error::ConnectionFailed)
-			},
-		};
-
-		if res.is_ok() {
-			self.clear_connect_failures(&node_id);
+					log_debug!(
+						self.logger,
+						"Overlay '{}' reached {} but the handshake did not complete",
+						overlay.name(),
+						node_id
+					);
+				},
+				Err(e) => {
+					log_debug!(
+						self.logger,
+						"Overlay '{}' did not reach {}: {}",
+						overlay.name(),
+						node_id,
+						e
+					);
+				},
+			}
+			if !overlay.config().tcp_fallback {
+				return Err(Error::ConnectionFailed);
+			}
 		}
 
-		self.propagate_result_to_subscribers(&node_id, res);
+		if target == PeerAddress::Overlay {
+			// Known only by node id, and the overlay did not reach it.
+			return Err(Error::ConnectionFailed);
+		}
+		let started = Instant::now();
+		let dialed =
+			match tokio::time::timeout(TCP_DIAL_TIMEOUT, TcpTransport.dial(peer, &target)).await {
+				Ok(result) => result,
+				Err(_) => Err(DialError::Timeout(TCP_DIAL_TIMEOUT)),
+			};
+		self.stats.on_dial(&peer, "tcp", dialed.as_ref().map(|_| ()), started.elapsed());
+		match dialed {
+			Ok(stream) => self.handshake(node_id, stream, "tcp").await,
+			Err(DialError::Unresolved(e)) => {
+				log_error!(self.logger, "Failed to resolve network address {}: {}", addr, e);
+				Err(Error::InvalidSocketAddress)
+			},
+			Err(_) => Err(Error::ConnectionFailed),
+		}
+	}
 
-		res
+	/// Runs LDK over `stream` until the handshake with `node_id` completes or the stream
+	/// closes.
+	async fn handshake(
+		&self, node_id: PublicKey, stream: PeerStream, transport: &'static str,
+	) -> Result<(), Error> {
+		let info = stream.info().to_string();
+		let closed = node_net_ldk::setup_outbound(Arc::clone(&self.peer_manager), node_id, stream);
+		if closed.was_refused() {
+			return Err(Error::ConnectionFailed);
+		}
+		let mut closed = Box::pin(closed);
+		loop {
+			tokio::select! {
+				_ = &mut closed => {
+					log_info!(self.logger, "Peer connection closed: {} ({})", node_id, info);
+					return Err(Error::ConnectionFailed);
+				},
+				_ = tokio::time::sleep(Duration::from_millis(10)) => {},
+			};
+			if self.peer_manager.peer_by_node_id(&node_id).is_some() {
+				self.stats.on_connected(&node_net_ldk::peer_id(&node_id), transport);
+				log_debug!(self.logger, "Connected to peer {} over {}", node_id, info);
+				return Ok(());
+			}
+		}
 	}
 
 	/// Records a failed dial and reports it at a rate that does not scale with

@@ -233,12 +233,17 @@ pub use builder::NodeBuilder as Builder;
 pub use chain::host::{ChainHost, ChainHostBuilder, ChainHostStatus};
 pub use funding::{FundingRequest, FundingSource};
 pub use net::listener::InboundListener;
+pub use net::overlay::{Overlay, OverlayConfig};
+/// The peer transport this node runs on (node-net ADR 0001), for applications that build an
+/// [`Overlay`]'s transport or feed it streams.
+pub use node_net;
+pub use node_net_ldk::{is_overlay_address, overlay_address};
 pub use types::{Graph, Scorer};
 use chain::target::{SyncTargetSpec, TargetId};
 use chain::ChainLayer;
 use config::{
 	default_user_config, may_announce_channel, ChannelConfig, Config, NODE_ANN_BCAST_INTERVAL,
-	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
+	PEER_RECONNECTION_INTERVAL, PEER_RECONNECTION_MAX_BACKOFF, RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 use custom_gossip::CustomGossipMessageHandler;
@@ -454,6 +459,17 @@ impl Node {
 			},
 			None => {},
 		}
+		// The overlay needs no port: a node that takes inbound connections at all takes them
+		// over the overlay, even on a start that could not bind its TCP port.
+		if let Some(overlay) = self.connection_manager.overlay() {
+			if self.config.listening_addresses.is_some() {
+				overlay.register(
+					self.node_id(),
+					Arc::clone(&self.keys_manager),
+					Arc::clone(&self.peer_manager),
+				);
+			}
+		}
 
 		if self.gossip_source.is_rgs() {
 			let gossip_source = Arc::clone(&self.gossip_source);
@@ -505,12 +521,18 @@ impl Node {
 			});
 		}
 
-		// Regularly reconnect to persisted peers.
+		// Regularly reconnect to persisted peers: concurrently, so one slow dial (an overlay
+		// attempt running to its timeout) does not hold up the rest, and with a per-peer
+		// backoff so a peer that keeps failing is not redialled every minute forever.
 		let connect_cm = Arc::clone(&self.connection_manager);
 		let connect_pm = Arc::clone(&self.peer_manager);
 		let connect_logger = Arc::clone(&self.logger);
 		let connect_peer_store = Arc::clone(&self.peer_store);
 		let mut stop_connect = self.stop_sender.subscribe();
+		let connect_backoff = Arc::new(Mutex::new(node_net::Backoff::new(
+			PEER_RECONNECTION_INTERVAL,
+			PEER_RECONNECTION_MAX_BACKOFF,
+		)));
 		runtime.spawn(async move {
 			let mut interval = tokio::time::interval(PEER_RECONNECTION_INTERVAL);
 			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -529,12 +551,31 @@ impl Node {
 								.iter()
 								.map(|peer| peer.counterparty_node_id)
 								.collect::<Vec<_>>();
-
-							for peer_info in connect_peer_store.list_peers().iter().filter(|info| !pm_peers.contains(&info.node_id)) {
-								let _ = connect_cm.do_connect_peer(
-									peer_info.node_id,
-									peer_info.address.clone(),
-									).await;
+							let known = connect_peer_store.list_peers();
+							let now = std::time::Instant::now();
+							let due = {
+								let mut backoff = connect_backoff.lock().unwrap_or_else(|e| e.into_inner());
+								backoff.retain(|peer| known.iter().any(|info| node_net_ldk::peer_id(&info.node_id) == *peer));
+								known
+									.into_iter()
+									.filter(|info| !pm_peers.contains(&info.node_id))
+									.filter(|info| backoff.ready(&node_net_ldk::peer_id(&info.node_id), now))
+									.collect::<Vec<_>>()
+							};
+							for peer_info in due {
+								let cm = Arc::clone(&connect_cm);
+								let backoff = Arc::clone(&connect_backoff);
+								tokio::spawn(async move {
+									let peer = node_net_ldk::peer_id(&peer_info.node_id);
+									let result = cm.do_connect_peer(peer_info.node_id, peer_info.address).await;
+									let mut backoff = backoff.lock().unwrap_or_else(|e| e.into_inner());
+									match result {
+										Ok(()) => backoff.succeeded(&peer),
+										Err(_) => {
+											backoff.failed(peer, std::time::Instant::now());
+										},
+									}
+								});
 							}
 						}
 				}
@@ -781,6 +822,12 @@ impl Node {
 			self.chain_host.detach(id);
 		}
 
+		// Subscribe to "event handling stopped" BEFORE signalling the stop: a background
+		// processor with nothing to do can stop (and signal) before a later subscription
+		// exists, and the signal would be lost — `stop` then sat out its whole 100 s timeout.
+		let event_handling_stopped_logger = Arc::clone(&self.logger);
+		let mut event_handling_stopped_receiver = self.event_handling_stopped_sender.subscribe();
+
 		// Stop the runtime.
 		match self.stop_sender.send(()) {
 			Ok(_) => (),
@@ -794,7 +841,11 @@ impl Node {
 			},
 		}
 
-		// Stop taking inbound connections: leave a shared listener, stop a private one.
+		// Stop taking inbound connections: leave the overlay and a shared listener, stop a
+		// private one.
+		if let Some(overlay) = self.connection_manager.overlay() {
+			overlay.unregister(&self.node_id());
+		}
 		if let Some(listener) = self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()).take()
 		{
 			listener.unregister(&self.node_id());
@@ -807,8 +858,6 @@ impl Node {
 		self.peer_manager.disconnect_all_peers();
 
 		// Wait until event handling stopped, at least until a timeout is reached.
-		let event_handling_stopped_logger = Arc::clone(&self.logger);
-		let mut event_handling_stopped_receiver = self.event_handling_stopped_sender.subscribe();
 
 		// FIXME: For now, we wait up to 100 secs (BDK_WALLET_SYNC_TIMEOUT_SECS + 10) to allow
 		// event handling to exit gracefully even if it was blocked on the BDK wallet syncing. We
@@ -959,6 +1008,23 @@ impl Node {
 	/// Diagnostic only — nothing decides anything on it.
 	pub fn chain_slot_adapters(&self) -> ChainSlotStatus {
 		self.chain_source.slot_status()
+	}
+
+	/// What this node's peer transport did since it was built, per transport (`"tcp"`, the
+	/// overlay's name): its own dials, plus the inbound doors it is registered with (the
+	/// listener and the overlay, which other nodes of the process share).
+	pub fn network_stats(&self) -> NetworkStats {
+		NetworkStats {
+			dials: self.connection_manager.stats().snapshot(),
+			listener: self
+				.inbound_listener
+				.lock()
+				.unwrap_or_else(|e| e.into_inner())
+				.as_ref()
+				.map(|listener| listener.stats()),
+			overlay: self.connection_manager.overlay().map(|overlay| overlay.stats()),
+			overlay_name: self.connection_manager.overlay().map(|overlay| overlay.name()),
+		}
 	}
 
 	/// Returns the status of the [`Node`].
@@ -2635,6 +2701,8 @@ impl Node {
 			let address = match (connected_peer.socket_address, stored_addr_opt) {
 				(Some(con_addr), _) => con_addr,
 				(None, Some(stored_addr)) => stored_addr,
+				// Connected with no IP address and not stored: an overlay connection.
+				(None, None) if self.connection_manager.overlay().is_some() => overlay_address(),
 				(None, None) => continue,
 			};
 
@@ -2736,6 +2804,19 @@ pub struct QuiesceReport {
 	pub last_block_height: u32,
 	/// How many events wait in the persisted queue for the application to handle.
 	pub pending_events: usize,
+}
+
+/// What a node's peer transport did; see [`Node::network_stats`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkStats {
+	/// This node's dial attempts, per transport.
+	pub dials: std::collections::BTreeMap<String, node_net::TransportStats>,
+	/// The TCP listener's inbound door, while the node is registered with one.
+	pub listener: Option<std::collections::BTreeMap<String, node_net::TransportStats>>,
+	/// The overlay's inbound door, when the node has an overlay.
+	pub overlay: Option<std::collections::BTreeMap<String, node_net::TransportStats>>,
+	/// The overlay's transport name.
+	pub overlay_name: Option<&'static str>,
 }
 
 /// Represents the status of the [`Node`].

@@ -12,6 +12,7 @@ use crate::chain::cbf::birthday::birthday_checkpoint;
 use crate::chain::cbf::source::FilterSource;
 use crate::chain::host::{ChainHost, ChainHostBuilder};
 use crate::net::listener::InboundListener;
+use crate::net::overlay::Overlay;
 use crate::chain::provider::ChainDataProvider;
 #[cfg(feature = "cbf")]
 use crate::config::CbfConfig;
@@ -374,6 +375,7 @@ pub struct NodeBuilder {
 	chain_host: Option<Arc<ChainHost>>,
 	shared_graph: Option<SharedGraph>,
 	inbound_listener: Option<Arc<InboundListener>>,
+	overlay: Option<Arc<Overlay>>,
 	wallet_birthday: Option<BestBlock>,
 	gossip_source_config: Option<GossipSourceConfig>,
 	liquidity_source_config: Option<LiquiditySourceConfig>,
@@ -409,6 +411,7 @@ impl NodeBuilder {
 			chain_host: None,
 			shared_graph: None,
 			inbound_listener: None,
+			overlay: None,
 			wallet_birthday: None,
 			gossip_source_config,
 			liquidity_source_config,
@@ -471,6 +474,21 @@ impl NodeBuilder {
 	/// [`NodeStatus::is_listening`]: crate::NodeStatus::is_listening
 	pub fn set_inbound_listener(&mut self, listener: Arc<InboundListener>) -> &mut Self {
 		self.inbound_listener = Some(listener);
+		self
+	}
+
+	/// Reaches peers over an [`Overlay`] shared with other nodes in this process — on a Node,
+	/// Lightning over the platform's iroh/QUIC network — before TCP.
+	///
+	/// Every dial tries the overlay first (by node id alone) and falls back to TCP at the
+	/// peer's stored address as the overlay's [`OverlayConfig`] allows. While running, a node
+	/// with [`Config::listening_addresses`] also takes inbound overlay connections: it
+	/// registers with the overlay on start and unregisters on stop. The overlay needs no port,
+	/// so this holds even on a start that could not bind one.
+	///
+	/// [`OverlayConfig`]: crate::OverlayConfig
+	pub fn set_overlay(&mut self, overlay: Arc<Overlay>) -> &mut Self {
+		self.overlay = Some(overlay);
 		self
 	}
 
@@ -1106,6 +1124,7 @@ impl NodeBuilder {
 			self.chain_selection(&logger)?,
 			self.shared_graph.clone(),
 			self.inbound_listener.clone(),
+			self.overlay.clone(),
 			self.wallet_birthday,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
@@ -1132,6 +1151,7 @@ impl NodeBuilder {
 			self.chain_selection(&logger)?,
 			self.shared_graph.clone(),
 			self.inbound_listener.clone(),
+			self.overlay.clone(),
 			self.wallet_birthday,
 			self.gossip_source_config.as_ref(),
 			self.liquidity_source_config.as_ref(),
@@ -1585,7 +1605,8 @@ impl std::fmt::Debug for SharedGraph {
 /// Builds a [`Node`] instance according to the options previously configured.
 fn build_with_store_internal(
 	config: Arc<Config>, chain: ChainSelection, shared_graph: Option<SharedGraph>,
-	inbound_listener: Option<Arc<InboundListener>>, wallet_birthday: Option<BestBlock>,
+	inbound_listener: Option<Arc<InboundListener>>, overlay: Option<Arc<Overlay>>,
+	wallet_birthday: Option<BestBlock>,
 	gossip_source_config: Option<&GossipSourceConfig>,
 	liquidity_source_config: Option<&LiquiditySourceConfig>, custom_gossip_enabled: bool,
 	seed_bytes: [u8; 64], logger: Arc<Logger>, kv_store: Arc<DynStore>,
@@ -2220,7 +2241,7 @@ fn build_with_store_internal(
 	);
 
 	let connection_manager =
-		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
+		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), overlay, Arc::clone(&logger)));
 
 	let output_sweeper = match io::utils::read_output_sweeper(
 		Arc::clone(&tx_broadcaster),

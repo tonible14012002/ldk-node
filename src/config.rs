@@ -55,6 +55,10 @@ pub(crate) const RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL: u32 = 6;
 // The time in-between peer reconnection attempts.
 pub(crate) const PEER_RECONNECTION_INTERVAL: Duration = Duration::from_secs(60);
 
+// The longest a persisted peer that keeps failing waits between redials. Short enough that a
+// peer back from a long outage is reached within minutes even if it does not dial us itself.
+pub(crate) const PEER_RECONNECTION_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
 // The time in-between RGS sync attempts.
 pub(crate) const RGS_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 

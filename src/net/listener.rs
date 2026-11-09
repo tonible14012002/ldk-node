@@ -9,11 +9,11 @@
 //!
 //! A process running several wallets — several [`Node`]s — has one public address. An
 //! [`InboundListener`] owns the socket bound there and hands each inbound connection to the
-//! node it was dialed for: it peeks (never reads) the 50-byte BOLT 8 act one, checks it
-//! against each registered node's static key ([`act_one`](super::act_one)), and passes the
-//! socket, act one still in the kernel buffer, to that node's `PeerManager` through
-//! `lightning_net_tokio::setup_inbound`. A connection meant for no registered node is
-//! closed.
+//! node it was dialed for, through a [`node_net::InboundRouter`]: it reads the 50-byte BOLT 8
+//! act one, checks it against each registered node's static key (`node_net::bolt8`, ECDH
+//! through the node's signer), and hands the connection to that node's `PeerManager`
+//! (`node_net_ldk::setup_inbound`) with the act one replayed first. A connection meant for no
+//! registered node is closed. The overlay ([`super::overlay`]) routes through the same door.
 //!
 //! Every node listens through one, whether or not the application made it: a [`Node`] built
 //! without [`Builder::set_inbound_listener`] binds a private listener on start from its
@@ -27,41 +27,27 @@
 //! [`Builder::set_inbound_listener`]: crate::Builder::set_inbound_listener
 //! [`Config::listening_addresses`]: crate::config::Config::listening_addresses
 
+use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
 
 use lightning::ln::msgs::SocketAddress;
-use lightning::sign::{NodeSigner, Recipient};
+
+use node_net::{InboundRouter, NetStats, PeerEvents, PeerStream, RouteOutcome, TransportStats};
 
 use tokio::sync::watch;
 
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
-use crate::net::act_one::{act_one_matches, ACT_ONE_LEN};
+use crate::net::target::NodeTarget;
 use crate::types::{KeysManager, PeerManager};
 use crate::Error;
 
-/// How long a dialer has to send act one before the connection is dropped. LDK's own
-/// handshake timeout is of the same order (a few ticks of its 10 s timer).
-const ACT_ONE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Pause between peeks while act one has arrived only in part, so a slow sender does not
-/// turn the peek loop into a busy wait (a readable socket stays readable while we only peek).
-const PARTIAL_PEEK_BACKOFF: Duration = Duration::from_millis(10);
-
 /// Pause after a failed `accept` (e.g. out of file descriptors) before trying again.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
-
-/// A node that takes connections from the listener.
-#[derive(Clone)]
-struct Registration {
-	node_id: PublicKey,
-	signer: Arc<KeysManager>,
-	peer_manager: Arc<PeerManager>,
-}
 
 /// A Lightning TCP listener shared by the [`Node`]s of one process; see the
 /// [module documentation](self).
@@ -75,7 +61,8 @@ struct Registration {
 /// [`Builder::set_inbound_listener`]: crate::Builder::set_inbound_listener
 /// [`Config::listening_addresses`]: crate::config::Config::listening_addresses
 pub struct InboundListener {
-	registrations: Arc<RwLock<Vec<Registration>>>,
+	router: Arc<InboundRouter>,
+	stats: Arc<NetStats>,
 	listening: Arc<AtomicBool>,
 	stop_sender: watch::Sender<bool>,
 	local_addr: SocketAddr,
@@ -136,8 +123,12 @@ impl InboundListener {
 		};
 
 		let (stop_sender, mut stop_receiver) = watch::channel(false);
+		let stats = Arc::new(NetStats::default());
 		let this = Arc::new(Self {
-			registrations: Arc::new(RwLock::new(Vec::new())),
+			router: Arc::new(
+				InboundRouter::default().with_events(Arc::clone(&stats) as Arc<dyn PeerEvents>),
+			),
+			stats,
 			listening: Arc::new(AtomicBool::new(true)),
 			stop_sender,
 			local_addr,
@@ -146,7 +137,7 @@ impl InboundListener {
 		});
 		log_info!(logger, "Listening for inbound Lightning connections on {}", local_addr);
 
-		let registrations = Arc::clone(&this.registrations);
+		let router = Arc::clone(&this.router);
 		let listening = Arc::clone(&this.listening);
 		runtime.spawn(async move {
 			loop {
@@ -157,10 +148,11 @@ impl InboundListener {
 					}
 					res = listener.accept() => match res {
 						Ok((stream, remote)) => {
-							let registrations = Arc::clone(&registrations);
+							let router = Arc::clone(&router);
 							let logger = Arc::clone(&logger);
 							tokio::spawn(async move {
-								route_inbound(stream, remote, registrations, logger).await;
+								route_inbound(PeerStream::from_tcp(stream), remote, router, logger)
+									.await;
 							});
 						},
 						Err(e) => {
@@ -190,18 +182,23 @@ impl InboundListener {
 
 	/// The node ids taking connections, in matching order.
 	pub fn registered_node_ids(&self) -> Vec<PublicKey> {
-		self.registrations.read().unwrap().iter().map(|r| r.node_id).collect()
+		self.router.registered().iter().filter_map(node_net_ldk::public_key).collect()
 	}
 
 	/// Whether `node_id` takes connections from this listener.
 	pub fn is_registered(&self, node_id: &PublicKey) -> bool {
-		self.registrations.read().unwrap().iter().any(|r| r.node_id == *node_id)
+		self.router.is_registered(&node_net_ldk::peer_id(node_id))
+	}
+
+	/// What the listener's door did: inbound connections routed, unrouted, failed.
+	pub fn stats(&self) -> BTreeMap<String, TransportStats> {
+		self.stats.snapshot()
 	}
 
 	/// Stops accepting connections and drops every registration. Connections already handed
 	/// to a node are the node's. Idempotent.
 	pub fn stop(&self) {
-		self.registrations.write().unwrap().clear();
+		self.router.clear();
 		let _ = self.stop_sender.send(true);
 	}
 
@@ -210,12 +207,7 @@ impl InboundListener {
 	pub(crate) fn register(
 		&self, node_id: PublicKey, signer: Arc<KeysManager>, peer_manager: Arc<PeerManager>,
 	) {
-		let registration = Registration { node_id, signer, peer_manager };
-		let mut registrations = self.registrations.write().unwrap();
-		match registrations.iter_mut().find(|r| r.node_id == node_id) {
-			Some(existing) => *existing = registration,
-			None => registrations.push(registration),
-		}
+		self.router.register(Arc::new(NodeTarget::new(node_id, signer, peer_manager)));
 		log_debug!(
 			self.logger,
 			"Node {} takes inbound connections on {}",
@@ -226,7 +218,7 @@ impl InboundListener {
 
 	/// Stops routing connections to `node_id`.
 	pub(crate) fn unregister(&self, node_id: &PublicKey) {
-		self.registrations.write().unwrap().retain(|r| r.node_id != *node_id);
+		self.router.unregister(&node_net_ldk::peer_id(node_id));
 		log_debug!(self.logger, "Node {} no longer takes inbound connections", node_id);
 	}
 }
@@ -247,63 +239,29 @@ impl Drop for InboundListener {
 	}
 }
 
-/// Waits for act one without consuming it, finds the node it was written for and hands
-/// that node the socket.
+/// Reads act one, finds the node it was written for and hands that node the connection.
 async fn route_inbound(
-	stream: tokio::net::TcpStream, remote: SocketAddr,
-	registrations: Arc<RwLock<Vec<Registration>>>, logger: Arc<Logger>,
+	stream: PeerStream, remote: SocketAddr, router: Arc<InboundRouter>, logger: Arc<Logger>,
 ) {
-	let mut act_one = [0u8; ACT_ONE_LEN];
-	let deadline = tokio::time::Instant::now() + ACT_ONE_TIMEOUT;
-	loop {
-		match tokio::time::timeout_at(deadline, stream.peek(&mut act_one)).await {
-			Err(_) => {
-				log_debug!(logger, "Inbound connection from {} sent no act one in time", remote);
-				return;
-			},
-			Ok(Err(e)) => {
-				log_debug!(
-					logger,
-					"Inbound connection from {} failed before act one: {}",
-					remote,
-					e
-				);
-				return;
-			},
-			Ok(Ok(0)) => {
-				log_trace!(logger, "Inbound connection from {} closed before act one", remote);
-				return;
-			},
-			Ok(Ok(n)) if n >= ACT_ONE_LEN => break,
-			Ok(Ok(_)) => tokio::time::sleep(PARTIAL_PEEK_BACKOFF).await,
-		}
-	}
-
-	let candidates = registrations.read().unwrap().clone();
-	let matched = candidates.into_iter().find(|r| {
-		act_one_matches(&act_one, &r.node_id, |their_ephemeral| {
-			r.signer.ecdh(Recipient::Node, their_ephemeral, None)
-		})
-	});
-	let registration = match matched {
-		Some(registration) => registration,
-		None => {
+	match router.route(stream).await {
+		RouteOutcome::Routed(node) => {
+			log_trace!(logger, "Inbound connection from {} is for node {}", remote, node);
+		},
+		RouteOutcome::NoTarget => {
 			log_debug!(
 				logger,
 				"Inbound connection from {} is for no node on this listener; closing",
 				remote
 			);
-			return;
 		},
-	};
-
-	log_trace!(logger, "Inbound connection from {} is for node {}", remote, registration.node_id);
-	match stream.into_std() {
-		Ok(std_stream) => {
-			lightning_net_tokio::setup_inbound(registration.peer_manager, std_stream).await
+		RouteOutcome::Timeout => {
+			log_debug!(logger, "Inbound connection from {} sent no act one in time", remote);
 		},
-		Err(e) => {
-			log_error!(logger, "Failed to hand inbound connection from {} over: {}", remote, e);
+		RouteOutcome::Closed => {
+			log_trace!(logger, "Inbound connection from {} closed before act one", remote);
+		},
+		RouteOutcome::Io(e) => {
+			log_debug!(logger, "Inbound connection from {} failed before act one: {}", remote, e);
 		},
 	}
 }
