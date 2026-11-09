@@ -276,6 +276,11 @@ impl std::fmt::Debug for ChainHost {
 }
 
 impl ChainHost {
+	#[cfg(all(test, feature = "cbf"))]
+	pub(crate) fn halt_the_applicator_for_test(&self, why: &str) {
+		self.inner.halt_the_applicator_for_test(why)
+	}
+
 	pub(crate) fn layer(&self) -> &Arc<ChainLayer> {
 		self.inner.layer()
 	}
@@ -394,5 +399,109 @@ impl ChainHost {
 	/// is stopped and the host's tasks are told to end.
 	pub(crate) fn detach(&self, id: TargetId) {
 		self.inner.detach(id)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use lightning::util::test_utils::TestStore;
+
+	use crate::Builder;
+
+	/// Two nodes on one host: the host counts them, both come up and go down through it,
+	/// and the host's chain source outlives the first of them to stop.
+	#[test]
+	fn two_nodes_share_one_host() {
+		let logger = Arc::new(Logger::new_log_facade());
+		let mut host_builder = ChainHostBuilder::new(Network::Regtest);
+		host_builder
+			.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None)
+			.set_logger(Arc::clone(&logger));
+		let host = host_builder.build().expect("a host that connects to nothing");
+
+		let build_node = |seed: u8| {
+			let mut builder = Builder::new();
+			builder.set_network(Network::Regtest);
+			builder.set_log_facade_logger();
+			builder.set_entropy_seed_bytes([seed; 64]);
+			builder.set_chain_host(Arc::clone(&host));
+			builder.build_with_store(Arc::new(TestStore::new(false))).expect("a node builds")
+		};
+		let alice = build_node(1);
+		let bob = build_node(2);
+		assert_ne!(alice.node_id(), bob.node_id());
+
+		let runtime =
+			Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap());
+		alice.start_with_runtime(Arc::clone(&runtime)).unwrap();
+		assert_eq!(host.status().attached, 1);
+		bob.start_with_runtime(Arc::clone(&runtime)).unwrap();
+		let status = host.status();
+		assert_eq!(status.attached, 2);
+		assert_eq!(status.engine, "esplora-tx-sync");
+		assert!(alice.status().is_running && bob.status().is_running);
+
+		alice.stop().unwrap();
+		assert_eq!(host.status().attached, 1);
+		assert!(bob.status().is_running, "the host kept running for bob");
+		bob.stop().unwrap();
+		assert_eq!(host.status().attached, 0);
+	}
+
+	/// A second node built on the first's graph and scorer routes over the very same
+	/// objects, and a Rapid Gossip Sync source beside a shared graph is refused.
+	#[test]
+	fn a_secondary_shares_the_primarys_graph_and_scorer() {
+		let host = {
+			let mut b = ChainHostBuilder::new(Network::Regtest);
+			b.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None)
+				.set_logger(Arc::new(Logger::new_log_facade()));
+			b.build().unwrap()
+		};
+		let mut primary_builder = Builder::new();
+		primary_builder.set_network(Network::Regtest);
+		primary_builder.set_log_facade_logger();
+		primary_builder.set_entropy_seed_bytes([4; 64]);
+		primary_builder.set_chain_host(Arc::clone(&host));
+		let primary = primary_builder.build_with_store(Arc::new(TestStore::new(false))).unwrap();
+
+		let mut secondary_builder = Builder::new();
+		secondary_builder.set_network(Network::Regtest);
+		secondary_builder.set_log_facade_logger();
+		secondary_builder.set_entropy_seed_bytes([5; 64]);
+		secondary_builder.set_chain_host(Arc::clone(&host));
+		secondary_builder.set_shared_graph(primary.network_graph_handle(), primary.scorer_handle());
+		let secondary =
+			secondary_builder.build_with_store(Arc::new(TestStore::new(false))).unwrap();
+		assert!(Arc::ptr_eq(&primary.network_graph_handle(), &secondary.network_graph_handle()));
+		assert!(Arc::ptr_eq(&primary.scorer_handle(), &secondary.scorer_handle()));
+
+		secondary_builder.set_gossip_source_rgs("http://127.0.0.1:1".to_string());
+		assert_eq!(
+			secondary_builder.build_with_store(Arc::new(TestStore::new(false))).err(),
+			Some(BuildError::SharedGraphWithRgs)
+		);
+	}
+
+	/// A node builder with both a host and a chain source of its own is refused: the two
+	/// would disagree on where the chain comes from.
+	#[test]
+	fn a_host_and_a_chain_source_on_one_builder_is_refused() {
+		let host = {
+			let mut b = ChainHostBuilder::new(Network::Regtest);
+			b.set_chain_source_esplora("http://127.0.0.1:1".to_string(), None)
+				.set_logger(Arc::new(Logger::new_log_facade()));
+			b.build().unwrap()
+		};
+		let mut builder = Builder::new();
+		builder.set_network(Network::Regtest);
+		builder.set_log_facade_logger();
+		builder.set_entropy_seed_bytes([3; 64]);
+		builder.set_chain_host(host);
+		builder.set_chain_source_esplora("http://127.0.0.1:2".to_string(), None);
+		let err = builder.build_with_store(Arc::new(TestStore::new(false))).err();
+		assert_eq!(err, Some(BuildError::ChainHostConflict));
 	}
 }

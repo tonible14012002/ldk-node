@@ -19,6 +19,11 @@ pub(crate) mod host;
 pub(crate) mod observer;
 pub(crate) mod wallet;
 
+// The provider-session tests that run a real Node on a host over a session; the session's
+// node-free tests are node-chain's.
+#[cfg(all(test, feature = "cbf"))]
+mod session_tests;
+
 pub use host::{ChainHost, ChainHostBuilder};
 
 pub(crate) use node_chain::{ChainLayer, ChainTargetSpec, TargetId};
