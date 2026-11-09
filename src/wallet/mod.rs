@@ -98,7 +98,7 @@ where
 	persister: Mutex<KVStoreWalletPersister>,
 	broadcaster: B,
 	/// The broadcast policy of every transaction this wallet builds, and the ones held for a
-	/// rebroadcast, whose inputs stay reserved; see [`crate::broadcast_queue`].
+	/// rebroadcast, whose inputs stay reserved; see [`node_chain::broadcast_queue`].
 	broadcast_queue: Arc<BroadcastQueue>,
 	fee_estimator: E,
 	payment_store: Arc<PaymentStore>,

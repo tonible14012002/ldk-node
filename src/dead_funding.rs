@@ -25,7 +25,7 @@
 //! transaction buried [`ANTI_REORG_DELAY`] deep, or one of its inputs comes from a parent that
 //! is itself dead. A transaction this node gave up for good — a funding LDK discarded before
 //! broadcasting it, or one the broadcast queue gave up on a definitive answer
-//! ([`crate::broadcast_queue`]) — is dead by this node's own word: nothing will ever broadcast
+//! ([`node_chain::broadcast_queue`]) — is dead by this node's own word: nothing will ever broadcast
 //! it, and its inputs are offered to other spends. A legitimately pending funding is never dead, and a funding the peer built
 //! (an inbound channel) is not in the wallet's graph and is left alone.
 //!
