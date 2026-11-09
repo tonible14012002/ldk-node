@@ -5,21 +5,23 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::broadcast_queue::BroadcastQueue;
-#[cfg(feature = "cbf")]
-use crate::chain::cbf::birthday::birthday_checkpoint;
-#[cfg(feature = "cbf")]
-use crate::chain::cbf::source::FilterSource;
-use crate::chain::host::{ChainHost, ChainHostBuilder};
-use crate::net::listener::InboundListener;
-use crate::chain::provider::ChainDataProvider;
+use crate::chain_shim::{ChainHost, ChainHostBuilder};
 #[cfg(feature = "cbf")]
 use crate::config::CbfConfig;
 use crate::config::{
-	check_announce_configuration, default_user_config, AnnounceError,
-	BitcoindRestClientConfig, Config, ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
+	check_announce_configuration, default_user_config, AnnounceError, BitcoindRestClientConfig,
+	Config, ElectrumSyncConfig, EsploraSyncConfig, DEFAULT_LOG_FILENAME, DEFAULT_LOG_LEVEL,
 	WALLET_KEYS_SEED_LEN,
 };
+use crate::net::listener::InboundListener;
+#[cfg(feature = "cbf")]
+use node_chain::cbf::birthday::birthday_checkpoint;
+#[cfg(feature = "cbf")]
+use node_chain::cbf::source::FilterSource;
+use node_chain::provider::ChainDataProvider;
+use node_chain::BroadcastQueue;
+use node_chain_ldk::ldk::{LdkBroadcaster, LdkFeeEstimator, LdkFilter};
+use node_chain_ldk::KvQueueStore;
 
 use crate::connection::ConnectionManager;
 use crate::custom_gossip::CustomGossipMessageHandler;
@@ -92,63 +94,8 @@ const VSS_HARDENED_CHILD_INDEX: u32 = 877;
 const VSS_LNURL_AUTH_HARDENED_CHILD_INDEX: u32 = 138;
 const LSPS_HARDENED_CHILD_INDEX: u32 = 577;
 
-#[derive(Clone)]
-pub(crate) enum ChainDataSourceConfig {
-	Esplora {
-		server_url: String,
-		sync_config: Option<EsploraSyncConfig>,
-	},
-	Electrum {
-		server_url: String,
-		sync_config: Option<ElectrumSyncConfig>,
-	},
-	Bitcoind {
-		rpc_host: String,
-		rpc_port: u16,
-		rpc_user: String,
-		rpc_password: String,
-		rest_client_config: Option<BitcoindRestClientConfig>,
-	},
-	/// No chain source of this node's own: every chain ability is served by a
-	/// remote provider. The Dependent tier.
-	Dependent {
-		provider: Arc<dyn ChainDataProvider>,
-		sync_config: Option<EsploraSyncConfig>,
-	},
-	/// The chain followed by compact block filters over the Bitcoin P2P
-	/// network. What the filters cannot show — a mempool, an arbitrary
-	/// transaction's status, a mempool-aware fee market — is borrowed from
-	/// the provider set through [`NodeBuilder::set_chain_provider_fallback`],
-	/// when one is.
-	#[cfg(feature = "cbf")]
-	Cbf {
-		/// Trusted peers as `host:port`; empty leaves discovery to the DNS
-		/// seeds.
-		peers: Vec<String>,
-		config: CbfConfig,
-	},
-}
-
-/// Where this node reads the raw BIP157/158 data it serves to other nodes;
-/// see [`NodeBuilder::set_raw_chain_source_bitcoind_rpc`].
-#[derive(Clone)]
-pub(crate) struct RawChainSourceConfig {
-	pub(crate) url: String,
-	pub(crate) user: String,
-	pub(crate) password: String,
-	pub(crate) cert_sha256: Option<String>,
-	/// See [`NodeBuilder::set_raw_chain_source_allow_insecure_http`].
-	pub(crate) allow_insecure_http: bool,
-}
-
-// Hand-written so the credentials never reach a log.
-impl std::fmt::Debug for RawChainSourceConfig {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("RawChainSourceConfig")
-			.field("cert_pinned", &self.cert_sha256.is_some())
-			.finish_non_exhaustive()
-	}
-}
+pub(crate) use node_chain::config::RawChainSourceConfig;
+pub(crate) use node_chain_ldk::ChainDataSourceConfig;
 
 /// The provider a filter-following node borrows from, kept apart from the
 /// chain source so the two can be set in either order.
@@ -177,41 +124,6 @@ struct CbfFilterSource(Arc<dyn FilterSource>);
 impl std::fmt::Debug for CbfFilterSource {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_tuple("CbfFilterSource").field(&self.0.name()).finish()
-	}
-}
-
-// Hand-written because the `Dependent` variant holds a trait object, which
-// cannot derive `Debug`. The provider identifies itself by name; nothing else
-// about it is this crate's business to print.
-impl std::fmt::Debug for ChainDataSourceConfig {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::Esplora { server_url, sync_config } => f
-				.debug_struct("Esplora")
-				.field("server_url", server_url)
-				.field("sync_config", sync_config)
-				.finish(),
-			Self::Electrum { server_url, sync_config } => f
-				.debug_struct("Electrum")
-				.field("server_url", server_url)
-				.field("sync_config", sync_config)
-				.finish(),
-			Self::Bitcoind { rpc_host, rpc_port, rest_client_config, .. } => f
-				.debug_struct("Bitcoind")
-				.field("rpc_host", rpc_host)
-				.field("rpc_port", rpc_port)
-				.field("rest_client_config", rest_client_config)
-				.finish_non_exhaustive(),
-			#[cfg(feature = "cbf")]
-			Self::Cbf { peers, config } => {
-				f.debug_struct("Cbf").field("peers", peers).field("config", config).finish()
-			},
-			Self::Dependent { provider, sync_config } => f
-				.debug_struct("Dependent")
-				.field("provider", &provider.name())
-				.field("sync_config", sync_config)
-				.finish(),
-		}
 	}
 }
 
@@ -1625,8 +1537,12 @@ fn build_with_store_internal(
 		ChainSelection::Shared(host) => host,
 		ChainSelection::Own(host_builder) => host_builder.build()?,
 	};
-	let tx_broadcaster = Arc::clone(chain_host.tx_broadcaster());
-	let fee_estimator = Arc::clone(chain_host.fee_estimator());
+	// The host's broadcaster, fee estimator and layer as LDK's `BroadcasterInterface`,
+	// `FeeEstimator` and `Filter`, wrapped once for every LDK object of this node. The wallet
+	// estimates through the host's fee estimator itself.
+	let tx_broadcaster = Arc::new(LdkBroadcaster::new(Arc::clone(chain_host.tx_broadcaster())));
+	let onchain_fee_estimator = Arc::clone(chain_host.fee_estimator());
+	let fee_estimator = Arc::new(LdkFeeEstimator::new(Arc::clone(&onchain_fee_estimator)));
 
 	// Initialize the on-chain wallet and chain access
 	let xprv = bitcoin::bip32::Xpriv::new_master(config.network, &seed_bytes).map_err(|e| {
@@ -1729,26 +1645,30 @@ fn build_with_store_internal(
 		},
 	};
 
-	let broadcast_queue =
-		Arc::new(BroadcastQueue::read_or_empty(Arc::clone(&kv_store), Arc::clone(&logger)));
+	let chain_logger: Arc<node_chain::Logger> = Arc::clone(&logger) as Arc<node_chain::Logger>;
+	let broadcast_queue = Arc::new(BroadcastQueue::read_or_empty(
+		Arc::new(KvQueueStore::new(Arc::clone(&kv_store), Arc::clone(&chain_logger))),
+		chain_logger,
+	));
 	let wallet = Arc::new(Wallet::new(
 		bdk_wallet,
 		wallet_persister,
 		Arc::clone(&tx_broadcaster),
 		broadcast_queue,
-		Arc::clone(&fee_estimator),
+		Arc::clone(&onchain_fee_estimator),
 		Arc::clone(&payment_store),
 		Arc::clone(&config),
 		Arc::clone(&logger),
 	));
 
 	let chain_source = Arc::clone(chain_host.layer());
+	let chain_filter = Arc::new(LdkFilter::new(Arc::clone(&chain_source)));
 
 	let runtime = Arc::new(RwLock::new(None));
 
 	// Initialize the ChainMonitor
 	let chain_monitor: Arc<ChainMonitor> = Arc::new(chainmonitor::ChainMonitor::new(
-		Some(Arc::clone(&chain_source)),
+		Some(Arc::clone(&chain_filter)),
 		Arc::clone(&tx_broadcaster),
 		Arc::clone(&logger),
 		Arc::clone(&fee_estimator),
@@ -1776,19 +1696,17 @@ fn build_with_store_internal(
 	let (network_graph, scorer) = match shared_graph {
 		Some(SharedGraph { graph, scorer }) => (graph, scorer),
 		None => {
-			let network_graph = match io::utils::read_network_graph(
-				Arc::clone(&kv_store),
-				Arc::clone(&logger),
-			) {
-				Ok(graph) => Arc::new(graph),
-				Err(e) => {
-					if e.kind() == std::io::ErrorKind::NotFound {
-						Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
-					} else {
-						return Err(BuildError::ReadFailed);
-					}
-				},
-			};
+			let network_graph =
+				match io::utils::read_network_graph(Arc::clone(&kv_store), Arc::clone(&logger)) {
+					Ok(graph) => Arc::new(graph),
+					Err(e) => {
+						if e.kind() == std::io::ErrorKind::NotFound {
+							Arc::new(Graph::new(config.network.into(), Arc::clone(&logger)))
+						} else {
+							return Err(BuildError::ReadFailed);
+						}
+					},
+				};
 
 			let scorer = match io::utils::read_scorer(
 				Arc::clone(&kv_store),
@@ -2069,7 +1987,7 @@ fn build_with_store_internal(
 					Arc::clone(&wallet),
 					Arc::clone(&channel_manager),
 					Arc::clone(&keys_manager),
-					Arc::clone(&chain_source),
+					Arc::clone(&chain_filter),
 					Arc::clone(&config),
 					Arc::clone(&logger),
 				);
@@ -2118,7 +2036,7 @@ fn build_with_store_internal(
 					Arc::clone(&wallet),
 					Arc::clone(&channel_manager),
 					Arc::clone(&keys_manager),
-					Arc::clone(&chain_source),
+					Arc::clone(&chain_filter),
 					Arc::clone(&config),
 					Arc::clone(&logger),
 				);
@@ -2225,7 +2143,7 @@ fn build_with_store_internal(
 	let output_sweeper = match io::utils::read_output_sweeper(
 		Arc::clone(&tx_broadcaster),
 		Arc::clone(&fee_estimator),
-		Arc::clone(&chain_source),
+		Arc::clone(&chain_filter),
 		Arc::clone(&keys_manager),
 		Arc::clone(&kv_store),
 		Arc::clone(&logger),
@@ -2237,7 +2155,7 @@ fn build_with_store_internal(
 					channel_manager.current_best_block(),
 					Arc::clone(&tx_broadcaster),
 					Arc::clone(&fee_estimator),
-					Some(Arc::clone(&chain_source)),
+					Some(Arc::clone(&chain_filter)),
 					Arc::clone(&keys_manager),
 					Arc::clone(&keys_manager),
 					Arc::clone(&kv_store),
@@ -2297,6 +2215,7 @@ fn build_with_store_internal(
 		wallet,
 		chain_source,
 		tx_broadcaster,
+		fee_estimator,
 		event_queue,
 		channel_manager,
 		chain_monitor,
@@ -2327,7 +2246,7 @@ fn build_with_store_internal(
 		external_fundings: Arc::new(crate::funding::ExternalFundings::default()),
 		journal: Arc::new(crate::journal::JournalQueue::new()),
 		#[cfg(feature = "swaps")]
-		swap_tx_watch: Arc::new(crate::chain::SwapTxWatch::new()),
+		swap_tx_watch: Arc::new(node_chain::status::SwapTxWatch::new()),
 	})
 }
 

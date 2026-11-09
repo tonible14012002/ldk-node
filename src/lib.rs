@@ -76,9 +76,8 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 mod balance;
-mod broadcast_queue;
 mod builder;
-mod chain;
+mod chain_shim;
 pub mod config;
 mod connection;
 pub mod custom_gossip;
@@ -86,7 +85,6 @@ mod data_store;
 mod dead_funding;
 mod error;
 mod event;
-mod fee_estimator;
 mod ffi;
 mod funding;
 mod gossip;
@@ -102,7 +100,6 @@ mod path_failure;
 pub mod payment;
 mod peer_store;
 mod sweep;
-mod tx_broadcaster;
 mod types;
 mod wallet;
 
@@ -112,7 +109,7 @@ mod wallet;
 /// [`chain_provider::ChainDataProvider`], supplied through
 /// [`Builder::set_chain_source_dependent`]. The transport is the implementor's
 /// business; this crate never learns what it is.
-pub use crate::chain::provider as chain_provider;
+pub use node_chain::provider as chain_provider;
 
 /// The raw BIP157/158 filter source port.
 ///
@@ -125,17 +122,17 @@ pub use crate::chain::provider as chain_provider;
 /// [`chain_filter_source::BundleTransport`] port are re-exported here too: a
 /// Pro node answers them with [`Node::chain_serve_since`], and builds pushes
 /// with [`Node::chain_serve_block_update`].
-pub use crate::chain::cbf::source as chain_filter_source;
+pub use node_chain::cbf::source as chain_filter_source;
 
 /// The provider session: which Pro node a chain host follows, swappable while it
 /// runs. See [`chain_session::ChainProviderSession`].
-pub use crate::chain::session as chain_session;
+pub use node_chain::session as chain_session;
 
 /// Who a Pro node pushes blocks to. See
 /// [`chain_subscription::SubscriptionRegistry`].
-pub use crate::chain::subscription as chain_subscription;
+pub use node_chain::subscription as chain_subscription;
 
-pub use crate::chain::adapters::bitcoind_raw::RawSourceStatus;
+pub use node_chain::adapters::bitcoind_raw::RawSourceStatus;
 
 pub use bip39;
 pub use bitcoin;
@@ -146,7 +143,7 @@ pub use lightning_types;
 pub use vss_client;
 
 pub use balance::{BalanceDetails, LightningBalance, PendingSweepBalance};
-pub use broadcast_queue::{
+pub use node_chain::broadcast_queue::{
 	BroadcastPolicy, BroadcastQueueEntry, BroadcastQueueState, DEFAULT_BROADCAST_QUEUE_MAX_AGE_SECS,
 };
 
@@ -163,13 +160,13 @@ pub struct OpenChannelOptions {
 	/// What the broadcast does with the funding transaction when the network does not take it.
 	pub broadcast_policy: BroadcastPolicy,
 }
-pub use chain::{
-	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
-};
 #[cfg(feature = "cbf")]
 pub use config::{CbfConfig, CbfExternalFee, CbfSource};
 pub use error::Error as NodeError;
 use error::Error;
+pub use node_chain::status::{
+	CbfSyncStatus, ChainSlotAdapterStatus, ChainSlotStatus, ChainUtxoStatus, ChainUtxoVerification,
+};
 
 pub use event::Event;
 
@@ -191,21 +188,21 @@ pub use path_failure::{PathFailureClass, PathFailureInfo, PATH_FAILURE_STORE_CAP
 /// can request on-chain fee rates without the crate-internal
 /// `ConfirmationTarget` leaking into the public API.
 #[cfg(feature = "swaps")]
-pub use fee_estimator::SwapFeeTarget;
+pub use node_chain::fee_estimator::SwapFeeTarget;
 
 /// Public source-bearing swap feerate quote types (Peerswap native primitive
 /// B6 / plan FIX-B). Re-exported from the otherwise-private `fee_estimator`
 /// module so swap callers can detect estimate provenance (live vs fallback).
 #[cfg(feature = "swaps")]
-pub use fee_estimator::{FeerateQuote, SwapFeerateSource};
+pub use node_chain::fee_estimator::{FeerateQuote, SwapFeerateSource};
 
+#[cfg(feature = "swaps")]
+pub use node_chain::status::SwapTxInBlock;
 /// Public reorg-aware chain-status types for the swap-txid watch primitive
 /// (Peerswap native primitives, B5). Re-exported from the otherwise-private
 /// `chain` module.
 #[cfg(feature = "swaps")]
-pub use chain::{ChainStatus, TxStatus};
-#[cfg(feature = "swaps")]
-pub use chain::SwapTxInBlock;
+pub use node_chain::status::{ChainStatus, TxStatus};
 
 /// Public types appearing in the swap-primitive signatures on [`Node`]
 /// (Peerswap native primitives, B-series). Re-exported so the consumer crate
@@ -230,12 +227,8 @@ pub use builder::BuildError;
 #[cfg(not(feature = "uniffi"))]
 pub use builder::NodeBuilder as Builder;
 
-pub use chain::host::{ChainHost, ChainHostBuilder, ChainHostStatus};
-pub use funding::{FundingRequest, FundingSource};
-pub use net::listener::InboundListener;
-pub use types::{Graph, Scorer};
-use chain::target::{SyncTargetSpec, TargetId};
-use chain::ChainLayer;
+pub use chain_shim::{ChainHost, ChainHostBuilder};
+use chain_shim::{ChainLayer, ChainTargetSpec, TargetId};
 use config::{
 	default_user_config, may_announce_channel, ChannelConfig, Config, NODE_ANN_BCAST_INTERVAL,
 	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
@@ -243,21 +236,25 @@ use config::{
 use connection::ConnectionManager;
 use custom_gossip::CustomGossipMessageHandler;
 use event::{EventHandler, EventQueue};
+pub use funding::{FundingRequest, FundingSource};
 use gossip::GossipSource;
 use graph::NetworkGraph;
 use io::no_graph_persister::{BackgroundPersister, GraphPersistence};
 use io::utils::write_node_metrics;
 use liquidity::{LSPS1Liquidity, LiquiditySource};
+pub use net::listener::InboundListener;
+pub use node_chain::ChainHostStatus;
 use payment::{
 	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
 	UnifiedQrPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
 use types::{
-	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, GossipSync,
-	KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Sweeper, Wallet,
+	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, FeeEstimator,
+	GossipSync, KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Sweeper, Wallet,
 };
 pub use types::{ChannelDetails, CustomTlvRecord, PeerDetails, UserChannelId};
+pub use types::{Graph, Scorer};
 
 #[cfg(tokio_unstable)]
 use logger::log_trace;
@@ -299,6 +296,8 @@ pub struct Node {
 	chain_host: Arc<ChainHost>,
 	chain_source: Arc<ChainLayer>,
 	tx_broadcaster: Arc<Broadcaster>,
+	/// The host's fee estimator as LDK's, the one this node's LDK objects were built with.
+	fee_estimator: Arc<FeeEstimator>,
 	event_queue: Arc<EventQueue<Arc<Logger>>>,
 	channel_manager: Arc<ChannelManager>,
 	chain_monitor: Arc<ChainMonitor>,
@@ -331,7 +330,7 @@ pub struct Node {
 	/// This node's handle in the chain host's target registry, from `start` to `stop`.
 	chain_target: Mutex<Option<TargetId>>,
 	/// Where a filter scan for this node's wallet may start; see
-	/// [`chain::target::SyncTargetSpec::birthday_height`].
+	/// [`ChainTargetSpec::birthday_height`].
 	wallet_birthday_height: Option<u32>,
 	/// Last `PaymentPathFailed` detail per payment (bounded, in-memory). Written by
 	/// the event handler, read via `Node::path_failure`.
@@ -343,7 +342,7 @@ pub struct Node {
 	journal: Arc<JournalQueue>,
 	/// Reorg-aware swap-txid watch registry (Peerswap native primitive B5).
 	#[cfg(feature = "swaps")]
-	swap_tx_watch: Arc<chain::SwapTxWatch>,
+	swap_tx_watch: Arc<node_chain::status::SwapTxWatch>,
 }
 
 impl Node {
@@ -665,7 +664,10 @@ impl Node {
 			)
 		} else {
 			(
-				Arc::new(BackgroundPersister::new(Arc::clone(&self.kv_store), GraphPersistence::Own)),
+				Arc::new(BackgroundPersister::new(
+					Arc::clone(&self.kv_store),
+					GraphPersistence::Own,
+				)),
 				self.gossip_source.as_gossip_sync(),
 			)
 		};
@@ -795,7 +797,8 @@ impl Node {
 		}
 
 		// Stop taking inbound connections: leave a shared listener, stop a private one.
-		if let Some(listener) = self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()).take()
+		if let Some(listener) =
+			self.inbound_listener.lock().unwrap_or_else(|e| e.into_inner()).take()
 		{
 			listener.unregister(&self.node_id());
 			if self.shared_inbound_listener.is_none() {
@@ -833,7 +836,10 @@ impl Node {
 						"Stopping event handling failed. This should never happen: {}",
 						e
 					);
-					debug_assert!(false, "Stopping event handling failed. This should never happen.");
+					debug_assert!(
+						false,
+						"Stopping event handling failed. This should never happen."
+					);
 					stop_res = Err(Error::EventHandlingStopFailed);
 				},
 			},
@@ -878,9 +884,8 @@ impl Node {
 			let checkpoint = rusqlite::Connection::open(&db_path).and_then(|connection| {
 				// Returns (busy, log frames, checkpointed frames); busy means a reader held
 				// the WAL open and the checkpoint stopped short.
-				connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-					row.get::<_, i64>(0)
-				})
+				connection
+					.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0))
 			});
 			match checkpoint {
 				Ok(0) => {
@@ -1339,7 +1344,7 @@ impl Node {
 		let script_pubkey = self.swap_tx_watch.script_pubkey(&txid);
 		let previously_confirmed = self.swap_tx_watch.previously_confirmed(&txid);
 		let observation = self.chain_source.swap_query_tx(txid, script_pubkey.as_ref()).await;
-		let status = chain::derive_tx_status(observation, previously_confirmed);
+		let status = node_chain::status::derive_tx_status(observation, previously_confirmed);
 		self.swap_tx_watch.record(&txid, &status);
 		Ok(status)
 	}
@@ -1400,7 +1405,7 @@ impl Node {
 	/// confirm acceptance by the backend.
 	#[cfg(feature = "swaps")]
 	pub fn broadcast_swap_tx(&self, tx: &bitcoin::Transaction) {
-		self.tx_broadcaster.broadcast_tx(tx);
+		self.tx_broadcaster.0.broadcast_tx(tx);
 	}
 
 	/// Estimates the on-chain feerate for a swap transaction at the requested
@@ -1714,10 +1719,8 @@ impl Node {
 				broadcast_queue.forget_pending_open(user_channel_id);
 				log_error!(self.logger, "Failed to initiate channel creation: {:?}", e);
 				if externally_funded {
-					self.external_fundings.release(
-						user_channel_id,
-						lightning::ln::types::ChannelId([0u8; 32]),
-					);
+					self.external_fundings
+						.release(user_channel_id, lightning::ln::types::ChannelId([0u8; 32]));
 				}
 				Err(Error::ChannelCreationFailed)
 			},
@@ -1977,28 +1980,50 @@ impl Node {
 		// one per call.
 		let rt_lock = self.runtime.read().unwrap();
 		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
-		let target_id = self
-			.chain_target
-			.lock()
-			.unwrap_or_else(|e| e.into_inner())
-			.ok_or(Error::NotRunning)?;
+		let target_id =
+			self.chain_target.lock().unwrap_or_else(|e| e.into_inner()).ok_or(Error::NotRunning)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		runtime.block_on(async move { chain_source.sync_wallets_once(target_id).await })
+		runtime.block_on(async move {
+			chain_source.sync_wallets_once(target_id).await.map_err(Error::from)
+		})
 	}
 
-	/// Everything of this node the chain layer keeps in step; see [`chain::target`].
-	fn sync_target_spec(&self) -> SyncTargetSpec {
+	/// Everything of this node the chain layer keeps in step: its wallet, its Lightning
+	/// listeners in the order they are called — `ChannelManager`, `ChainMonitor` (each channel
+	/// monitor a member), `OutputSweeper` — and what a pass writes back into it.
+	fn sync_target_spec(&self) -> ChainTargetSpec {
+		use node_chain::{Listener, NamedGroup, NamedListener};
+		use node_chain_ldk::ldk::{SeamGroup, SeamListener};
+
 		let node_id = self.node_id().to_string();
-		SyncTargetSpec {
+		let channel_manager =
+			SeamListener::new(Arc::clone(&self.channel_manager), |cm| cm.current_best_block());
+		let chain_monitor = SeamGroup::new(
+			Arc::clone(&self.chain_monitor),
+			Arc::clone(&self.tx_broadcaster),
+			Arc::clone(&self.fee_estimator),
+			Arc::clone(&self.logger),
+		);
+		let output_sweeper =
+			SeamListener::new(Arc::clone(&self.output_sweeper), |s| s.current_best_block());
+		ChainTargetSpec {
 			label: node_id.chars().take(8).collect(),
-			onchain_wallet: Arc::clone(&self.wallet),
-			channel_manager: Arc::clone(&self.channel_manager),
-			chain_monitor: Arc::clone(&self.chain_monitor),
-			output_sweeper: Arc::clone(&self.output_sweeper),
-			kv_store: Arc::clone(&self.kv_store),
-			node_metrics: Arc::clone(&self.node_metrics),
-			dead_fundings: Arc::clone(&self.dead_fundings),
+			onchain_wallet: Arc::clone(&self.wallet) as Arc<dyn node_chain_seam::ChainWallet>,
+			lightning: vec![
+				Listener::Single(NamedListener::new("ChannelManager", Arc::new(channel_manager))),
+				Listener::Group(NamedGroup::new("ChainMonitor", Arc::new(chain_monitor))),
+				Listener::Single(NamedListener::new("OutputSweeper", Arc::new(output_sweeper))),
+			],
+			observer: Arc::new(chain_shim::observer::NodeSyncObserver {
+				wallet: Arc::clone(&self.wallet),
+				channel_manager: Arc::clone(&self.channel_manager),
+				chain_monitor: Arc::clone(&self.chain_monitor),
+				kv_store: Arc::clone(&self.kv_store),
+				node_metrics: Arc::clone(&self.node_metrics),
+				dead_fundings: Arc::clone(&self.dead_fundings),
+				logger: Arc::clone(&self.logger),
+			}),
 			birthday_height: self.wallet_birthday_height,
 		}
 	}
@@ -2016,7 +2041,7 @@ impl Node {
 	/// source of its own — a Dependent or filter-following node — which must
 	/// never pass them on as though they were.
 	pub fn chain_serve_fee_estimates(&self) -> Result<chain_provider::WireFeeEstimates, Error> {
-		self.chain_source.serve_fee_estimates()
+		self.chain_source.serve_fee_estimates().map_err(Error::from)
 	}
 
 	/// Broadcast another node's transaction through this node's chain source.
@@ -2031,13 +2056,14 @@ impl Node {
 		let rt_lock = self.runtime.read().unwrap();
 		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
 
-		let tx = crate::chain::wire_convert::tx_from_wire(&req.tx_hex).map_err(|e| {
+		let tx = node_chain::wire_convert::tx_from_wire(&req.tx_hex).map_err(|e| {
 			log_error!(self.logger, "Refusing a malformed broadcast request: {}", e);
 			Error::ChainServeFailed
 		})?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		runtime.block_on(async move { chain_source.serve_broadcast(&tx).await })
+		runtime
+			.block_on(async move { chain_source.serve_broadcast(&tx).await.map_err(Error::from) })
 	}
 
 	/// Answer another node's question about an arbitrary transaction.
@@ -2057,18 +2083,18 @@ impl Node {
 			log_error!(self.logger, "Refusing a malformed chain lookup request: {}", e);
 			Error::ChainServeFailed
 		};
-		let txid = crate::chain::wire_convert::txid_from_wire(&req.txid).map_err(malformed)?;
+		let txid = node_chain::wire_convert::txid_from_wire(&req.txid).map_err(malformed)?;
 		let script_pubkey = req
 			.script_hex
 			.as_deref()
-			.map(crate::chain::wire_convert::script_from_wire)
+			.map(node_chain::wire_convert::script_from_wire)
 			.transpose()
 			.map_err(malformed)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		runtime.block_on(
-			async move { chain_source.serve_tx_status(txid, script_pubkey.as_ref()).await },
-		)
+		runtime.block_on(async move {
+			chain_source.serve_tx_status(txid, script_pubkey.as_ref()).await.map_err(Error::from)
+		})
 	}
 
 	/// Run another node's on-chain wallet scan against this node's chain
@@ -2081,7 +2107,9 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_wallet_sync(&req).await })
+		runtime.block_on(
+			async move { chain_source.serve_wallet_sync(&req).await.map_err(Error::from) },
+		)
 	}
 
 	/// Answer another node's Lightning sync.
@@ -2093,7 +2121,9 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_lightning_sync(&req).await })
+		runtime.block_on(async move {
+			chain_source.serve_lightning_sync(&req).await.map_err(Error::from)
+		})
 	}
 
 	/// Answer another node's mempool question from this node's own mempool.
@@ -2111,7 +2141,7 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_mempool(&req).await })
+		runtime.block_on(async move { chain_source.serve_mempool(&req).await.map_err(Error::from) })
 	}
 
 	/// How this node's raw chain source — the bitcoind set through
@@ -2149,7 +2179,7 @@ impl Node {
 		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		runtime.block_on(async move { chain_source.serve_tip().await })
+		runtime.block_on(async move { chain_source.serve_tip().await.map_err(Error::from) })
 	}
 
 	/// Serve up to [`chain_provider::MAX_HEADERS_PER_REQUEST`] consecutive
@@ -2162,7 +2192,7 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_headers(&req).await })
+		runtime.block_on(async move { chain_source.serve_headers(&req).await.map_err(Error::from) })
 	}
 
 	/// Serve the filter headers of a span of at most
@@ -2176,7 +2206,9 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_filter_headers(&req).await })
+		runtime.block_on(async move {
+			chain_source.serve_filter_headers(&req).await.map_err(Error::from)
+		})
 	}
 
 	/// Serve the basic filters of a span of at most
@@ -2190,7 +2222,7 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_filters(&req).await })
+		runtime.block_on(async move { chain_source.serve_filters(&req).await.map_err(Error::from) })
 	}
 
 	/// Serve one [`chain_provider::BLOCK_CHUNK_BYTES`] chunk of a block; see
@@ -2204,7 +2236,9 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_block_chunk(&req).await })
+		runtime.block_on(
+			async move { chain_source.serve_block_chunk(&req).await.map_err(Error::from) },
+		)
 	}
 
 	/// Serve one block's bundle to push to the nodes holding a lease: its
@@ -2218,7 +2252,9 @@ impl Node {
 		let runtime = rt_lock.as_ref().ok_or(Error::NotRunning)?;
 
 		let chain_source = Arc::clone(&self.chain_source);
-		runtime.block_on(async move { chain_source.serve_block_update(height).await })
+		runtime.block_on(async move {
+			chain_source.serve_block_update(height).await.map_err(Error::from)
+		})
 	}
 
 	/// See [`ChainHost::chain_set_candidates`].
@@ -2296,7 +2332,7 @@ impl Node {
 
 		let chain_source = Arc::clone(&self.chain_source);
 		let req = req.clone();
-		runtime.block_on(async move { chain_source.serve_since(&req).await })
+		runtime.block_on(async move { chain_source.serve_since(&req).await.map_err(Error::from) })
 	}
 
 	/// Close a previously opened channel.
@@ -2953,10 +2989,8 @@ mod announce_policy_tests {
 		let mut config = Config::default();
 		config.network = Network::Regtest;
 		config.node_alias = Some(NodeAlias([7u8; 32]));
-		config.listening_addresses = Some(vec![SocketAddress::TcpIpV4 {
-			addr: [127, 0, 0, 1],
-			port: 19735,
-		}]);
+		config.listening_addresses =
+			Some(vec![SocketAddress::TcpIpV4 { addr: [127, 0, 0, 1], port: 19735 }]);
 		config.announce_policy.announce = announce;
 		config
 	}

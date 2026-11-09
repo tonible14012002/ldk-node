@@ -15,10 +15,10 @@ use crate::{
 use crate::config::{may_announce_channel, Config};
 use crate::connection::ConnectionManager;
 use crate::data_store::DataStoreUpdateResult;
-use crate::fee_estimator::ConfirmationTarget;
 use crate::funding::{ExternalFundings, FundingRequest, FundingSource};
 use crate::liquidity::LiquiditySource;
 use crate::logger::Logger;
+use node_chain::fee_estimator::ConfirmationTarget;
 
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
@@ -480,8 +480,8 @@ where
 		liquidity_source: Option<Arc<LiquiditySource<Arc<Logger>>>>,
 		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
 		path_failures: Arc<PathFailureStore>, external_fundings: Arc<ExternalFundings>,
-		journal: Arc<JournalQueue>,
-		runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>, logger: L, config: Arc<Config>,
+		journal: Arc<JournalQueue>, runtime: Arc<RwLock<Option<Arc<tokio::runtime::Runtime>>>>,
+		logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,

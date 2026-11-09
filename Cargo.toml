@@ -31,17 +31,17 @@ panic = 'abort'     # Abort on panic
 
 [features]
 default = []
-# Peerswap native primitives (B-series). Empty for now; gates all swap
-# additions so the default build is byte-for-byte unaffected.
-swaps = []
+# Peerswap native primitives (B-series). Gates all swap additions, here and in the
+# chain layer, so the default build is byte-for-byte unaffected.
+swaps = ["node-chain/swaps", "node-chain-ldk/swaps"]
 # Cooperative cycle-balance primitive (manual-route circular self-payment).
 # Gates the `Node::send_along_route` entry point; the `PaymentKind::Rebalance`
 # variant and its `event.rs` claim path stay ungated for TLV compatibility.
 cycles = []
-# BIP157/158 compact-block-filter chain source (T6 groundwork; the engine lands in T7).
-# Pulls in `bip157` (kyoto) and the tokio `net` feature its peer sockets need, so the
-# default build stays free of both.
-cbf = ["dep:bip157", "tokio/net"]
+# BIP157/158 compact-block-filter chain source. The chain layer's: pulls in `bip157` (kyoto)
+# there and the tokio `net` feature its peer sockets need, so the default build stays free
+# of both.
+cbf = ["tokio/net", "node-chain/cbf", "node-chain-ldk/cbf"]
 
 [dependencies]
 lightning = { version = "0.1.0", features = ["std"] }
@@ -77,38 +77,27 @@ lightning-liquidity = { version = "0.1.0", features = ["std"] }
 #lightning-transaction-sync = { path = "../rust-lightning/lightning-transaction-sync", features = ["esplora-async-https", "electrum", "time"] }
 #lightning-liquidity = { path = "../rust-lightning/lightning-liquidity", features = ["std"] }
 
+# The chain layer (src/chain of before): its seam, the layer itself, and the LDK adapters and
+# engines on LDK's sync crates. Path dependencies on the port lane; pinned by git at the swap.
+node-chain-seam = { path = "../node-chain/crates/node-chain-seam" }
+node-chain = { path = "../node-chain/crates/node-chain" }
+node-chain-ldk = { path = "../node-chain/crates/node-chain-ldk" }
+
 bdk_chain = { version = "0.23.0", default-features = false, features = ["std"] }
-bdk_esplora = { version = "0.22.0", default-features = false, features = ["async-https-rustls", "tokio"]}
-bdk_electrum = { version = "0.23.0", default-features = false, features = ["use-rustls"]}
 bdk_wallet = { version = "2.0.0", default-features = false, features = ["std", "keys-bip39"]}
-bip157 = { version = "0.6.3", default-features = false, optional = true }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Only to pick a crypto provider explicitly: rustls panics rather than guess
-# when several are linked. See `install_default_crypto_provider`.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 bitcoin = "0.32.4"
 bip39 = "2.0.0"
 bip21 = { version = "0.5", features = ["std"], default-features = false }
 
-base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 rand = "0.8.5"
 # ChaCha20-Poly1305 for matching a BOLT 8 act one to a local node key (`net::act_one`):
 # rust-lightning keeps its own implementation crate-private. rust-bitcoin's crate, no deps.
 chacha20-poly1305 = "0.1.2"
-# Needed for object-safe async methods on the chain ability adapters
-# (`Arc<dyn FeeAdapter>` and friends in `chain::seam`).
-async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokio = { version = "1.37", default-features = false, features = [ "rt-multi-thread", "time", "sync", "macros" ] }
-esplora-client = { version = "0.12", default-features = false, features = ["tokio", "async-https-rustls"] }
-
-# FIXME: This was  introduced to decouple the `bdk_esplora` and
-# `lightning-transaction-sync` APIs. We should drop it as part of the upgrade
-# to LDK 0.2.
-esplora-client_0_11 = { package = "esplora-client", version = "0.11", default-features = false, features = ["tokio", "async-https-rustls"] }
-electrum-client = { version = "0.23.1", default-features = true }
 libc = "0.2"
 uniffi = { version = "0.28.3", features = ["build"], optional = true }
 serde = { version = "1.0.210", default-features = false, features = ["std", "derive"] }
@@ -125,6 +114,14 @@ winapi = { version = "0.3", features = ["winbase"] }
 lightning = { version = "0.1.0", features = ["std", "_test_utils"] }
 #lightning = { git = "https://github.com/lightningdevkit/rust-lightning", branch="main", features = ["std", "_test_utils"] }
 #lightning = { path = "../rust-lightning/lightning", features = ["std", "_test_utils"] }
+# The chain layer's test fakes (fake chains, a Pro's raw server, trace assertions) for the
+# session tests that run a real Node.
+node-chain = { path = "../node-chain/crates/node-chain", features = ["_test_utils"] }
+# The fake Pros of the session tests implement the async chain ports.
+async-trait = "0.1"
+# The integration tests' own Electrum client and BIP157 filters.
+electrum-client = { version = "0.23.1", default-features = true }
+bip157 = { version = "0.6.3", default-features = false }
 proptest = "1.0.0"
 regex = "1.5.6"
 

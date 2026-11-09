@@ -7,12 +7,12 @@
 
 //! Holds a payment handler allowing to send and receive on-chain payments.
 
-use crate::broadcast_queue::BroadcastPolicy;
 use crate::config::Config;
 use crate::error::Error;
 use crate::logger::{log_info, LdkLogger, Logger};
 use crate::types::{ChannelManager, Wallet};
 use crate::wallet::OnchainSendAmount;
+use node_chain::broadcast_queue::BroadcastPolicy;
 
 use bitcoin::{Address, Txid};
 

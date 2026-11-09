@@ -22,11 +22,15 @@ use bitcoin::Network;
 use std::fmt;
 use std::time::Duration;
 
+// The chain layer's configuration is node-chain's; its types keep their paths here.
+pub use node_chain::config::{
+	BackgroundSyncConfig, BitcoindRestClientConfig, ElectrumSyncConfig, EsploraSyncConfig,
+};
+#[cfg(feature = "cbf")]
+pub use node_chain::config::{CbfConfig, CbfExternalFee, CbfSource};
+
 // Config defaults
 const DEFAULT_NETWORK: Network = Network::Bitcoin;
-const DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS: u64 = 80;
-const DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS: u64 = 30;
-pub(crate) const DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS: u64 = 60 * 10;
 const DEFAULT_PROBING_LIQUIDITY_LIMIT_MULTIPLIER: u64 = 3;
 const DEFAULT_ANCHOR_PER_CHANNEL_RESERVE_SATS: u64 = 25_000;
 
@@ -39,18 +43,8 @@ pub const DEFAULT_LOG_FILENAME: &'static str = "ldk_node.log";
 /// The default storage directory.
 pub const DEFAULT_STORAGE_DIR_PATH: &str = "/tmp/ldk_node";
 
-// The 'stop gap' parameter used by BDK's wallet sync. This seems to configure the threshold
-// number of derivation indexes after which BDK stops looking for new scripts belonging to the wallet.
-pub(crate) const BDK_CLIENT_STOP_GAP: usize = 20;
-
-// The number of concurrent requests made against the API provider.
-pub(crate) const BDK_CLIENT_CONCURRENCY: usize = 4;
-
 // The timeout after which we abandon retrying failed payments.
 pub(crate) const LDK_PAYMENT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
-
-// The interval (in block height) after which we retry archiving fully resolved channel monitors.
-pub(crate) const RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL: u32 = 6;
 
 // The time in-between peer reconnection attempts.
 pub(crate) const PEER_RECONNECTION_INTERVAL: Duration = Duration::from_secs(60);
@@ -60,21 +54,6 @@ pub(crate) const RGS_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // The time in-between node announcement broadcast attempts.
 pub(crate) const NODE_ANN_BCAST_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-// The lower limit which we apply to any configured wallet sync intervals.
-pub(crate) const WALLET_SYNC_INTERVAL_MINIMUM_SECS: u64 = 10;
-
-// The timeout after which we abort a wallet syncing operation.
-pub(crate) const BDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 90;
-
-// The timeout after which we abort a wallet syncing operation.
-pub(crate) const LDK_WALLET_SYNC_TIMEOUT_SECS: u64 = 30;
-
-// The timeout after which we abort a fee rate cache update operation.
-pub(crate) const FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS: u64 = 5;
-
-// The timeout after which we abort a transaction broadcast operation.
-pub(crate) const TX_BROADCAST_TIMEOUT_SECS: u64 = 5;
 
 // The timeout after which we abort a RGS sync operation.
 pub(crate) const RGS_SYNC_TIMEOUT_SECS: u64 = 5;
@@ -209,156 +188,6 @@ impl Default for Config {
 			announce_policy: AnnouncePolicy::default(),
 		}
 	}
-}
-
-/// Configuration of the compact-block-filter (BIP157/158) chain source.
-///
-/// ### Defaults
-///
-/// | Parameter                 | Value  |
-/// |---------------------------|--------|
-/// | `wallet_birthday_height`  | None   |
-/// | `external_fee`            | None   |
-/// | `utxo_source`             | false  |
-/// | `required_peers`          | 1      |
-/// | `source`                  | P2p    |
-#[cfg(feature = "cbf")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CbfConfig {
-	/// The lowest height whose block may hold a transaction of this wallet: the wallet
-	/// birthday. Rounded *down* to the nearest checkpoint compiled into the crate (mainnet
-	/// only), which seeds a fresh wallet — unless the node is given a birthday block of its
-	/// own (`NodeBuilder::set_wallet_birthday`), which wins — and floors the height the
-	/// filter sync resumes from.
-	///
-	/// A filter scan never starts from genesis: a wallet whose persisted chain offers no
-	/// usable checkpoint resumes from this birthday, and refuses to sync at all when none is
-	/// configured. Set it for every wallet handed over from another chain source.
-	pub wallet_birthday_height: Option<u32>,
-	/// An external, mempool-aware server asked for fee estimates first, ahead of the provider
-	/// (when one is set) and the node's own coinbase-derived rates. Without either, the FEE
-	/// slot has only the blocks the node downloads.
-	pub external_fee: Option<CbfExternalFee>,
-	/// Whether to verify BOLT-7 channel announcements against the filters: existence-only,
-	/// since a block filter can say an output was created and not yet spent, but not what it
-	/// holds. Off by default; announcements are then accepted unverified.
-	pub utxo_source: bool,
-	/// Number of peers that must agree on filter headers before they are accepted.
-	pub required_peers: u8,
-	/// Where the headers, filter headers, filters and blocks come from: the Bitcoin P2P
-	/// network (the default), a node source supplied through
-	/// [`NodeBuilder::set_cbf_filter_source`], or the node source with P2P as its fallback.
-	///
-	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
-	pub source: CbfSource,
-}
-
-#[cfg(feature = "cbf")]
-impl Default for CbfConfig {
-	fn default() -> Self {
-		Self {
-			wallet_birthday_height: None,
-			external_fee: None,
-			utxo_source: false,
-			required_peers: DEFAULT_CBF_REQUIRED_PEERS,
-			source: CbfSource::default(),
-		}
-	}
-}
-
-/// Where a compact-block-filter node gets its raw chain data from.
-///
-/// Whatever the source, every header, filter header, filter and block is checked by this
-/// node before it is applied: a source cannot make the node accept a header, a chain or a
-/// block that is not valid. What a single node source *can* do is leave a transaction out of
-/// its filters — see [`CbfSource::trusts_source_for_inclusion`].
-#[cfg(feature = "cbf")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CbfSource {
-	/// The Bitcoin P2P network, through kyoto: the trusted peers configured with the chain
-	/// source, or the DNS seeds.
-	#[default]
-	P2p,
-	/// Only the filter source given to [`NodeBuilder::set_cbf_filter_source`] — typically
-	/// another Node device serving raw BIP157 data. Kyoto is never built and the node opens no
-	/// Bitcoin P2P connection. Building without a filter source fails.
-	///
-	/// **Trusts the source for inclusion.** Headers (proof of work, difficulty), block
-	/// contents, and the agreement of filters with filter headers are verified; that the
-	/// filters leave no transaction out is not, and cannot be with one source. A source that
-	/// omits a transaction — a revoked commitment spending a channel's funding outpoint, say —
-	/// hides it from this node. See [`CbfSource::trusts_source_for_inclusion`].
-	///
-	/// A source that keeps sending data that fails verification fails the sync closed; it is
-	/// tried again from scratch after a backoff of up to ten minutes. A tip more than three
-	/// hours old by this node's clock is reported as syncing, not synced (regtest aside).
-	///
-	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
-	Node,
-	/// The filter source first. The node falls back to the P2P network for the rest of the run
-	/// when the source stays unavailable for five minutes, keeps sending data that fails
-	/// verification, or serves a tip more than three hours old (regtest aside). Building without
-	/// a filter source fails.
-	///
-	/// **Trusts the source for inclusion** while it is used, as [`CbfSource::Node`] does: an
-	/// omission is not something the node can detect, so it is no reason to fall back.
-	NodeThenP2p,
-}
-
-#[cfg(feature = "cbf")]
-impl CbfSource {
-	/// Whether this source needs the filter source given to
-	/// [`NodeBuilder::set_cbf_filter_source`].
-	///
-	/// [`NodeBuilder::set_cbf_filter_source`]: crate::NodeBuilder::set_cbf_filter_source
-	pub fn uses_node_source(&self) -> bool {
-		matches!(self, Self::Node | Self::NodeThenP2p)
-	}
-
-	/// What a node filter source is trusted with, in words an app can show its operator.
-	pub const NODE_SOURCE_TRUST_NOTE: &'static str =
-		"Compact-block-filter sync through a single node source: headers (proof of work, \
-		 difficulty), block contents and filter/filter-header consistency are verified, but \
-		 the source is trusted not to leave transactions out of its filters. A source that \
-		 omits one (for example a revoked commitment spending a channel's funding output) \
-		 hides it from this node. Do not use a source that could gain from that, such as a \
-		 channel counterparty on mainnet.";
-
-	/// Whether this source trusts the node source not to leave transactions out of its
-	/// filters: `true` for [`CbfSource::Node`] and [`CbfSource::NodeThenP2p`], `false` for
-	/// [`CbfSource::P2p`], whose peers are compared.
-	///
-	/// This crate does not know who runs the source; the app does. An app should refuse a node
-	/// source where it would pay to hide a transaction — on mainnet, when the source node is
-	/// also one of this node's channel counterparties.
-	pub fn trusts_source_for_inclusion(&self) -> bool {
-		self.uses_node_source()
-	}
-
-	/// [`CbfSource::NODE_SOURCE_TRUST_NOTE`] when this source
-	/// [trusts the node source for inclusion](CbfSource::trusts_source_for_inclusion), for the
-	/// app to surface; `None` otherwise.
-	pub fn trust_note(&self) -> Option<&'static str> {
-		self.trusts_source_for_inclusion().then_some(Self::NODE_SOURCE_TRUST_NOTE)
-	}
-}
-
-/// Number of peers that must agree on filter headers before they are accepted.
-#[cfg(feature = "cbf")]
-pub(crate) const DEFAULT_CBF_REQUIRED_PEERS: u8 = 1;
-
-/// An external fee-estimation server for a compact-block-filter node.
-///
-/// By default CBF derives fee rates from recent blocks' coinbase outputs. An external source
-/// provides more accurate, per-target estimates from a mempool-aware server; it is asked
-/// first, and the coinbase-derived rates stand in when it cannot answer.
-#[cfg(feature = "cbf")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CbfExternalFee {
-	/// An Esplora HTTP server, by URL.
-	Esplora(String),
-	/// An Electrum server, by URL.
-	Electrum(String),
 }
 
 /// Configuration options pertaining to 'Anchor' channels, i.e., channels for which the
@@ -567,94 +396,6 @@ pub(crate) fn default_user_config(config: &Config) -> UserConfig {
 	user_config
 }
 
-/// Options related to background syncing the Lightning and on-chain wallets.
-///
-/// ### Defaults
-///
-/// | Parameter                              | Value              |
-/// |----------------------------------------|--------------------|
-/// | `onchain_wallet_sync_interval_secs`    | 80                 |
-/// | `lightning_wallet_sync_interval_secs`  | 30                 |
-/// | `fee_rate_cache_update_interval_secs`  | 600                |
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct BackgroundSyncConfig {
-	/// The time in-between background sync attempts of the onchain wallet, in seconds.
-	///
-	/// **Note:** A minimum of 10 seconds is enforced when background syncing is enabled.
-	pub onchain_wallet_sync_interval_secs: u64,
-
-	/// The time in-between background sync attempts of the LDK wallet, in seconds.
-	///
-	/// **Note:** A minimum of 10 seconds is enforced when background syncing is enabled.
-	pub lightning_wallet_sync_interval_secs: u64,
-
-	/// The time in-between background update attempts to our fee rate cache, in seconds.
-	///
-	/// **Note:** A minimum of 10 seconds is enforced when background syncing is enabled.
-	pub fee_rate_cache_update_interval_secs: u64,
-}
-
-impl Default for BackgroundSyncConfig {
-	fn default() -> Self {
-		Self {
-			onchain_wallet_sync_interval_secs: DEFAULT_BDK_WALLET_SYNC_INTERVAL_SECS,
-			lightning_wallet_sync_interval_secs: DEFAULT_LDK_WALLET_SYNC_INTERVAL_SECS,
-			fee_rate_cache_update_interval_secs: DEFAULT_FEE_RATE_CACHE_UPDATE_INTERVAL_SECS,
-		}
-	}
-}
-
-/// Configuration for syncing with an Esplora backend.
-///
-/// Background syncing is enabled by default, using the default values specified in
-/// [`BackgroundSyncConfig`].
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct EsploraSyncConfig {
-	/// Background sync configuration.
-	///
-	/// If set to `None`, background syncing will be disabled. Users will need to manually
-	/// sync via [`Node::sync_wallets`] for the wallets and fee rate updates.
-	///
-	/// [`Node::sync_wallets`]: crate::Node::sync_wallets
-	pub background_sync_config: Option<BackgroundSyncConfig>,
-}
-
-impl Default for EsploraSyncConfig {
-	fn default() -> Self {
-		Self { background_sync_config: Some(BackgroundSyncConfig::default()) }
-	}
-}
-
-/// Configuration for syncing with an Electrum backend.
-///
-/// Background syncing is enabled by default, using the default values specified in
-/// [`BackgroundSyncConfig`].
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct ElectrumSyncConfig {
-	/// Background sync configuration.
-	///
-	/// If set to `None`, background syncing will be disabled. Users will need to manually
-	/// sync via [`Node::sync_wallets`] for the wallets and fee rate updates.
-	///
-	/// [`Node::sync_wallets`]: crate::Node::sync_wallets
-	pub background_sync_config: Option<BackgroundSyncConfig>,
-}
-
-impl Default for ElectrumSyncConfig {
-	fn default() -> Self {
-		Self { background_sync_config: Some(BackgroundSyncConfig::default()) }
-	}
-}
-
-/// Configuration for syncing with Bitcoin Core backend via REST.
-#[derive(Debug, Clone)]
-pub struct BitcoindRestClientConfig {
-	/// Host URL.
-	pub rest_host: String,
-	/// Host port.
-	pub rest_port: u16,
-}
-
 /// Options which apply on a per-channel basis and may change at runtime or based on negotiation
 /// with our counterparty.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -781,19 +522,6 @@ mod tests {
 	use super::Config;
 	use super::NodeAlias;
 	use super::SocketAddress;
-
-	#[cfg(feature = "cbf")]
-	#[test]
-	fn node_sources_say_they_trust_the_source_for_inclusion() {
-		use super::CbfSource;
-		assert!(!CbfSource::P2p.trusts_source_for_inclusion());
-		assert_eq!(CbfSource::P2p.trust_note(), None);
-		for source in [CbfSource::Node, CbfSource::NodeThenP2p] {
-			assert!(source.trusts_source_for_inclusion());
-			let note = source.trust_note().expect("a note to surface");
-			assert!(note.contains("trusted not to leave transactions out"), "{}", note);
-		}
-	}
 
 	fn anchors(per_channel: u64, cap: Option<u64>) -> AnchorChannelsConfig {
 		AnchorChannelsConfig {

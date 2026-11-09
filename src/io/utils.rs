@@ -8,15 +8,13 @@
 use super::*;
 use crate::config::WALLET_KEYS_SEED_LEN;
 
-use crate::chain::ChainLayer;
-use crate::fee_estimator::OnchainFeeEstimator;
 use crate::io::{
 	NODE_METRICS_KEY, NODE_METRICS_PRIMARY_NAMESPACE, NODE_METRICS_SECONDARY_NAMESPACE,
 };
 use crate::logger::{log_error, LdkLogger, Logger};
 use crate::peer_store::PeerStore;
 use crate::sweep::DeprecatedSpendableOutputInfo;
-use crate::types::{Broadcaster, DynStore, KeysManager, Sweeper};
+use crate::types::{Broadcaster, ChainFilter, DynStore, FeeEstimator, KeysManager, Sweeper};
 use crate::wallet::ser::{ChangeSetDeserWrapper, ChangeSetSerWrapper};
 use crate::{Error, EventQueue, NodeMetrics, PaymentDetails};
 
@@ -234,8 +232,8 @@ where
 
 /// Read `OutputSweeper` state from the store.
 pub(crate) fn read_output_sweeper(
-	broadcaster: Arc<Broadcaster>, fee_estimator: Arc<OnchainFeeEstimator>,
-	chain_data_source: Arc<ChainLayer>, keys_manager: Arc<KeysManager>, kv_store: Arc<DynStore>,
+	broadcaster: Arc<Broadcaster>, fee_estimator: Arc<FeeEstimator>,
+	chain_data_source: Arc<ChainFilter>, keys_manager: Arc<KeysManager>, kv_store: Arc<DynStore>,
 	logger: Arc<Logger>,
 ) -> Result<Sweeper, std::io::Error> {
 	let mut reader = Cursor::new(kv_store.read(

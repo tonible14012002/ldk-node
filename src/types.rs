@@ -5,14 +5,16 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::ChainLayer;
+use crate::chain_shim::ChainLayer;
 use crate::config::ChannelConfig;
 use crate::data_store::DataStore;
-use crate::fee_estimator::OnchainFeeEstimator;
 use crate::gossip::RuntimeSpawner;
 use crate::logger::Logger;
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::PaymentDetails;
+use node_chain::fee_estimator::OnchainFeeEstimator;
+use node_chain::TransactionBroadcaster;
+use node_chain_ldk::ldk::{LdkBroadcaster, LdkFeeEstimator, LdkFilter};
 
 use lightning::chain::chainmonitor;
 use lightning::impl_writeable_tlv_based;
@@ -42,9 +44,9 @@ pub(crate) type DynStore = dyn KVStore + Sync + Send;
 
 pub(crate) type ChainMonitor = chainmonitor::ChainMonitor<
 	InMemorySigner,
-	Arc<ChainLayer>,
+	Arc<ChainFilter>,
 	Arc<Broadcaster>,
-	Arc<OnchainFeeEstimator>,
+	Arc<FeeEstimator>,
 	Arc<Logger>,
 	Arc<DynStore>,
 >;
@@ -60,7 +62,7 @@ pub(crate) type PeerManager = lightning::ln::peer_handler::PeerManager<
 >;
 
 pub(crate) type LiquidityManager =
-	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainLayer>>;
+	lightning_liquidity::LiquidityManager<Arc<KeysManager>, Arc<ChannelManager>, Arc<ChainFilter>>;
 
 pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<ChainMonitor>,
@@ -68,13 +70,21 @@ pub(crate) type ChannelManager = lightning::ln::channelmanager::ChannelManager<
 	Arc<KeysManager>,
 	Arc<KeysManager>,
 	Arc<KeysManager>,
-	Arc<OnchainFeeEstimator>,
+	Arc<FeeEstimator>,
 	Arc<Router>,
 	Arc<MessageRouter>,
 	Arc<Logger>,
 >;
 
-pub(crate) type Broadcaster = crate::tx_broadcaster::TransactionBroadcaster<Arc<Logger>>;
+/// The chain host's broadcaster, as LDK's.
+pub(crate) type Broadcaster = LdkBroadcaster<TransactionBroadcaster>;
+
+/// The chain host's fee estimator, as LDK's. The wallet estimates through the host's
+/// [`OnchainFeeEstimator`] itself.
+pub(crate) type FeeEstimator = LdkFeeEstimator<OnchainFeeEstimator>;
+
+/// The chain layer as the `Filter` LDK registers transactions and outputs to watch with.
+pub(crate) type ChainFilter = LdkFilter<ChainLayer>;
 
 pub(crate) type Wallet =
 	crate::wallet::Wallet<Arc<Broadcaster>, Arc<OnchainFeeEstimator>, Arc<Logger>>;
@@ -140,8 +150,8 @@ pub(crate) type MessageRouter = lightning::onion_message::messenger::DefaultMess
 pub(crate) type Sweeper = OutputSweeper<
 	Arc<Broadcaster>,
 	Arc<KeysManager>,
-	Arc<OnchainFeeEstimator>,
-	Arc<ChainLayer>,
+	Arc<FeeEstimator>,
+	Arc<ChainFilter>,
 	Arc<DynStore>,
 	Arc<Logger>,
 	Arc<KeysManager>,

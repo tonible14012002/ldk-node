@@ -5,11 +5,14 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-use crate::chain::ChainLayer;
+use crate::chain_shim::ChainLayer;
+
 use crate::config::RGS_SYNC_TIMEOUT_SECS;
 use crate::logger::{log_error, log_trace, LdkLogger, Logger};
 use crate::types::{GossipSync, Graph, P2PGossipSync, PeerManager, RapidGossipSync, UtxoLookup};
 use crate::Error;
+use lightning_block_sync::gossip::UtxoSource;
+use node_chain_ldk::ldk::LdkUtxoSource;
 
 use lightning_block_sync::gossip::{FutureSpawner, GossipVerifier};
 
@@ -67,7 +70,9 @@ impl GossipSource {
 	) {
 		match self {
 			Self::P2PNetwork { gossip_sync, logger } => {
-				if let Some(utxo_source) = chain_source.as_utxo_source() {
+				if let Some(block_fetch) = chain_source.as_utxo_source() {
+					let utxo_source: Arc<dyn UtxoSource> =
+						Arc::new(LdkUtxoSource::new(block_fetch));
 					let spawner = RuntimeSpawner::new(Arc::clone(&runtime), Arc::clone(&logger));
 					let gossip_verifier = Arc::new(GossipVerifier::new(
 						utxo_source,

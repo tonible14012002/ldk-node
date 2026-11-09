@@ -7,16 +7,16 @@
 
 use persist::KVStoreWalletPersister;
 
-use crate::broadcast_queue::{BroadcastPolicy, BroadcastQueue};
 use crate::config::Config;
 use crate::dead_funding::{find_dead_fundings, DeadFundingProof};
 use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger};
+use node_chain::broadcast_queue::{BroadcastPolicy, BroadcastQueue};
 
-use crate::fee_estimator::{ConfirmationTarget, FeeEstimator};
 use crate::payment::store::{ConfirmationStatus, PaymentDetailsUpdate};
 use crate::payment::{PaymentDetails, PaymentDirection, PaymentStatus};
 use crate::types::PaymentStore;
 use crate::Error;
+use node_chain::fee_estimator::{ConfirmationTarget, FeeEstimator};
 
 use lightning::chain::chaininterface::BroadcasterInterface;
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
@@ -172,7 +172,7 @@ where
 	/// A block filter tells the provider that a block spends one of the
 	/// wallet's scripts; within the block a spend shows only the outpoint it
 	/// spends, so this is what lets the provider tell which transaction it
-	/// was. See [`crate::chain::provider::WireSyncRequest::owned_outpoints`].
+	/// was. See `WireSyncRequest::owned_outpoints` of the chain provider wire.
 	pub(crate) fn outpoints_for_spend_watch(&self, reorg_depth: u32) -> Vec<bitcoin::OutPoint> {
 		use bdk_chain::{CanonicalizationParams, ChainPosition};
 
@@ -219,7 +219,6 @@ where
 
 	/// Whether the wallet's graph holds a transaction with `txid`.
 	/// The transaction `txid`, when this wallet's graph holds it.
-	#[cfg(feature = "cbf")]
 	pub(crate) fn known_tx(&self, txid: &Txid) -> Option<Transaction> {
 		self.inner.lock().unwrap().tx_graph().get_tx(*txid).map(|tx| (*tx).clone())
 	}
@@ -251,8 +250,6 @@ where
 	///
 	/// A filter-driven engine seeds its header chain from this instead of the bare
 	/// [`Self::current_best_block`] so it can resume without re-fetching the ancestors.
-	// Called by the filter-driven sync engine only.
-	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn latest_checkpoint(&self) -> bdk_chain::local_chain::CheckPoint {
 		self.inner.lock().unwrap().latest_checkpoint()
 	}
@@ -262,8 +259,6 @@ where
 	/// The set only ever grows — BDK reveals keys, it never forgets them — so a filter-driven
 	/// engine matching thousands of block filters against it can keep a copy and refresh it
 	/// only when this count moves, instead of cloning every script per filter.
-	// Called by the filter-driven sync engine only.
-	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn watched_script_count(&self) -> usize {
 		self.inner.lock().unwrap().spk_index().inner().all_spks().len()
 	}
@@ -275,8 +270,6 @@ where
 	/// block may pay an address the wallet has not explicitly revealed yet (on recovery a fresh
 	/// wallet has revealed nothing at all) but which is still inside the gap limit, and a
 	/// filter that only carried revealed scripts would silently miss that deposit.
-	// Called by the filter-driven sync engine only.
-	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn list_watched_scripts(&self) -> Vec<ScriptBuf> {
 		self.inner.lock().unwrap().spk_index().inner().all_spks().values().cloned().collect()
 	}
@@ -286,15 +279,11 @@ where
 	/// See [`KVStoreWalletPersister::set_defer_local_chain`] for why only the chain is deferred
 	/// and why a crash mid-sync stays recoverable. Callers pair this with
 	/// [`Self::flush_chain_persistence`]; nothing flushes implicitly.
-	// Called by the filter-driven sync engine only.
-	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn set_bulk_chain_persistence(&self, enabled: bool) {
 		self.persister.lock().unwrap().set_defer_local_chain(enabled);
 	}
 
 	/// Persists any chain state deferred by [`Self::set_bulk_chain_persistence`].
-	// Called by the filter-driven sync engine only.
-	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn flush_chain_persistence(&self) -> Result<(), Error> {
 		self.persister.lock().unwrap().flush_local_chain().map_err(|e| {
 			log_error!(self.logger, "Failed to flush deferred on-chain wallet chain state: {}", e);
@@ -392,7 +381,6 @@ where
 	/// as they leave the wallet's unconfirmed list by themselves, and nothing else would ever
 	/// write those rows again. Their inputs are back in the balance already. A block that
 	/// confirms one after all writes it again.
-	#[cfg_attr(not(feature = "cbf"), allow(dead_code))]
 	pub(crate) fn fail_replaced_payments(&self) -> Result<(), Error> {
 		let replaced: Vec<Txid> = {
 			let locked_wallet = self.inner.lock().unwrap();
@@ -1720,16 +1708,18 @@ mod chain_listen_tests {
 
 	use super::persist::KVStoreWalletPersister;
 	use super::{unix_now_secs, Update};
-	use crate::broadcast_queue::{BroadcastPolicy, BroadcastQueue};
 	use crate::config::Config;
 	use crate::dead_funding::DeadFundingProof;
-	use crate::fee_estimator::OnchainFeeEstimator;
 	use crate::io::{
 		PAYMENT_INFO_PERSISTENCE_PRIMARY_NAMESPACE, PAYMENT_INFO_PERSISTENCE_SECONDARY_NAMESPACE,
 	};
 	use crate::logger::Logger;
-	use crate::tx_broadcaster::TransactionBroadcaster;
 	use crate::types::{DynStore, PaymentStore, Wallet};
+	use node_chain::broadcast_queue::{BroadcastPolicy, BroadcastQueue};
+	use node_chain::fee_estimator::OnchainFeeEstimator;
+	use node_chain::tx_broadcaster::TransactionBroadcaster;
+	use node_chain_ldk::ldk::LdkBroadcaster;
+	use node_chain_ldk::KvQueueStore;
 
 	const EXTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
 	const INTERNAL_DESCRIPTOR: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
@@ -1753,8 +1743,16 @@ mod chain_listen_tests {
 		let wallet = Wallet::new(
 			bdk_wallet,
 			persister,
-			Arc::new(TransactionBroadcaster::new(Arc::clone(&logger))),
-			Arc::new(BroadcastQueue::read_or_empty(Arc::clone(&kv_store), Arc::clone(&logger))),
+			Arc::new(LdkBroadcaster::new(Arc::new(TransactionBroadcaster::new(
+				Arc::clone(&logger) as Arc<node_chain::Logger>,
+			)))),
+			Arc::new(BroadcastQueue::read_or_empty(
+				Arc::new(KvQueueStore::new(
+					Arc::clone(&kv_store),
+					Arc::clone(&logger) as Arc<node_chain::Logger>,
+				)),
+				Arc::clone(&logger) as Arc<node_chain::Logger>,
+			)),
 			Arc::new(OnchainFeeEstimator::new()),
 			payment_store,
 			config,
@@ -1967,7 +1965,9 @@ mod chain_listen_tests {
 		assert_eq!(status(&wallet), Some(PaymentStatus::Failed));
 
 		// Sent again and seen again.
-		wallet.apply_own_view(vec![(tx.clone(), unix_now_secs() + 10)], Vec::new()).expect("applies");
+		wallet
+			.apply_own_view(vec![(tx.clone(), unix_now_secs() + 10)], Vec::new())
+			.expect("applies");
 		assert_eq!(status(&wallet), Some(PaymentStatus::Pending));
 
 		// Held: pending stays pending, whatever the view says.
@@ -2007,13 +2007,17 @@ mod chain_listen_tests {
 			}],
 		};
 		let first = spend_to(coin, 40_000);
-		let child =
-			spend_to(bitcoin::OutPoint { txid: first.compute_txid(), vout: 0 }, 30_000);
+		let child = spend_to(bitcoin::OutPoint { txid: first.compute_txid(), vout: 0 }, 30_000);
 		let replacement = spend_to(coin, 39_000);
 		let now = unix_now_secs();
-		wallet.apply_own_view(vec![(first.clone(), now), (child.clone(), now)], Vec::new()).unwrap();
+		wallet
+			.apply_own_view(vec![(first.clone(), now), (child.clone(), now)], Vec::new())
+			.unwrap();
 		let status = |tx: &Transaction| {
-			wallet.payment_store.get(&PaymentId(tx.compute_txid().to_byte_array())).map(|p| p.status)
+			wallet
+				.payment_store
+				.get(&PaymentId(tx.compute_txid().to_byte_array()))
+				.map(|p| p.status)
 		};
 		assert_eq!(status(&first), Some(PaymentStatus::Pending));
 		assert_eq!(status(&child), Some(PaymentStatus::Pending));
@@ -2388,8 +2392,10 @@ mod chain_listen_tests {
 		let tx = source.create_funding_transaction(request.clone()).expect("the coin funds it");
 		assert!(spends(&tx, coin));
 		assert!(
-			tx.output.iter().any(|o| o.script_pubkey == request.output_script
-				&& o.value == Amount::from_sat(30_000)),
+			tx.output
+				.iter()
+				.any(|o| o.script_pubkey == request.output_script
+					&& o.value == Amount::from_sat(30_000)),
 			"pays the channel output exactly"
 		);
 		assert!(tx.input.iter().all(|i| !i.witness.is_empty()), "signed, segwit inputs");
