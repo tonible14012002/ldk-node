@@ -226,6 +226,9 @@ mod tests {
 	#[derive(Default)]
 	struct Switchboard {
 		overlays: Mutex<Vec<Arc<Overlay>>>,
+		/// Nodes the board knows but that do not take sessions on it: what a Node on an older
+		/// release is to the iroh overlay (a card without the Lightning tag).
+		not_on_it: Mutex<Vec<PublicKey>>,
 	}
 
 	struct SwitchboardTransport(Arc<Switchboard>);
@@ -240,6 +243,9 @@ mod tests {
 		) -> BoxFuture<'a, Result<PeerStream, DialError>> {
 			Box::pin(async move {
 				let key = node_net_ldk::public_key(&peer).ok_or(DialError::Unsupported)?;
+				if self.0.not_on_it.lock().unwrap().contains(&key) {
+					return Err(DialError::Unsupported);
+				}
 				let remote = self
 					.0
 					.overlays
@@ -379,11 +385,54 @@ mod tests {
 		a.connect(outside.node_id(), outside_address, false).unwrap();
 		wait_for_peer(&outside, a.node_id());
 		let stats = a.network_stats().dials;
-		assert_eq!(stats["memory-overlay"].dial_failed, 1);
+		assert_eq!(stats["memory-overlay"].dial_skipped, 1);
+		assert_eq!(stats["memory-overlay"].dial_attempts, 0, "a miss is not an attempt");
 		assert_eq!(stats["memory-overlay"].last_error.as_deref(), Some("unresolved"));
 		assert_eq!(stats["tcp"].connected, 1);
 
 		a.stop().unwrap();
 		outside.stop().unwrap();
+	}
+
+	/// A mixed fleet: a Node the overlay knows but that does not take sessions on it (an older
+	/// release) is dialled over TCP at once, both ways — the upgraded node at the old one's
+	/// stored address, the old one into the upgraded node's TCP listener, which it keeps.
+	#[test]
+	fn a_node_not_on_the_overlay_is_reached_over_tcp_both_ways() {
+		let board = Arc::new(Switchboard::default());
+		let upgraded_overlay = overlay(&board, true);
+		let (upgraded, upgraded_address) = node(91, Some(&upgraded_overlay));
+		let (old, old_address) = node(92, None);
+		board.not_on_it.lock().unwrap().push(old.node_id());
+
+		let started = Instant::now();
+		upgraded.connect(old.node_id(), old_address, true).unwrap();
+		assert!(started.elapsed() < Duration::from_secs(5), "waited on the overlay");
+		wait_for_peer(&old, upgraded.node_id());
+		let stats = upgraded.network_stats().dials;
+		let overlay_dials = &stats["memory-overlay"];
+		assert_eq!((overlay_dials.dial_attempts, overlay_dials.dial_skipped), (0, 1));
+		assert_eq!(overlay_dials.last_error.as_deref(), Some("unsupported"));
+		assert_eq!(stats["tcp"].connected, 1);
+
+		// Until both sides saw the close: `connect` on a side that still holds the session is
+		// a no-op.
+		upgraded.disconnect(old.node_id()).unwrap();
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let holds = |node: &Node, peer: PublicKey| {
+			node.list_peers().iter().any(|p| p.node_id == peer && p.is_connected)
+		};
+		while holds(&upgraded, old.node_id()) || holds(&old, upgraded.node_id()) {
+			assert!(Instant::now() < deadline, "the disconnect never landed");
+			std::thread::sleep(Duration::from_millis(20));
+		}
+		old.connect(upgraded.node_id(), upgraded_address, false).unwrap();
+		wait_for_peer(&upgraded, old.node_id());
+		let listener = upgraded.network_stats().listener.unwrap();
+		assert_eq!(listener.values().map(|s| s.inbound_routed).sum::<u64>(), 1);
+		assert_eq!(upgraded_overlay.stats().values().map(|s| s.inbound_routed).sum::<u64>(), 0);
+
+		upgraded.stop().unwrap();
+		old.stop().unwrap();
 	}
 }
